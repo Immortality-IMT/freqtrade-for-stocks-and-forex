@@ -62,3 +62,6 @@ janus==2.0.0
 
 ast-comments==1.2.2
 packaging==24.2
+
+#Alpaca
+alpaca-py

@@ -4,6 +4,7 @@ from freqtrade.exchange.common import remove_exchange_credentials, MAP_EXCHANGE_
 from freqtrade.exchange.exchange import Exchange
 
 # isort: on
+from freqtrade.exchange.alpacastocks import Alpacastocks
 from freqtrade.exchange.binance import Binance
 from freqtrade.exchange.bingx import Bingx
 from freqtrade.exchange.bitmart import Bitmart
@@ -45,3 +46,4 @@ from freqtrade.exchange.kraken import Kraken
 from freqtrade.exchange.kucoin import Kucoin
 from freqtrade.exchange.lbank import Lbank
 from freqtrade.exchange.okx import Okx
+from freqtrade.exchange.stockexchange import Stockexchange
