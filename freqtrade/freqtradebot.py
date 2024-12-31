@@ -162,6 +162,7 @@ class FreqtradeBot(LoggingMixin):
 
             def update():
                 self.update_funding_fees()
+                self.update_all_liquidation_prices()
                 self.wallets.update()
 
             # This would be more efficient if scheduled in utc time, and performed at each
@@ -1197,7 +1198,7 @@ class FreqtradeBot(LoggingMixin):
             trade.pair, side="entry", is_short=trade.is_short, refresh=False
         )
         stake_amount = trade.stake_amount
-        if not fill:
+        if not fill and trade.nr_of_successful_entries > 0:
             # If we have open orders, we need to add the stake amount of the open orders
             # as it's not yet included in the trade.stake_amount
             stake_amount += sum(
@@ -1303,7 +1304,7 @@ class FreqtradeBot(LoggingMixin):
                     logger.warning(
                         f"Unable to handle stoploss on exchange for {trade.pair}: {exception}"
                     )
-                # Check if we can sell our current pair
+                # Check if we can exit our current pair
                 if not trade.has_open_orders and trade.is_open and self.handle_trade(trade):
                     trades_closed += 1
 
