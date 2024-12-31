@@ -351,6 +351,10 @@ class FreqtradeBot(LoggingMixin):
         if _prev_whitelist != _whitelist:
             self.rpc.send_msg({"type": RPCMessageType.WHITELIST, "data": _whitelist})
 
+        # Security addition, ensure no duplicates creep into the whitelist.
+        whitelist_temp = _whitelist
+        _whitelist = list(set(whitelist_temp))
+
         return _whitelist
 
     def get_free_open_trades(self) -> int:
