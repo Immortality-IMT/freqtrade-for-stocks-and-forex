@@ -33,8 +33,8 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     exchange = config.get("exchange", {}).get("name", "").lower()
     if not exchange:
         raise OperationalException(
-            "This command requires a configured exchange. You should either use "
-            "`--exchange <exchange_name>` or specify a configuration file via `--config`.\n"
+            f"This command requires a configured exchange. You should either use "
+            f"`--exchange <exchange_name>` or specify a configuration file via `--config`.\n"
             f"The following exchanges are available for Freqtrade: "
             f'{", ".join(available_exchanges())}'
         )
@@ -43,7 +43,7 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
         if is_exchange_known_ccxt(exchange):
             logger.info(
                 f"The {exchange.capitalize()} exchange has been recognized "
-                "and is compatible with ccxt."
+                f"and is compatible with ccxt."
             )
             logger.info(
                 f"Exchange {exchange} is officially supported by the Freqtrade development team."
@@ -51,21 +51,21 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
         else:
             logger.warning(
                 f"The {exchange.capitalize()} exchange is recognized by Freqtrade "
-                "but not compatible with ccxt. Experimental!!!"
+                f"but not compatible with ccxt. Experimental!!!"
             )
     else:
         if is_exchange_known_ccxt(exchange):
             logger.warning(
                 f"The {exchange.capitalize()} exchange is not recognized by Freqtrade "
-                "but is compatible with ccxt. "
-                "Not officially supported by the Freqtrade development team. "
-                "It may work flawlessly (please report back) or have serious issues. "
-                "Use it at your own discretion."
+                f"but is compatible with ccxt. "
+                f"Not officially supported by the Freqtrade development team. "
+                f"It may work flawlessly (please report back) or have serious issues. "
+                f"Use it at your own discretion."
             )
         else:
             raise OperationalException(
                 f"Exchange '{exchange}' is not recognized by Freqtrade and not "
-                "compatible with ccxt, and therefore not available for the bot.\n"
+                f"compatible with ccxt, and therefore not available for the bot.\n"
                 f"The following exchanges are available for Freqtrade: "
                 f'{", ".join(available_exchanges())}'
             )
