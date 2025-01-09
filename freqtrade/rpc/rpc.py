@@ -326,7 +326,7 @@ class RPC:
                 active_order_side = ".".join(
                     "*" if (o.get("is_open") and o.get("ft_is_entry")) else "**"
                     for o in orders
-                    if o.get("is_open")
+                    if o.get("is_open") and o.get("ft_order_side") != "stoploss"
                 )
 
             # Direction string for non-spot
@@ -1283,6 +1283,7 @@ class RPC:
                 r.message + ("\n" + r.exc_text if r.exc_text else ""),
             ]
             for r in buffer
+            if hasattr(r, "message")
         ]
 
         # Log format:

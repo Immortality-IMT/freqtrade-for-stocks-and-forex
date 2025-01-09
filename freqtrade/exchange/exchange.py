@@ -548,6 +548,7 @@ class Exchange:
             and (
                 self.precisionMode != TICK_SIZE
                 # Too low precision will falsify calculations
+                or market.get("precision", {}).get("price") is None
                 or market.get("precision", {}).get("price") > 1e-11
             )
             and (
@@ -2391,35 +2392,35 @@ class Exchange:
 
         if cache and (pair, timeframe, candle_type) in self._klines:
             candle_limit = self.ohlcv_candle_limit(timeframe, candle_type)
-            min_date = int(date_minus_candles(timeframe, candle_limit - 5).timestamp())
+            min_ts = dt_ts(date_minus_candles(timeframe, candle_limit - 5))
 
             if self._exchange_ws:
-                candle_date = int(timeframe_to_prev_date(timeframe).timestamp() * 1000)
-                prev_candle_date = int(date_minus_candles(timeframe, 1).timestamp() * 1000)
+                candle_ts = dt_ts(timeframe_to_prev_date(timeframe))
+                prev_candle_ts = dt_ts(date_minus_candles(timeframe, 1))
                 candles = self._exchange_ws.ccxt_object.ohlcvs.get(pair, {}).get(timeframe)
-                half_candle = int(candle_date - (candle_date - prev_candle_date) * 0.5)
+                half_candle = int(candle_ts - (candle_ts - prev_candle_ts) * 0.5)
                 last_refresh_time = int(
                     self._exchange_ws.klines_last_refresh.get((pair, timeframe, candle_type), 0)
                 )
 
                 if (
                     candles
-                    and candles[-1][0] >= prev_candle_date
+                    and candles[-1][0] >= prev_candle_ts
                     and last_refresh_time >= half_candle
                 ):
                     # Usable result, candle contains the previous candle.
                     # Also, we check if the last refresh time is no more than half the candle ago.
                     logger.debug(f"reuse watch result for {pair}, {timeframe}, {last_refresh_time}")
 
-                    return self._exchange_ws.get_ohlcv(pair, timeframe, candle_type, candle_date)
+                    return self._exchange_ws.get_ohlcv(pair, timeframe, candle_type, candle_ts)
                 logger.info(
-                    f"Failed to reuse watch {pair}, {timeframe}, {candle_date < last_refresh_time},"
-                    f" {candle_date}, {last_refresh_time}, "
-                    f"{format_ms_time(candle_date)}, {format_ms_time(last_refresh_time)} "
+                    f"Failed to reuse watch {pair}, {timeframe}, {candle_ts < last_refresh_time},"
+                    f" {candle_ts}, {last_refresh_time}, "
+                    f"{format_ms_time(candle_ts)}, {format_ms_time(last_refresh_time)} "
                 )
 
             # Check if 1 call can get us updated candles without hole in the data.
-            if min_date < self._pairs_last_refresh_time.get((pair, timeframe, candle_type), 0):
+            if min_ts < self._pairs_last_refresh_time.get((pair, timeframe, candle_type), 0):
                 # Cache can be used - do one-off call.
                 not_all_data = False
             else:
@@ -2497,7 +2498,7 @@ class Exchange:
         # keeping last candle time as last refreshed time of the pair
         if ticks and cache:
             idx = -2 if drop_incomplete and len(ticks) > 1 else -1
-            self._pairs_last_refresh_time[(pair, timeframe, c_type)] = ticks[idx][0] // 1000
+            self._pairs_last_refresh_time[(pair, timeframe, c_type)] = ticks[idx][0]
         # keeping parsed dataframe in cache
         ohlcv_df = ohlcv_to_dataframe(
             ticks, timeframe, pair=pair, fill_missing=True, drop_incomplete=drop_incomplete
@@ -2610,10 +2611,10 @@ class Exchange:
 
     def _now_is_time_to_refresh(self, pair: str, timeframe: str, candle_type: CandleType) -> bool:
         # Timeframe in seconds
-        interval_in_sec = timeframe_to_seconds(timeframe)
+        interval_in_sec = timeframe_to_msecs(timeframe)
         plr = self._pairs_last_refresh_time.get((pair, timeframe, candle_type), 0) + interval_in_sec
         # current,active candle open date
-        now = int(timeframe_to_prev_date(timeframe).timestamp())
+        now = dt_ts(timeframe_to_prev_date(timeframe))
         return plr < now
 
     @retrier_async
