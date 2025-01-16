@@ -34,8 +34,8 @@
     },
     "exchange": {
         "name": "alpacastocks",
-        "key": "PKK93VAYAOF56RBPFU4F",
-        "secret": "D6QI0CKlKXk0rpIh8SSKX0eVZcvTtkfJqWk5CT1I",
+        "key": "get_an_api_key",
+        "secret": "get_an_api_key",
         "pair_whitelist": ["TSLA/USD","AAPL/USD","MSFT/USD"],
         "pair_blacklist": []
     },
