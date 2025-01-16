@@ -36,25 +36,26 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
             f"This command requires a configured exchange. You should either use "
             f"`--exchange <exchange_name>` or specify a configuration file via `--config`.\n"
             f"The following exchanges are available for Freqtrade: "
-            f'{", ".join(available_exchanges())}'
+            f"{', '.join(available_exchanges())}"
         )
 
-    if MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange) in SUPPORTED_EXCHANGES:
-        if is_exchange_known_ccxt(exchange):
+    is_known_ccxt = is_exchange_known_ccxt(exchange)
+    exchange_name = MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange)
+
+    if exchange_name in SUPPORTED_EXCHANGES:
+        if is_known_ccxt:
             logger.info(
                 f"The {exchange.capitalize()} exchange has been recognized "
                 f"and is compatible with ccxt."
-            )
-            logger.info(
                 f"Exchange {exchange} is officially supported by the Freqtrade development team."
             )
         else:
             logger.warning(
                 f"The {exchange.capitalize()} exchange is recognized by Freqtrade "
-                f"but not compatible with ccxt. Experimental!!!"
+                f"but not compatible with ccxt. Experimental!!!" #new option
             )
     else:
-        if is_exchange_known_ccxt(exchange):
+        if is_known_ccxt:
             logger.warning(
                 f"The {exchange.capitalize()} exchange is not recognized by Freqtrade "
                 f"but is compatible with ccxt. "
@@ -70,7 +71,7 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
                 f'{", ".join(available_exchanges())}'
             )
 
-    if is_exchange_known_ccxt(exchange):
+    if is_known_ccxt:
         valid, reason, _ = validate_exchange(exchange)
         if not valid:
             if check_for_bad:
