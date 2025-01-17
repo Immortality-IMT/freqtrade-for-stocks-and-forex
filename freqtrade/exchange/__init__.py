@@ -37,6 +37,7 @@ from freqtrade.exchange.exchange_utils_timeframe import (
     timeframe_to_resample_freq,
     timeframe_to_seconds,
 )
+from freqtrade.exchange.foreignexchange import Foreignexchange
 from freqtrade.exchange.gate import Gate
 from freqtrade.exchange.hitbtc import Hitbtc
 from freqtrade.exchange.htx import Htx
@@ -45,5 +46,6 @@ from freqtrade.exchange.idex import Idex
 from freqtrade.exchange.kraken import Kraken
 from freqtrade.exchange.kucoin import Kucoin
 from freqtrade.exchange.lbank import Lbank
+from freqtrade.exchange.oanda import Oanda
 from freqtrade.exchange.okx import Okx
 from freqtrade.exchange.stockexchange import Stockexchange

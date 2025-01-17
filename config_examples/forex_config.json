@@ -2,7 +2,7 @@
 {
     "$schema": "https://schema.freqtrade.io/schema.json",
     "max_open_trades": 10,
-    "stake_currency": "USD",   //changed line 
+    "stake_currency": "USD",   //changed line
     "stake_amount": 10,
     "tradable_balance_ratio": 0.99,
     "fiat_display_currency": "USD",

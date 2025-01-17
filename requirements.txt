@@ -64,3 +64,5 @@ packaging==24.2
 
 #Alpaca
 alpaca-py
+#OandA
+v20
