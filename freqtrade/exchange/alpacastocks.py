@@ -182,6 +182,10 @@ class Alpacastocks(Stockexchange):
     def markets(self):
         return self._markets
 
+    def reload_markets(self) -> None:
+        """Reload the markets data, forcing a fresh fetch from Alpaca."""
+        self.get_markets(reload=True)
+
     def get_fee(self, symbol, now=None, taker_or_maker="maker"):
         # Replace with the actual fee calculation for the symbol
         fee = {
@@ -480,3 +484,74 @@ class Alpacastocks(Stockexchange):
             logger.info(f"DataFrame saved to {file_path}")
         except Exception as e:
             logger.error(f"Failed to save DataFrame to Feather file: {str(e)}")
+
+    def klines(self, pair, timeframe=None, *, candle_type="spot", **kwargs) -> pd.DataFrame:
+        """
+        Fetch historical OHLCV data for a pair and timeframe.
+
+        :param pair: The trading pair, or a tuple containing (pair, timeframe, candle_type).
+        :param timeframe: The timeframe (e.g., '1m', '1h', '1d').
+        :param candle_type: The type of candles ('spot' for standard candles).
+        :return: DataFrame containing OHLCV data.
+        """
+        try:
+            # Initialize pair_str to hold the string pair name
+            pair_str = pair
+            # Check if pair is provided as a tuple (pair, timeframe, candle_type)
+            if isinstance(pair, tuple) and len(pair) == 3:
+                # Unpack tuple, but use pair_str for the string pair name
+                pair_str, timeframe, candle_type = pair
+            else:
+                # Ensure timeframe is provided when not using a tuple
+                if timeframe is None:
+                    raise ValueError("timeframe must be provided if not using a tuple.")
+            # Proceed to fetch OHLCV data, now using pair_str
+            ohlcv = self.get_historic_ohlcv(pair_str, timeframe)
+            return ohlcv.copy()
+        except Exception as e:
+            logger.error(f"Error fetching klines for {pair}: {str(e)}")
+            return pd.DataFrame()
+
+    def refresh_latest_ohlcv(self, pairs=None, timeframe="1h", **kwargs):
+        """
+        Fetches the latest OHLCV data for the given pairs from Alpaca.
+
+        :param pairs: List of trading pairs (or tuples) to fetch data for.
+        :param timeframe: Timeframe for the data (e.g., '1m', '1h', '1d').
+        :return: Dictionary mapping pairs to their latest OHLCV data as DataFrames.
+        """
+        if not pairs:
+            return {}
+
+        latest_ohlcv = {}
+        current_time = pd.Timestamp.now(tz="UTC")
+
+        for raw_pair in pairs:
+            # Extract the actual pair string if it's a tuple (pair, timeframe, candle_type)
+            if isinstance(raw_pair, tuple) and len(raw_pair) == 3:
+                pair_symbol = raw_pair[0]
+            else:
+                pair_symbol = raw_pair
+
+            try:
+                # Fetch the most recent candle (last 5 minutes to ensure we get the latest)
+                start_time = current_time - pd.Timedelta(minutes=5)
+                limit = 1  # Get only the latest candle
+
+                # Call get_historic_ohlcv with the extracted pair symbol
+                ohlcv_data = self.get_historic_ohlcv(
+                    pair=pair_symbol,
+                    timeframe=timeframe,
+                    since=int(start_time.timestamp() * 1000),
+                    limit=limit,
+                )
+
+                if not ohlcv_data.empty:
+                    latest_ohlcv[pair_symbol] = ohlcv_data
+                else:
+                    logger.warning(f"No OHLCV data found for pair {pair_symbol} at {current_time}.")
+            except Exception as e:
+                logger.error(f"Error fetching latest OHLCV for {pair_symbol}: {str(e)}")
+                continue
+
+        return latest_ohlcv
