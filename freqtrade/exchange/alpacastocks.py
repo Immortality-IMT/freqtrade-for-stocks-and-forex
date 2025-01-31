@@ -1,8 +1,9 @@
 # alpacastocks.py
 # This file contains the implementation for the Alpaca Stocks exchange integration in Freqtrade.
-
+import json
 import logging
 import sys
+from pathlib import Path
 
 import pandas as pd
 import pyarrow.feather as feather
@@ -26,6 +27,9 @@ class Alpacastocks(Stockexchange):
     DECIMAL_PLACES = 2
     SIGNIFICANT_DIGITS = 3
     TICK_SIZE = 4
+    MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
+
+    PAIRLIST_FILE = "user_data/data/alpacastocks/alpaca_pairs.json"
 
     _ft_has_default = {
         "stoploss_on_exchange": False,
@@ -117,62 +121,77 @@ class Alpacastocks(Stockexchange):
         :param tradable_only: If True, return only tradable markets.
         :param active_only: If True, return only active markets.
         """
+
+        pairlist_file_path = Path(self.PAIRLIST_FILE)
+
         try:
             if not hasattr(self, "_markets") or reload:
-                try:
-                    search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
-                    assets = self.trading_client.get_all_assets(search_params)
-                    assets_dict = [dict(item) for item in assets]
-                    self._markets = {}
-                    for asset in assets_dict:
-                        if tradable_only and not asset["tradable"]:
-                            continue
-                        if active_only and asset["status"] != "active":
-                            continue
-                        pair = f"{asset['symbol']}/USD"
-                        self._markets[pair] = {
-                            "id": pair,
-                            "symbol": pair,
-                            "base": asset["symbol"],
-                            "quote": "USD",
-                            "spot": True,
-                            "margin": False,
-                            "active": asset["status"] == "active",
-                            "maker": 0.001,
-                            "taker": 0.002,
-                            "info": asset,
-                            "precision": {"amount": 8, "price": 8},
-                            "limits": {
-                                "amount": {"min": 0.001, "max": 1000000},
-                                "price": {"min": 0.01, "max": 1000000},
-                                "cost": {"min": 0.01, "max": 1000000},
-                            },
-                            "future": False,
-                            "option": False,
-                            "linear": True,
-                            "inverse": False,
-                            "contractSize": 1,
-                            "expiry": None,
-                            "expiry_date": None,
-                            "strike": None,
-                            "underlying": None,
-                            "settle": None,
-                            "settleDate": None,
-                            "listing": None,
-                            "listed": None,
-                            "market_type": "spot",
-                        }
-                        logger.debug(f"Added pair: {pair}")
-                except Exception as e:
-                    error_message = str(e).lower()
-                    if "forbidden" in error_message:
-                        logger.error(
-                            "Authentication failed - Invalid API credentials. "
-                            "Please check your Alpaca API key and secret. "
-                            "Make sure they are correct and have proper permissions."
-                        )
-                        sys.exit(1)
-            # logger.info(f"Retrieved markets: {self._markets}")
+                if pairlist_file_path.exists():
+                    # Load markets from file
+                    with pairlist_file_path.open() as f:
+                        self._markets = json.load(f)
+                else:
+                    try:
+                        search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
+                        assets = self.trading_client.get_all_assets(search_params)
+                        assets_dict = [dict(item) for item in assets]
+                        self._markets = {}
+                        for asset in assets_dict:
+                            if tradable_only and not asset["tradable"]:
+                                continue
+                            if active_only and asset["status"] != "active":
+                                continue
+                            pair = f"{asset['symbol']}/USD"
+                            self._markets[pair] = {
+                                "id": pair,
+                                "symbol": pair,
+                                "base": asset["symbol"],
+                                "quote": "USD",
+                                "spot": True,
+                                "margin": False,
+                                "active": asset["status"] == "active",
+                                "maker": 0.001,
+                                "taker": 0.002,
+                                "info": asset,
+                                "precision": {"amount": 8, "price": 8},
+                                "limits": {
+                                    "amount": {"min": 0.001, "max": 1000000},
+                                    "price": {"min": 0.01, "max": 1000000},
+                                    "cost": {"min": 0.01, "max": 1000000},
+                                },
+                                "future": False,
+                                "option": False,
+                                "linear": True,
+                                "inverse": False,
+                                "contractSize": 1,
+                                "expiry": None,
+                                "expiry_date": None,
+                                "strike": None,
+                                "underlying": None,
+                                "settle": None,
+                                "settleDate": None,
+                                "listing": None,
+                                "listed": None,
+                                "market_type": "spot",
+                            }
+                            logger.debug(f"Added pair: {pair}")
+
+                        # logger.info(f"Retrieved markets: {self._markets}")
+
+                        with pairlist_file_path.open("w") as f:
+                            json.dump(self._markets, f, default=str)
+                        logger.info("Saved market pairs to file.")
+
+                    except Exception as e:
+                        error_message = str(e).lower()
+                        if "forbidden" in error_message:
+                            logger.error(
+                                "Authentication failed - Invalid API credentials. "
+                                "Please check your Alpaca API key and secret. "
+                                "Make sure they are correct and have proper permissions."
+                            )
+                            sys.exit(1)
+
             return self._markets
         except Exception as e:
             logger.error(f"Failed to retrieve markets: {str(e)}")
@@ -555,3 +574,41 @@ class Alpacastocks(Stockexchange):
                 continue
 
         return latest_ohlcv
+
+    def get_balances(self):
+        """Retrieve account balances (already implemented)"""
+        try:
+            account = self.trading_client.get_account()
+            return {
+                "USD": {
+                    "free": float(account.cash),
+                    "used": float(account.cash) - float(account.buying_power),
+                    "total": float(account.equity),
+                }
+            }
+        except Exception as e:
+            logger.error(f"Balance fetch error: {e}")
+            return {}
+
+    def fetch_positions(self, symbols=None, params=None):
+        """New positions fetch method"""
+        try:
+            positions = self.trading_client.get_all_positions()
+            return [self._format_position(pos) for pos in positions]
+        except Exception as e:
+            logger.error(f"Position fetch error: {e}")
+            return []
+
+    def _format_position(self, position):
+        """Helper to format Alpaca position"""
+        qty = float(position.qty)
+        return {
+            "symbol": f"{position.symbol}/USD",
+            "amount": abs(qty),
+            "side": "long" if qty > 0 else "short",
+            "leverage": 1.0,
+            "contracts": abs(qty),
+            "contractSize": 1,
+            "unrealizedPnl": float(position.unrealized_pl),
+            "info": dict(position),
+        }
