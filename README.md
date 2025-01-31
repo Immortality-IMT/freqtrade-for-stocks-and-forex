@@ -1,11 +1,12 @@
-This fork aims to stay in sync with Freqtrade except it adds stocks and fx. You can use your freqtrade strategies without alteration on stocks and foreign exchange. 
-Currently both stocks and forex work only for backtesting strategies.
+This fork aims to stay in sync with Freqtrade except it adds stocks and forex. You can use your freqtrade strategies without alteration on stocks and foreign exchange. 
+Currently stocks work only for backtesting strategies.
 
 Installation is same. Notes:
 
 - You have to get paper trading API keys, regardless.
 - In config: Use USD instead of USDT, so it is TSLA/USD and stake_currency: USD
 - The custom exchange is named alpacastocks and oanda
+- config_examples has stocks_config.json
 
 ```
     "stake_currency": "USD",
@@ -30,6 +31,7 @@ Test with commands...
 ```
 freqtrade download-data --config user_data/stocks_config.json --timeframes 1m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
+freqtrade trade -c user_data/stocks_config.json -s SampleStrategy
 ```
 
 # ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade_poweredby.svg)
