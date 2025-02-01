@@ -8,9 +8,10 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.feather as feather
 import requests
-from alpaca.trading.client import TradingClient
+from alpaca.trading.client import TradingClient, TradingStream
 from alpaca.trading.enums import AssetClass
-from alpaca.trading.requests import GetAssetsRequest
+from alpaca.trading.exceptions import APIError
+from alpaca.trading.requests import GetAssetsRequest, LimitOrderRequest, MarketOrderRequest
 
 from freqtrade.exchange.stockexchange import Stockexchange
 
@@ -108,6 +109,11 @@ class Alpacastocks(Stockexchange):
         # Initialize TradingClient
         self.trading_client = TradingClient(self.key, self.secret, paper=self.dry_run)
 
+        # Initialize WebSocket client
+        self.ws_client = None
+        if self._ft_has_default["ws_enabled"]:
+            self.setup_websocket()
+
     @property
     def name(self):
         return "alpacastocks"
@@ -197,6 +203,63 @@ class Alpacastocks(Stockexchange):
             logger.error(f"Failed to retrieve markets: {str(e)}")
             return {}
 
+    def setup_websocket(self):
+        """Initialize WebSocket for real-time updates."""
+        self.ws_client = TradingStream(self.key, self.secret, paper=self.dry_run)
+        self.ws_client.subscribe_trade_updates(self.handle_trade_update)
+        self.ws_client.run()
+
+    def handle_trade_update(self, trade_update):
+        """Handle real-time trade updates from WebSocket."""
+        logger.info(f"Trade update received: {trade_update}")
+
+    def create_order(
+        self,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        params=None,
+    ):
+        """Create an order on Alpaca."""
+        symbol = pair.split("/")[0]
+        if params is None:
+            params = {}
+
+        try:
+            if ordertype == "market":
+                order_data = MarketOrderRequest(symbol=symbol, qty=amount, side=side)
+            elif ordertype == "limit":
+                order_data = LimitOrderRequest(
+                    symbol=symbol, qty=amount, side=side, limit_price=price
+                )
+            else:
+                raise ValueError(f"Unsupported order type: {ordertype}")
+
+            order = self.trading_client.submit_order(order_data)
+            return order.id  # Return order ID for tracking
+        except APIError as e:
+            logger.error(f"Failed to create order: {e}")
+            return None
+
+    def cancel_order(self, order_id: str):
+        """Cancel an order on Alpaca."""
+        try:
+            self.trading_client.cancel_order_by_id(order_id)
+            logger.info(f"Order {order_id} canceled successfully.")
+        except APIError as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+
+    def fetch_order(self, order_id: str):
+        """Fetch order details from Alpaca."""
+        try:
+            order = self.trading_client.get_order_by_id(order_id)
+            return order
+        except APIError as e:
+            logger.error(f"Failed to fetch order {order_id}: {e}")
+            return None
+
     @property
     def markets(self):
         return self._markets
@@ -208,10 +271,10 @@ class Alpacastocks(Stockexchange):
     def get_fee(self, symbol, now=None, taker_or_maker="maker"):
         # Replace with the actual fee calculation for the symbol
         fee = {
-            "maker": 0,
-            "taker": 0,
+            "maker": 0.001,
+            "taker": 0.001,
         }
-        return fee.get(taker_or_maker, 0)
+        return fee.get(taker_or_maker, 0.001)
 
     @property
     def precisionMode(self):
