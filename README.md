@@ -5,7 +5,7 @@ Installation is same. Notes:
 
 - You have to get paper trading API keys, regardless.
 - In config: Use USD instead of USDT, so it is TSLA/USD and stake_currency: USD
-- The custom exchange is named alpacastocks and oanda
+- The custom exchange is named alpacastocks and interactivebrokers
 - config_examples has stocks_config.json
 
 ```
@@ -29,7 +29,7 @@ Installation is same. Notes:
 Test with commands...
 
 ```
-freqtrade download-data --config user_data/stocks_config.json --timeframes 1m --timerange 20240101-20240201
+freqtrade download-data --config user_data/stocks_config.json --timeframes 5m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
 freqtrade trade -c user_data/stocks_config.json -s SampleStrategy
 ```

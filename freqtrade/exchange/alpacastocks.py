@@ -8,10 +8,11 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.feather as feather
 import requests
-from alpaca.trading.client import TradingClient, TradingStream
+from alpaca.common.exceptions import APIError
+from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
-from alpaca.trading.exceptions import APIError
 from alpaca.trading.requests import GetAssetsRequest, LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.stream import TradingStream
 
 from freqtrade.exchange.stockexchange import Stockexchange
 
