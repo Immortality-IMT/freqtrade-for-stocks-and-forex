@@ -33,9 +33,9 @@
         "order_book_top": 1
     },
     "exchange": {
-        "name": "oanda",
-    	"key": "",
-    	"secret": "",
+        "name": "interactivebrokers",
+        "key": "get_an_api_key",
+        "secret": "get_an_api_key",
         "pair_whitelist": ["CAD/USD", "AUD/USD", "GBP/USD"], //USD not USDT
         "pair_blacklist": []
     },

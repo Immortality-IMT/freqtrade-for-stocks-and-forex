@@ -410,7 +410,7 @@ class Alpacastocks(Stockexchange):
         end,
         limit=1000,
         adjustment="raw",
-        feed="sip",
+        feed="iex",
         currency="USD",
     ):
         """
@@ -492,7 +492,8 @@ class Alpacastocks(Stockexchange):
             if until_ms:
                 end = pd.to_datetime(until_ms, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
-                end = None
+                # Use current UTC time (or current_time minus a small buffer) as the end time.
+                end = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
 
             bars = self.get_historical_bars(
                 [symbol],
@@ -501,7 +502,7 @@ class Alpacastocks(Stockexchange):
                 end,
                 limit,
                 params.get("adjustment", "raw"),
-                params.get("feed", "sip"),
+                params.get("feed", "iex"),
                 params.get("currency", "USD"),
             )
 
@@ -598,37 +599,32 @@ class Alpacastocks(Stockexchange):
     def refresh_latest_ohlcv(self, pairs=None, timeframe="1h", **kwargs):
         """
         Fetches the latest OHLCV data for the given pairs from Alpaca.
-
-        :param pairs: List of trading pairs (or tuples) to fetch data for.
-        :param timeframe: Timeframe for the data (e.g., '1m', '1h', '1d').
-        :return: Dictionary mapping pairs to their latest OHLCV data as DataFrames.
         """
-        if not pairs:
+        if not self.is_market_open():
+            # If the market is closed, this message will have already been logged by is_market_open.
+            # Optionally, you can decide not to proceed with fetching data.
             return {}
 
+        # Continue with fetching data when the market is open
         latest_ohlcv = {}
         current_time = pd.Timestamp.now(tz="UTC")
 
-        for raw_pair in pairs:
-            # Extract the actual pair string if it's a tuple (pair, timeframe, candle_type)
+        for raw_pair in pairs or []:
             if isinstance(raw_pair, tuple) and len(raw_pair) == 3:
                 pair_symbol = raw_pair[0]
             else:
                 pair_symbol = raw_pair
 
             try:
-                # Fetch the most recent candle (last 5 minutes to ensure we get the latest)
                 start_time = current_time - pd.Timedelta(minutes=5)
                 limit = 1  # Get only the latest candle
-
-                # Call get_historic_ohlcv with the extracted pair symbol
                 ohlcv_data = self.get_historic_ohlcv(
                     pair=pair_symbol,
                     timeframe=timeframe,
                     since=int(start_time.timestamp() * 1000),
+                    until_ms=int(current_time.timestamp() * 1000),
                     limit=limit,
                 )
-
                 if not ohlcv_data.empty:
                     latest_ohlcv[pair_symbol] = ohlcv_data
                 else:
@@ -676,3 +672,19 @@ class Alpacastocks(Stockexchange):
             "unrealizedPnl": float(position.unrealized_pl),
             "info": dict(position),
         }
+
+    def is_market_open(self) -> bool:
+        """
+        Check if the market is open using Alpaca's clock API.
+
+        :return: True if the market is open, False otherwise.
+        """
+        try:
+            clock = self.trading_client.get_clock()
+            if not clock.is_open:
+                logger.info("Market is closed")
+            return clock.is_open
+        except Exception as e:
+            logger.error(f"Failed to retrieve market clock: {e}")
+            # If there is an error, assume the market is closed
+            return False
