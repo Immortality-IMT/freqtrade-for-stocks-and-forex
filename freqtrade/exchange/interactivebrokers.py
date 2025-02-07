@@ -20,9 +20,9 @@ class Interactivebrokers(Foreignexchange):
     to work with IBKR for forex trading.
     """
 
-    DECIMAL_PLACES = 5  # Forex typically uses 5 decimal places
-    SIGNIFICANT_DIGITS = 3
-    TICK_SIZE = 0.00001  # Minimum price movement for forex
+    DECIMAL_PLACES = 6  # Forex typically uses 5 decimal places
+    SIGNIFICANT_DIGITS = 6
+    TICK_SIZE = 0.000001  # Minimum price movement for forex
     MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
 
     _ft_has_default = {
