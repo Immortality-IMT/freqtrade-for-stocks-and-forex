@@ -169,6 +169,21 @@ class Interactivebrokers(Foreignexchange):
             ("USD", "JPY"),
             ("AUD", "USD"),
             ("USD", "CAD"),
+            ("USD", "CHF"),
+            ("NZD", "USD"),
+            ("EUR", "GBP"),
+            ("EUR", "JPY"),
+            ("GBP", "JPY"),
+            ("EUR", "AUD"),
+            ("USD", "CNH"),
+            ("USD", "MXN"),
+            ("EUR", "CAD"),
+            ("AUD", "JPY"),
+            ("GBP", "CAD"),
+            ("AUD", "CAD"),
+            ("EUR", "NZD"),
+            ("GBP", "AUD"),
+            ("USD", "TRY"),
         ]
         for base, quote in forex_pairs:
             pair = f"{base}/{quote}"
