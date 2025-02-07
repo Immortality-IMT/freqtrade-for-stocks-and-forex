@@ -28,16 +28,27 @@ For Alpacastocks
             }
     ],
 ```
+
+Test with commands...
+
+```
+freqtrade download-data --config user_data/stocks_config.json --timeframes 5m --timerange 20240101-20240201
+freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
+freqtrade trade -c user_data/stocks_config.json -s SampleStrategy
+```
+
 For Interactivebrokers
 
-Download TWS - https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
-cd ~/Downloads
-chmod u+x tws-latest-linux-x64.sh
-./tws-latest-linux-x64.sh
+- Download TWS - https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
+- cd ~/Downloads
+- chmod u+x tws-latest-linux-x64.sh
+- ./tws-latest-linux-x64.sh
+
 In the application go to Settings... 
-Set the port to paper trade 4002 or live 7497
-Check Enable ActiveX and socket clients
-Uncheck read only API
+
+- Set the port to paper trade 4002 or live 7497
+- Check Enable ActiveX and socket clients
+- Uncheck read only API
 
 ```
     "exchange": {
@@ -63,12 +74,6 @@ Uncheck read only API
 
 Test with commands...
 
-```
-freqtrade download-data --config user_data/stocks_config.json --timeframes 5m --timerange 20240101-20240201
-freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
-freqtrade trade -c user_data/stocks_config.json -s SampleStrategy
-```
-or
 ```
 freqtrade download-data --config user_data/forex_config.json --timeframes 5m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timerange=20240101-20240201
