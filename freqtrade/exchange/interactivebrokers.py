@@ -21,7 +21,7 @@ class Interactivebrokers(Foreignexchange):
     """
 
     DECIMAL_PLACES = 5  # Forex typically uses 5 decimal places
-    SIGNIFICANT_DIGITS = 6
+    SIGNIFICANT_DIGITS = 3
     TICK_SIZE = 0.00001  # Minimum price movement for forex
     MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
 
@@ -223,6 +223,11 @@ class Interactivebrokers(Foreignexchange):
         since: int,
         timeframe: str | None = None,
         limit: int = 1000,
+        params=None,
+        since_ms=None,
+        is_new_pair=True,
+        candle_type="spot",
+        until_ms=None,
     ) -> pd.DataFrame:
         """
         Fetch historical OHLCV data from IBKR.
@@ -230,6 +235,11 @@ class Interactivebrokers(Foreignexchange):
         :param timeframe: Timeframe string (e.g., '1h', '5m').
         :param since: Start timestamp for data retrieval.
         :param limit: Maximum number of candles to fetch.
+        :param params: Additional parameters.
+        :param since_ms: Start timestamp in milliseconds.
+        :param is_new_pair: Whether the pair is new.
+        :param candle_type: Type of candle (e.g., 'spot').
+        :param until_ms: End timestamp in milliseconds.
         :return: DataFrame containing OHLCV data.
         """
         if isinstance(pair, tuple):
@@ -435,3 +445,81 @@ class Interactivebrokers(Foreignexchange):
             return f"{years} Y"
         else:
             return f"{total_days} D"
+
+    @property
+    def precisionMode(self):
+        return self.DECIMAL_PLACES
+
+    @property
+    def precision_mode_price(self):
+        return self.precisionMode
+
+    def get_precision_price(self, pair):
+        return 2
+
+    def validate_required_startup_candles(self, startup_candle_count, timeframe):
+        pass
+
+    def validate_timeframes(self, timeframes):
+        """
+        Validate the timeframes supported by the exchange.
+
+        :param timeframes: List of timeframes to validate.
+        """
+        if isinstance(timeframes, str):
+            timeframes = [timeframes]
+
+        supported_timeframes = ["1m", "5m", "15m", "1h", "1d"]
+        logger.info(f"Validating timeframes: {timeframes}")
+        for timeframe in timeframes:
+            logger.info(f"Validating timeframe: {timeframe}")
+            if timeframe not in supported_timeframes:
+                raise ValueError(
+                    f"Timeframe '{timeframe}' is not supported by Interactive Brokers."
+                )
+
+    def get_option(self, option: str, default: Any = None) -> Any:
+        """
+        Retrieve the value for a given option from the _ft_has_default dictionary.
+        :param option: The option key to retrieve.
+        :param default: Default value if the option is not found.
+        :return: The value of the option or the default.
+        """
+        return self._ft_has_default.get(option, default)
+
+    def get_max_leverage(self, pair: str, stake_amount: float) -> float:
+        """
+        Get the maximum leverage available for a given trading pair and stake amount.
+        :param pair: The trading pair (e.g., 'EUR/USD').
+        :param stake_amount: The amount of stake currency.
+        :return: Maximum leverage available.
+        """
+        return 1.0  # Assuming a leverage of 1 (no leverage)
+
+    def get_min_pair_stake_amount(self, pair: str, *args, leverage: float, **kwargs) -> float:
+        """
+        Get the minimum stake amount required for a given trading pair.
+        """
+        return 10.0  # or your custom logic
+
+    def get_max_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
+        """
+        Get the maximum stake amount allowed for a given trading pair.
+        """
+        return 1000000.0  # matches the limit defined in get_markets()
+
+    def get_valid_price_and_stake(self, row, pair, leverage):
+        propose_rate = row["close"]
+        stake_amount = self.calculate_stake_amount(pair, propose_rate, leverage)
+        min_stake_amount = self.exchange.get_min_pair_stake_amount(pair, leverage)
+        return propose_rate, stake_amount, leverage, min_stake_amount
+
+    def get_contract_size(self, pair: str) -> float:
+        """
+        Returns the contract size (lot size) for a given Forex pair.
+        Many Forex brokers use 100,000 units as a standard lot size.
+        """
+        return 100000.0
+
+    def get_precision_amount(self, pair):
+        return 2
