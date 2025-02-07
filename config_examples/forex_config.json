@@ -1,4 +1,11 @@
-
+//Download TWS
+//https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
+//cd ~/Downloads
+//chmod u+x tws-latest-linux-x64.sh
+//./tws-latest-linux-x64.sh
+// Setting, set the port to paper trade 4002 or live 7497
+// Check Enable ActiveX and socket clients
+// Uncheck read only API
 {
     "$schema": "https://schema.freqtrade.io/schema.json",
     "max_open_trades": 10,
@@ -34,16 +41,22 @@
     },
     "exchange": {
         "name": "interactivebrokers",
-        "key": "get_an_api_key",
-        "secret": "get_an_api_key",
-        "pair_whitelist": ["CAD/USD", "AUD/USD", "GBP/USD"], //USD not USDT
+        "key": "",
+        "secret": "",
+        "pair_whitelist": [
+            "EUR/USD", "GBP/USD", "JPY/USD", "AUD/USD", "CAD/USD",
+            "CHF/USD", "NZD/USD", "EUR/GBP", "CNH/USD", "MXN/USD"
+        ],
         "pair_blacklist": []
     },
     "pairlists": [
-            {
+        {
             "method": "StaticPairList",
-            "pairs": ["CAD/USD", "AUD/USD", "GBP/USD"], //USD not USDT
-            }
+            "pairs": [
+                "EUR/USD", "GBP/USD", "JPY/USD", "AUD/USD", "CAD/USD",
+                "CHF/USD", "NZD/USD", "EUR/GBP", "CNH/USD", "MXN/USD"
+            ]
+        }
     ],
     "telegram": {
         "enabled": false,
