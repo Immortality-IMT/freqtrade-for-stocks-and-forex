@@ -30,6 +30,15 @@ For Alpacastocks
 ```
 For Interactivebrokers
 
+Download TWS - https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
+cd ~/Downloads
+chmod u+x tws-latest-linux-x64.sh
+./tws-latest-linux-x64.sh
+In the application go to Settings... 
+Set the port to paper trade 4002 or live 7497
+Check Enable ActiveX and socket clients
+Uncheck read only API
+
 ```
     "exchange": {
         "name": "interactivebrokers",
