@@ -230,10 +230,12 @@ class Alpacastocks(Stockexchange):
 
         try:
             if ordertype == "market":
-                order_data = MarketOrderRequest(symbol=symbol, qty=amount, side=side)
+                # Use notional for market orders to specify USD amount
+                order_data = MarketOrderRequest(symbol=symbol, notional=amount, side=side.lower())
             elif ordertype == "limit":
+                # For limit orders, amount is in shares (qty)
                 order_data = LimitOrderRequest(
-                    symbol=symbol, qty=amount, side=side, limit_price=price
+                    symbol=symbol, qty=amount, side=side.lower(), limit_price=price
                 )
             else:
                 raise ValueError(f"Unsupported order type: {ordertype}")
