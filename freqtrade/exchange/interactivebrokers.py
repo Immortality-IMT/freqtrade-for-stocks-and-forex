@@ -95,11 +95,16 @@ class Interactivebrokers(Foreignexchange):
             self.port = 7497  # TWS live trading port
             logger.info("Connecting to IBKR live trading (TWS).")
         # Connect to TWS/IB Gateway
-        self.ib.connect("127.0.0.1", self.port, clientId=1)
-        if self.ib.isConnected():
-            logger.info(f"Successfully connected to IBKR on port {self.port}.")
-        else:
-            logger.error("Failed to connect to IBKR.")
+        try:
+            self.ib.connect("127.0.0.1", self.port, clientId=1)
+            if self.ib.isConnected():
+                logger.info(f"Successfully connected to IBKR on port {self.port}.")
+        except ConnectionRefusedError as e:
+            logger.error(f"Unexpected error while connecting to IBKR: {e}")
+            logger.error("Failed to connect to IBKR. Is TWS from Interactive Brokers running?")
+            logger.error("Get TWS: interactivebrokers.com/en/trading/tws-updatable-latest.php")
+            exit(1)
+
         self.ws_start()
         self.markets = self.get_markets()
         if not self.ib.isConnected():
