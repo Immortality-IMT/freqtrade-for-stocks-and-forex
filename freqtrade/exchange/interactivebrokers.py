@@ -20,9 +20,9 @@ class Interactivebrokers(Foreignexchange):
     to work with IBKR for forex trading.
     """
 
-    DECIMAL_PLACES = 6  # Forex typically uses 5 decimal places
-    SIGNIFICANT_DIGITS = 6
-    TICK_SIZE = 0.000001  # Minimum price movement for forex
+    DECIMAL_PLACES = 4
+    SIGNIFICANT_DIGITS = 4
+    TICK_SIZE = 0.0001  # Minimum price movement for forex
     MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
 
     _ft_has_default = {
@@ -222,12 +222,12 @@ class Interactivebrokers(Foreignexchange):
         """Get the fee structure for a symbol."""
         return 0.0001 if taker_or_maker == "maker" else 0.0002
 
-    def get_historical_ohlcv(
+    def get_historic_ohlcv(
         self,
-        pair: str,
-        since: int,
-        timeframe: str | None = None,
-        limit: int = 1000,
+        pair,
+        timeframe,
+        since=None,
+        limit=10000,
         params=None,
         since_ms=None,
         is_new_pair=True,
@@ -272,14 +272,20 @@ class Interactivebrokers(Foreignexchange):
             timeframe = self.config.get("timeframe", "1h")
         ib_timeframe = self._convert_timeframe(timeframe)
         durationStr = self._calculate_duration(timeframe, limit)
+
         bars = self.ib.reqHistoricalData(
             contract,
             endDateTime="",
+            # durationStr="5 D",
             durationStr=durationStr,
+            # barSizeSetting="5 mins",
             barSizeSetting=ib_timeframe,
-            whatToShow="MIDPOINT",
+            whatToShow="BID_ASK",
+            # whatToShow='TRADES',
+            # whatToShow="MIDPOINT",
             useRTH=True,
         )
+
         if bars is None:
             raise ValueError("No historical data returned from IBKR")
         df = util.df(bars)
@@ -313,7 +319,7 @@ class Interactivebrokers(Foreignexchange):
                 pair = item
                 timeframe = self.config.get("timeframe", "1h")
             try:
-                ohlcv = self.get_historical_ohlcv(pair, 0, timeframe, 1)
+                ohlcv = self.get_historic_ohlcv(pair, 0, timeframe, 1)
                 self.latest_ohlcv[pair] = ohlcv
                 logger.info("Refreshed latest OHLCV for %s", pair)
             except Exception as e:
@@ -342,7 +348,7 @@ class Interactivebrokers(Foreignexchange):
             params = {}
         if timeframe is None:
             timeframe = self.config.get("timeframe", "1h")
-        return self.get_historical_ohlcv(pair, since, timeframe, limit)
+        return self.get_historic_ohlcv(pair, since, timeframe, limit)
 
     def get_balances(self):
         """Retrieve account balances."""
