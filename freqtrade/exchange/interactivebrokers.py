@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 from ib_insync import IB, Contract, Forex, Order, util
 
+from freqtrade.enums import MarginMode
 from freqtrade.exchange.foreignexchange import Foreignexchange
 
 
@@ -20,9 +21,9 @@ class Interactivebrokers(Foreignexchange):
     to work with IBKR for forex trading.
     """
 
-    DECIMAL_PLACES = 4
-    SIGNIFICANT_DIGITS = 4
-    TICK_SIZE = 0.0001  # Minimum price movement for forex
+    DECIMAL_PLACES = 6  # Forex typically uses 5 decimal places
+    SIGNIFICANT_DIGITS = 6
+    TICK_SIZE = 0.000001  # Minimum price movement for forex
     MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
 
     _ft_has_default = {
@@ -31,7 +32,7 @@ class Interactivebrokers(Foreignexchange):
         "ohlcv_candle_limit": 500,
         "ohlcv_has_history": True,
         "ohlcv_partial_candle": True,
-        "ohlcv_require_since": False,
+        "ohlcv_require_since": False,  # IBKR doesn't use 'since' directly in reqHistoricalData
         "ohlcv_volume_currency": "base",
         "tickers_have_quoteVolume": True,
         "tickers_have_percentage": True,
@@ -105,10 +106,16 @@ class Interactivebrokers(Foreignexchange):
             logger.error("Get TWS: interactivebrokers.com/en/trading/tws-updatable-latest.php")
             exit(1)
 
+        self.margin_mode = MarginMode.NONE
+
         self.ws_start()
         self.markets = self.get_markets()
         if not self.ib.isConnected():
             raise ConnectionError("WebSocket connection failed")
+
+    @property
+    def id(self) -> str:
+        return "interactivebrokers"
 
     @property
     def name(self) -> str:
@@ -129,35 +136,95 @@ class Interactivebrokers(Foreignexchange):
         amount: float,
         price: float | None = None,
         params: dict[Any, Any] | None = None,
-    ) -> int:
-        if params is None:
-            params = {}
-        """Create an order on IBKR."""
-        symbol = pair.split("/")[0]
-        currency = pair.split("/")[1]
-        # Define forex contract
-        contract = Forex(symbol, currency)
-        if ordertype == "market":
-            order = Order(action=side, totalQuantity=amount, orderType="MKT")
-        elif ordertype == "limit":
-            order = Order(action=side, totalQuantity=amount, orderType="LMT", lmtPrice=price)
+        **kwargs,
+    ) -> dict:
+        # Build the contract from the pair
+        parts = pair.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
+        symbol, currency = parts[0].strip().upper(), parts[1].strip().upper()
+        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
+
+        if ordertype == "limit":
+            # If no valid price is provided, attempt to fetch one using get_rate.
+            if price is None or price <= 0:
+                logger.info(
+                    f"No valid price for {pair}, call get_rate to get price for side {side}."
+                )
+                price = self.get_rate(pair, side=side)
+            if price is None or price <= 0:
+                logger.error(
+                    f"Attempted to create limit order for {pair} with invalid price: {price}"
+                )
+                raise ValueError(f"Limit order for {pair} requires a valid price > 0.")
+            formatted_price = round(price, 5)
+            order = Order(
+                action=side, totalQuantity=round(amount), orderType="LMT", lmtPrice=formatted_price
+            )
+        elif ordertype == "market":
+            order = Order(action=side, totalQuantity=round(amount), orderType="MKT")
         else:
             raise ValueError(f"Unsupported order type: {ordertype}")
+
+        # Place the order via IBKR API
         trade = self.ib.placeOrder(contract, order)
-        return trade.order.orderId
+        # Return a CCXT-style order dict
+        return {
+            "id": str(trade.order.orderId),
+            "symbol": pair,
+            "type": ordertype.lower(),
+            "side": side.lower(),
+            "amount": amount,
+            "price": price,
+            "filled": 0.0,
+            "remaining": amount,
+            "status": "open",
+            "info": trade.order,
+        }
+
+    def fetch_order(
+        self,
+        order_id: str,
+        pair: str | None = None,  # Changed from Optional[str]
+    ) -> dict | None:
+        """Fetch order from IBKR and format as CCXT order."""
+        trades = self.ib.trades()
+        for trade in trades:
+            if str(trade.order.orderId) == order_id:
+                # Convert IBKR trade to CCXT-style order dict
+                filled = trade.orderStatus.filled
+                remaining = trade.orderStatus.remaining
+                return {
+                    "id": str(trade.order.orderId),
+                    "symbol": f"{trade.contract.symbol}/{trade.contract.currency}",
+                    "type": trade.order.orderType.lower(),
+                    "side": "buy" if trade.order.action == "BUY" else "sell",
+                    "amount": trade.order.totalQuantity,
+                    "price": trade.order.lmtPrice if trade.order.orderType == "LMT" else None,
+                    "filled": filled,
+                    "remaining": remaining,
+                    "status": self._parse_order_status(trade.orderStatus.status),
+                    "info": trade,
+                }
+        return None
+
+    def _parse_order_status(self, ib_status: str) -> str:
+        """Map IBKR order status to CCXT status."""
+        status_mapping = {
+            "ApiPending": "open",
+            "PendingSubmit": "open",
+            "PreSubmitted": "open",
+            "Submitted": "open",
+            "Filled": "closed",
+            "Cancelled": "canceled",
+            "Inactive": "canceled",
+        }
+        return status_mapping.get(ib_status, "unknown")
 
     def cancel_order(self, order_id: str) -> None:
         """Cancel an order on IBKR."""
         self.ib.cancelOrder(order_id)
         logger.info(f"Order {order_id} canceled successfully.")
-
-    def fetch_order(self, order_id: str):
-        """Fetch order details from IBKR."""
-        trades = self.ib.trades()
-        for trade in trades:
-            if trade.order.orderId == order_id:
-                return trade
-        return None
 
     def get_markets(
         self,
@@ -224,15 +291,15 @@ class Interactivebrokers(Foreignexchange):
 
     def get_historic_ohlcv(
         self,
-        pair,
-        timeframe,
-        since=None,
-        limit=10000,
-        params=None,
-        since_ms=None,
-        is_new_pair=True,
-        candle_type="spot",
-        until_ms=None,
+        pair: str,
+        since: int | None = None,
+        timeframe: str | None = None,
+        limit: int = 1000,
+        params: dict[Any, Any] | None = None,
+        since_ms: int | None = None,
+        is_new_pair: bool = True,
+        candle_type: str = "spot",
+        until_ms: int | None = None,
     ) -> pd.DataFrame:
         """
         Fetch historical OHLCV data from IBKR.
@@ -272,20 +339,14 @@ class Interactivebrokers(Foreignexchange):
             timeframe = self.config.get("timeframe", "1h")
         ib_timeframe = self._convert_timeframe(timeframe)
         durationStr = self._calculate_duration(timeframe, limit)
-
         bars = self.ib.reqHistoricalData(
             contract,
             endDateTime="",
-            # durationStr="5 D",
             durationStr=durationStr,
-            # barSizeSetting="5 mins",
             barSizeSetting=ib_timeframe,
-            whatToShow="BID_ASK",
-            # whatToShow='TRADES',
-            # whatToShow="MIDPOINT",
+            whatToShow="MIDPOINT",
             useRTH=True,
         )
-
         if bars is None:
             raise ValueError("No historical data returned from IBKR")
         df = util.df(bars)
@@ -319,7 +380,7 @@ class Interactivebrokers(Foreignexchange):
                 pair = item
                 timeframe = self.config.get("timeframe", "1h")
             try:
-                ohlcv = self.get_historic_ohlcv(pair, 0, timeframe, 1)
+                ohlcv = self.get_historic_ohlcv(pair, None, timeframe, 1)  # Passing None for since
                 self.latest_ohlcv[pair] = ohlcv
                 logger.info("Refreshed latest OHLCV for %s", pair)
             except Exception as e:
@@ -459,11 +520,11 @@ class Interactivebrokers(Foreignexchange):
 
     @property
     def precisionMode(self):
-        return self.DECIMAL_PLACES
+        return 4
 
     @property
     def precision_mode_price(self):
-        return self.precisionMode
+        return 4
 
     def get_precision_price(self, pair):
         return 2
@@ -507,11 +568,11 @@ class Interactivebrokers(Foreignexchange):
         """
         return 1.0  # Assuming a leverage of 1 (no leverage)
 
-    def get_min_pair_stake_amount(self, pair: str, *args, leverage: float, **kwargs) -> float:
+    def get_min_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
         """
         Get the minimum stake amount required for a given trading pair.
         """
-        return 10.0  # or your custom logic
+        return 10.0  # or your custom logic for minimum stake
 
     def get_max_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
         """
@@ -522,7 +583,9 @@ class Interactivebrokers(Foreignexchange):
     def get_valid_price_and_stake(self, row, pair, leverage):
         propose_rate = row["close"]
         stake_amount = self.calculate_stake_amount(pair, propose_rate, leverage)
-        min_stake_amount = self.exchange.get_min_pair_stake_amount(pair, leverage)
+        min_stake_amount = self.exchange.get_min_pair_stake_amount(
+            pair
+        )  # Removed leverage argument here
         return propose_rate, stake_amount, leverage, min_stake_amount
 
     def get_contract_size(self, pair: str) -> float:
@@ -534,3 +597,180 @@ class Interactivebrokers(Foreignexchange):
 
     def get_precision_amount(self, pair):
         return 2
+
+    def get_rate(
+        self,
+        pair: str,
+        side: str | None = None,
+        is_short: bool | None = None,
+        refresh: bool = False,
+        **kwargs,
+    ) -> float:
+        """
+        Get the current exchange rate for a given trading pair.
+        If side is provided ('buy' or 'sell'), it returns the
+        ask or bid price respectively; otherwise, returns the
+        midpoint price.
+
+        :param pair: The trading pair (e.g., 'EUR/USD').
+        :param side: Optional parameter, 'buy' or 'sell' to get ask or bid price.
+        :param is_short: Optional parameter indicating if the position is short.
+        :param refresh: Optional parameter to force refreshing the market data.
+        :return: The current exchange rate as a float.
+        :raises ValueError: If no data is available for the pair.
+        """
+        # if isinstance(pair, tuple):
+        #    pair = pair[0]
+
+        # Ensure the pair is split properly and standardized
+        # symbol, currency = [s.strip().upper() for s in pair.split('/')]
+        # Now 'symbol' and 'currency' should both be exactly 3 characters for standard forex pairs.
+        # contract = Forex(symbol=symbol, currency=currency)
+
+        parts = pair.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
+        symbol, currency = parts[0].strip().upper(), parts[1].strip().upper()
+        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
+
+        if self.ib.isConnected() and side is not None:
+            # Request real-time market data for the pair
+            try:
+                market_data = self.ib.reqMktData(contract)
+                if market_data is not None:
+                    if side.lower() == "buy":
+                        price = market_data.ask
+                        if price and price > 0:
+                            logger.info(f"Returning ask price for {pair}: {price}")
+                            return price
+                        else:
+                            logger.warning(f"Invalid ask price received for {pair}: {price}")
+                    elif side.lower() == "sell":
+                        price = market_data.bid
+                        if price and price > 0:
+                            logger.info(f"Returning bid price for {pair}: {price}")
+                            return price
+                        else:
+                            logger.warning(f"Invalid bid price received for {pair}: {price}")
+            except Exception as e:
+                logger.error(f"Failed to request market data for {pair}: {e}")
+
+        # Fallback to historical data for midpoint price
+        timeframe = self.config.get("timeframe", "5m")
+        ohlcv = self.get_historic_ohlcv(
+            pair, None, timeframe=timeframe, limit=1
+        )  # Passing None for since
+        if not ohlcv.empty:
+            close_price = ohlcv.iloc[0]["close"]
+            if close_price and close_price > 0:
+                logger.info(f"Returning historical close price for {pair}: {close_price}")
+                return close_price
+            else:
+                logger.warning(
+                    f"Historical data returned invalid close price for {pair}: {close_price}"
+                )
+        raise ValueError(f"Could not fetch current rate for {pair}")
+
+    def get_funding_fees(self, pair: str, timeframe: str | None = None, **kwargs) -> float:
+        """
+        Return the funding fee for a given trading pair.
+        For Forex trading, funding fees may be negligible or not applicable,
+        so returning 0.0 is appropriate.
+        """
+        return 0.0
+
+    def fetch_order_or_stoploss_order(
+        self,
+        order_id: str,
+        pair: str | None = None,
+        *args,
+        **kwargs,
+    ) -> dict:
+        """
+        Fetch order details from IBKR, including stoploss orders.
+
+        :param order_id: The order ID to fetch.
+        :param pair: The trading pair (optional).
+        :param args: Additional positional arguments (ignored).
+        :param kwargs: Additional keyword arguments (ignored).
+        :return: Order details or a dictionary indicating the order status.
+        """
+        order = self.fetch_order(order_id, pair)
+        if order is None:
+            return {"status": "not_found"}
+        return order
+
+    def check_order_canceled_empty(self, order: dict) -> bool:
+        """
+        Checks if the order is canceled and has no remaining quantity.
+        This is relevant for some exchanges that might return partially filled
+        and then canceled orders as "canceled" even if they have a filled amount.
+
+        :param order: Order dictionary as returned by `fetch_order`
+        :return: True if the order is canceled and empty (no remaining quantity), False otherwise.
+        """
+        if not order:
+            return False  # Or maybe True, depending on how empty orders are represented
+        return order.get("status") == "canceled" and order.get("remaining", 0) == 0
+
+    def order_has_fee(self, order) -> bool:
+        """
+        Return whether the order object includes fee information.
+        For IBKR, fees might not be available, so we return False.
+        """
+        return False
+
+    def get_trades_for_order(self, order, *args, **kwargs):
+        """Retrieve trades associated with the given order, ignoring extra arguments."""
+        if not order:
+            return []
+
+        # Extract the order_id from the order parameter
+        order_id = None
+        if isinstance(order, dict):
+            order_id = order.get("order_id", None)
+        else:
+            order_id = getattr(order, "order_id", None)
+
+        if order_id is None:
+            return []
+
+        # Query IB for trades
+        trades = self.ib.trades()
+        matching_trades = []
+
+        for trade in trades:
+            if hasattr(trade.order, "orderId") and trade.order.orderId == order_id:
+                matching_trades.append(trade)
+
+        return matching_trades
+
+    def get_order_id_conditional(self, order: dict | None) -> str | None:
+        """Extract order ID from the order object or dictionary."""
+        if not order:
+            return None
+        if isinstance(order, dict):
+            return order.get("order_id") if "order_id" in order else None
+        return None
+
+    def get_liquidation_price(
+        self,
+        pair: str,
+        side: str | None = None,
+        leverage: float | None = None,
+        open_rate: float | None = None,
+        amount: float | None = None,
+        initial_stop_rate: float | None = None,
+        is_short: bool = False,
+        stake_amount: float | None = None,
+        wallet_balance: float | None = None,
+    ) -> None:
+        """
+        Return the liquidation price for a given trade.
+        Since this is spot forex (or treated as such),
+        liquidation price is not applicable.
+        Therefore, we return None.
+        Corrected syntax error by providing default values
+        for all arguments after the first default.
+        """
+        return None
