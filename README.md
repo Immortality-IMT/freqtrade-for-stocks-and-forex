@@ -1,8 +1,12 @@
-This fork aims to stay in sync with Freqtrade except it adds stocks and forex. You can use your freqtrade strategies without alteration on stocks and foreign exchange. 
+This fork aims to stay in sync with Freqtrade except it adds stocks and forex. 
+You can use your freqtrade strategies without alteration on stocks and foreign exchange. 
 Currently stocks work only for backtesting strategies.
 Both stocks and forex connect to the exchanges but do not open any trades.
 
-Installation is same. Notes:
+Installation is also identical to freqtrade, including generating the user_data directory.
+Config examples are provided in config_examples folder to move to the user_data directory.
+
+Notes:
 
 For Alpacastocks
 
@@ -79,6 +83,8 @@ freqtrade download-data --config user_data/forex_config.json --timeframes 5m --t
 freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timerange=20240101-20240201
 freqtrade trade -c user_data/forex_config.json -s SampleStrategy
 ```
+
+The discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks and forex round to 2 decimal places.
 
 # ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade_poweredby.svg)
 
