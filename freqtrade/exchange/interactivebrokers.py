@@ -144,6 +144,7 @@ class Interactivebrokers(Foreignexchange):
 
                 if self.ib.isConnected():
                     logger.info(f"Successfully connected to IBKR on port {self.port}.")
+                    util.startLoop()
                     self._setup_event_loop()
                     self._ws_connected = True
                     return
@@ -395,8 +396,6 @@ class Interactivebrokers(Foreignexchange):
             "status": "failed",
             "info": info,
         }
-
-    # ... rest of class unchanged ...
 
     def fetch_order(
         self,
@@ -701,24 +700,6 @@ class Interactivebrokers(Foreignexchange):
                 }
         return balances
 
-    def fetch_positions(self) -> list:
-        positions = self.ib.positions()
-        formatted_positions: list[dict[str, Any]] = []
-        for pos in positions:
-            formatted_positions.append(
-                {
-                    "symbol": f"{pos.contract.symbol}/{pos.contract.currency}",
-                    "amount": float(pos.position),
-                    "side": "long" if pos.position > 0 else "short",
-                    "leverage": 1.0,
-                    "contracts": abs(pos.position),
-                    "contractSize": 1,
-                    "unrealizedPnl": float(pos.unrealizedPNL),
-                    "info": pos,
-                }
-            )
-        return formatted_positions
-
     def close(self) -> None:
         self.ib.disconnect()
         logger.info("Disconnected from IBKR.")
@@ -995,3 +976,128 @@ class Interactivebrokers(Foreignexchange):
         except Exception as e:
             logger.error(f"Failed to validate required startup candles: {e}")
             raise
+
+    def fetch_open_orders(self, symbol: str | None = None) -> list[dict]:
+        self.ib.reqOpenOrders()
+        orders = []
+        for o in self.ib.openOrders():
+            sym = f"{o.contract.symbol}/{o.contract.currency}"
+            if symbol and sym != symbol:
+                continue
+            filled = float(o.orderStatus.filled)
+            total = float(o.order.totalQuantity)
+            orders.append(
+                {
+                    "id": str(o.order.orderId),
+                    "symbol": sym,
+                    "type": o.order.orderType.lower(),
+                    "side": o.order.action.lower(),
+                    "amount": total,
+                    "price": getattr(o.order, "lmtPrice", None),
+                    "filled": filled,
+                    "remaining": total - filled,
+                    "status": self._parse_order_status(o.orderStatus.status),
+                    "info": {},
+                }
+            )
+        return orders
+
+    def fetch_closed_orders(self, symbol: str | None = None) -> list[dict]:
+        closed = []
+        for t in self.ib.trades():
+            status = self._parse_order_status(t.orderStatus.status)
+            if status not in ("closed", "canceled"):
+                continue
+            sym = f"{t.contract.symbol}/{t.contract.currency}"
+            if symbol and sym != symbol:
+                continue
+            qty = float(t.order.totalQuantity)
+            filled = float(t.orderStatus.filled)
+            closed.append(
+                {
+                    "id": str(t.order.orderId),
+                    "symbol": sym,
+                    "type": t.order.orderType.lower(),
+                    "side": t.order.action.lower(),
+                    "amount": qty,
+                    "price": (t.order.lmtPrice if t.order.orderType == "LMT" else None),
+                    "filled": filled,
+                    "remaining": qty - filled,
+                    "status": status,
+                    "info": {},
+                }
+            )
+        return closed
+
+    def fetch_my_trades(self, symbol: str | None = None) -> list[dict]:
+        trades = []
+        for t in self.ib.trades():
+            for fill in t.fills:
+                t_sym = f"{t.contract.symbol}/{t.contract.currency}"
+                if symbol and t_sym != symbol:
+                    continue
+                trades.append(
+                    {
+                        "id": f"{t.order.orderId}:{fill.execution.execId}",
+                        "symbol": t_sym,
+                        "side": t.order.action.lower(),
+                        "amount": float(fill.execution.shares),
+                        "price": float(fill.execution.price),
+                        "fee": 0.0,
+                        "timestamp": fill.execution.time.isoformat(),
+                        "info": {},
+                    }
+                )
+        return trades
+
+    def fetch_balance(self) -> dict:
+        # Simply alias your existing balance call
+        return self.get_balances()
+
+    def fetch_positions(self) -> list[dict]:
+        positions = []
+        for pos in self.ib.positions():
+            sym = f"{pos.contract.symbol}/{pos.contract.currency}"
+            amount = float(pos.position)
+            if amount == 0:
+                continue
+            avg_cost = float(pos.avgCost)
+            positions.append(
+                {
+                    "symbol": sym,
+                    "amount": amount,
+                    "entry_price": avg_cost,
+                    "info": {},  # strip non serializable objects
+                }
+            )
+        return positions
+
+    def fetch_ticker(self, symbol: str) -> dict:
+        # Reuse fetch_tickers under the hood
+        return self.fetch_tickers([symbol])[symbol]
+
+    def fetch_tickers(self, symbols: list[str] | None = None) -> dict[str, dict]:
+        tickers = {}
+        # Default to all open positions if no list given
+        symbols = symbols or [p["symbol"] for p in self.fetch_positions()]
+        for sym in symbols:
+            contract = self._get_contract(sym)  # your helper to build IB Contract
+            # Request a fresh quote
+            data = self.ib.reqMktData(contract, "", False, False)
+            # Wait briefly for IB to populate data (you may need a small sleep here)
+            last = (data.bid + data.ask) / 2 if data.bid and data.ask else data.last
+            tickers[sym] = {
+                "symbol": sym,
+                "bid": data.bid,
+                "ask": data.ask,
+                "last": last,
+                "info": {},
+            }
+        return tickers
+
+    def _get_contract(self, symbol: str) -> Forex:
+        """
+        Creates and returns an IBKR Forex contract for a given symbol/pair.
+        """
+        base, quote = self._extract_currencies_from_pair(symbol)
+        return Forex(symbol=base, currency=quote, exchange="IDEALPRO")
