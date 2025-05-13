@@ -98,7 +98,7 @@ class Interactivebrokers(Foreignexchange):
         self._reconnect_event = Event()
         self._connection_thread: Thread | None = None
         self._ws_connected = False
-        self._markets_cache: dict[str, Any] = {}
+        self._markets_cache: dict[str, Any] | None = None
 
         # Set ports based on live/paper trading
         if self.dry_run:
@@ -213,7 +213,7 @@ class Interactivebrokers(Foreignexchange):
 
     def create_order(
         self,
-        pair: str,
+        pair: str | tuple,
         ordertype: str,
         side: str,
         amount: float,
@@ -223,23 +223,16 @@ class Interactivebrokers(Foreignexchange):
         **kwargs,
     ) -> dict:
         params = params or {}
+        pair = pair[0] if isinstance(pair, tuple) else pair
 
-        if rate is not None and (price is None or price <= 0):
-            price = rate
+        contract, amount, price = self._initialize_contract_amount_price(pair, amount, price, rate)
 
-        try:
-            contract = self._create_and_qualify_contract(pair)
-        except ValueError as e:
-            logger.error(f"Contract qualification failed: {e}")
-            return {"id": None, "status": "failed", "info": str(e)}
-
-        amount = self._adjust_amount_for_min_lot(amount)
-
-        # Use the helper method
-        use_market = self._should_use_market_order(ordertype, side, params)
+        use_market = ordertype.lower() == "market" or (
+            side.lower() == "sell" and params.get("exit_as_market", False)
+        )
 
         if use_market:
-            order = self._create_order_object(side, amount, None, ordertype)
+            order = Order(action=side.upper(), totalQuantity=amount, orderType="MKT")
         else:
             try:
                 if price is None or price <= 0:
@@ -248,22 +241,162 @@ class Interactivebrokers(Foreignexchange):
                 if not (0.00001 <= price <= 1000.0):
                     raise ValueError(f"Invalid price for order: {price}")
 
-                order = self._create_order_object(side, amount, price, ordertype)
+                order = Order(
+                    action=side.upper(),
+                    totalQuantity=amount,
+                    orderType="LMT",
+                    lmtPrice=round(price, self.SIGNIFICANT_DIGITS - 1),
+                )
             except ValueError as e:
                 logger.error(f"Failed to get valid price for order: {e}")
-                return {"id": None, "status": "failed", "info": str(e)}
+                return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
         try:
             trade = self.ib.placeOrder(contract, order)
             logger.info(
-                f"Order placed: {order.action} {order.totalQuantity} {pair}"
-                f" at {getattr(order, 'lmtPrice', 'MARKET')}"
+                f"Order placed: {order.action} {order.totalQuantity} "
+                f"{pair} at {getattr(order, 'lmtPrice', 'MARKET')}"
             )
         except Exception as e:
             logger.error(f"Error placing order: {e}")
-            return {"id": None, "status": "failed", "info": str(e)}
+            return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
-        return self._wait_for_order_status(trade)
+        deadline = time.time() + 30
+        while time.time() < deadline and trade.orderStatus.status in (
+            "ApiPending",
+            "PendingSubmit",
+            "Submitted",
+        ):
+            self.ib.waitOnUpdate(timeout=1)
+
+        return self._finalize_trade_status(trade, pair, ordertype, side, amount, price)
+
+    def _initialize_contract_amount_price(self, pair, amount, price, rate):
+        if rate is not None and (price is None or price <= 0):
+            price = rate
+
+        symbol, currency = self._extract_currencies_from_pair(pair)
+        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
+
+        try:
+            if not self.ib.qualifyContracts(contract):
+                raise ValueError(f"Contract qualification failed for {pair}")
+        except Exception as e:
+            logger.error(f"Contract qualification error: {e}")
+            raise ValueError(f"Contract qualification failed for {pair}: {e}")
+
+        min_lot = self.MIN_LOT_SIZE
+        amount = max(min_lot, math.floor(amount / min_lot) * min_lot)
+
+        return contract, amount, price
+
+    def _finalize_trade_status(self, trade, pair, ordertype, side, amount, price):
+        status = trade.orderStatus.status
+
+        if status == "Inactive":
+            logger.warning(
+                f"Order for {pair} was rejected: INACTIVE. Reason: {trade.orderStatus.whyHeld}"
+            )
+            return self._failed_response(pair, ordertype, side, amount, price, trade.orderStatus)
+
+        if status not in ("PreSubmitted", "Submitted", "Filled"):
+            logger.warning(
+                f"Order for {pair} failed with status: {status}.Reason: {trade.orderStatus.whyHeld}"
+            )
+            return self._failed_response(pair, ordertype, side, amount, price, trade.orderStatus)
+
+        oid = str(trade.order.orderId)
+        filled = float(trade.orderStatus.filled)
+        remaining = float(amount - filled)
+
+        logger.info(
+            f"Order {oid} for {pair} placed successfully. Status: {status}, filled: {filled}"
+        )
+
+        return {
+            "id": oid,
+            "symbol": pair,
+            "type": ordertype.lower(),
+            "side": side.lower(),
+            "amount": amount,
+            "price": price,
+            "filled": filled,
+            "remaining": remaining,
+            "status": self._parse_order_status(status),
+            "info": trade,
+        }
+
+    def get_rate(
+        self,
+        pair: str | tuple,
+        side: str | None = None,
+        **kwargs,
+    ) -> float:
+        pair = pair[0] if isinstance(pair, tuple) else pair
+        try:
+            return self._fetch_live_price(pair, side)
+        except Exception as e:
+            logger.error(f"Failed to request market data for {pair}: {e}")
+
+        return self._fallback_to_historical_rate(pair)
+
+    def _fetch_live_price(self, pair: str, side: str | None) -> float:
+        symbol, currency = pair.split("/")
+        contract = Forex(
+            symbol=symbol.strip().upper(), currency=currency.strip().upper(), exchange="IDEALPRO"
+        )
+
+        ticker = self.ib.reqMktData(contract)
+        self.ib.sleep(0.5)
+        if ticker and ticker.bid > 0.00001 and ticker.ask > 0.00001:
+            if side is None:
+                price = (ticker.bid + ticker.ask) / 2
+            elif side.lower() == "buy":
+                price = ticker.ask
+            elif side.lower() == "sell":
+                price = ticker.bid
+            else:
+                price = (ticker.bid + ticker.ask) / 2
+
+            if not (0.00001 <= price <= 1000.0):
+                raise ValueError(f"Price out of valid forex range: {price}")
+
+            logger.info(f"Returning price for {pair} ({side}): {price}")
+            return price
+
+        raise ValueError(f"Invalid market data for {pair}: bid={ticker.bid}, ask={ticker.ask}")
+
+    def _fallback_to_historical_rate(self, pair: str) -> float:
+        try:
+            timeframe = self.config.get("timeframe", "5m")
+            ohlcv = self.get_historic_ohlcv(pair, timeframe=timeframe, limit=1)
+            if not ohlcv.empty:
+                close_price = ohlcv.iloc[0]["close"]
+                if pd.notna(close_price) and close_price > 0.00001:
+                    if not (0.00001 <= close_price <= 1000.0):
+                        raise ValueError(f"Invalid historical close price: {close_price}")
+                    logger.info(f"Returning historical close price for {pair}: {close_price}")
+                    return close_price
+                logger.warning(f"Invalid historical close price for {pair}: {close_price}")
+        except Exception as e:
+            logger.error(f"Failed to fetch historical data for {pair}: {e}")
+        raise ValueError(f"Could not fetch valid rate for {pair}")
+
+    def _failed_response(self, pair, ordertype, side, amount, price, info):
+        return {
+            "id": None,
+            "symbol": pair,
+            "type": ordertype.lower(),
+            "side": side.lower(),
+            "amount": amount,
+            "price": price,
+            "filled": 0.0,
+            "remaining": amount,
+            "status": "failed",
+            "info": info,
+        }
+
+    # ... rest of class unchanged ...
 
     def fetch_order(
         self,
@@ -288,12 +421,10 @@ class Interactivebrokers(Foreignexchange):
                     else:
                         symbol = pair if pair else "UNKNOWN/UNKNOWN"
 
+                    price: float | None = None
+
                     if trade.order.orderType == "LMT":
-                        price = (
-                            float(trade.order.lmtPrice)
-                            if trade.order.lmtPrice is not None
-                            else None
-                        )
+                        price = float(trade.order.lmtPrice)
                     elif hasattr(trade, "fills") and trade.fills:
                         total_cost = sum(
                             fill.execution.price * fill.execution.shares for fill in trade.fills
@@ -302,7 +433,6 @@ class Interactivebrokers(Foreignexchange):
                         price = total_cost / total_shares if total_shares > 0 else None
                     else:
                         price = None
-
                     return {
                         "id": order_id,
                         "symbol": symbol,
@@ -353,8 +483,8 @@ class Interactivebrokers(Foreignexchange):
         params: dict[Any, Any] | None = None,
         tradable_only: bool = False,
         active_only: bool = False,
-    ) -> dict:
-        if hasattr(self, "_markets_cache") and not reload:
+    ) -> dict[Any, Any]:
+        if not reload and self._markets_cache is not None:
             return self._markets_cache
 
         markets: dict[str, Any] = {}
@@ -807,31 +937,7 @@ class Interactivebrokers(Foreignexchange):
 
         return symbol, currency
 
-    def get_rate(
-        self,
-        pair: str,
-        side: str | None = None,
-        is_short: bool | None = None,
-        refresh: bool = False,
-        **kwargs,
-    ) -> float:
-        if isinstance(pair, tuple):
-            pair = pair[0]
-
-        market_price = self._get_market_data_price(pair, side)
-        if market_price is not None:
-            logger.info(f"Returning market price for {pair} ({side}): {market_price}")
-            return market_price
-
-        timeframe = self.config.get("timeframe", "5m")
-        historical_price = self._get_historical_price(pair, timeframe)
-        if historical_price is not None:
-            logger.info(f"Returning historical close price for {pair}: {historical_price}")
-            return historical_price
-
-        raise ValueError(f"Could not fetch valid rate for {pair}")
-
-    def get_min_pair_stake_amount(self, pair: str, leverage: float = 1.0, *args, **kwargs) -> float:
+    def get_min_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
         return float(self.config.get("stake_amount_min", 10.0))
 
     def get_max_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
@@ -889,128 +995,3 @@ class Interactivebrokers(Foreignexchange):
         except Exception as e:
             logger.error(f"Failed to validate required startup candles: {e}")
             raise
-
-    def _create_and_qualify_contract(self, pair: str) -> Contract:
-        symbol, currency = self._extract_currencies_from_pair(pair)
-        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
-        if not self.ib.qualifyContracts(contract):
-            raise ValueError(f"Contract qualification failed for {pair}")
-        return contract
-
-    def _adjust_amount_for_min_lot(self, amount: float) -> float:
-        min_lot = self.MIN_LOT_SIZE
-        return max(min_lot, math.floor(amount / min_lot) * min_lot)
-
-    def _create_order_object(
-        self, side: str, amount: float, price: float | None, ordertype: str
-    ) -> Order:
-        if ordertype.lower() == "market":
-            return Order(action=side.upper(), totalQuantity=amount, orderType="MKT")
-        else:
-            if price is None:
-                raise ValueError("Price must be provided for limit orders")
-            return Order(
-                action=side.upper(),
-                totalQuantity=amount,
-                orderType="LMT",
-                lmtPrice=round(price, self.SIGNIFICANT_DIGITS - 1),
-            )
-
-    def _wait_for_order_status(self, trade) -> dict:
-        deadline = time.time() + 30
-        while time.time() < deadline and trade.orderStatus.status in (
-            "ApiPending",
-            "PendingSubmit",
-            "Submitted",
-        ):
-            self.ib.waitOnUpdate(timeout=1)
-
-        status = trade.orderStatus.status
-        filled = float(trade.orderStatus.filled)
-        remaining = float(trade.order.totalQuantity - filled)
-
-        if status == "Inactive":
-            return {
-                "id": None,
-                "status": "rejected",
-                "info": trade.orderStatus,
-            }
-
-        if status not in ("PreSubmitted", "Submitted", "Filled"):
-            return {
-                "id": None,
-                "status": "failed",
-                "info": trade.orderStatus,
-            }
-
-        oid = str(trade.order.orderId)
-        return {
-            "id": oid,
-            "status": self._parse_order_status(status),
-            "filled": filled,
-            "remaining": remaining,
-            "info": trade,
-        }
-
-    def _get_market_data_price(self, pair: str, side: str | None = None) -> float | None:
-        parts = pair.split("/")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
-
-        symbol, currency = parts[0].strip().upper(), parts[1].strip().upper()
-        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
-
-        try:
-            ticker = self.ib.reqMktData(contract)
-            self.ib.sleep(0.5)
-            if ticker and ticker.bid > 0.00001 and ticker.ask > 0.00001:
-                if side is None:
-                    price = (ticker.bid + ticker.ask) / 2
-                elif side.lower() == "buy":
-                    price = ticker.ask
-                elif side.lower() == "sell":
-                    price = ticker.bid
-                else:
-                    price = (ticker.bid + ticker.ask) / 2
-
-                if 0.00001 <= price <= 1000.0:
-                    return price
-                else:
-                    logger.warning(f"Invalid price from market data: {price}")
-        except Exception as e:
-            logger.error(f"Failed to request market data for {pair}: {e}")
-        return None
-
-    def _get_historical_price(self, pair: str, timeframe: str) -> float | None:
-        try:
-            ohlcv = self.get_historic_ohlcv(pair, timeframe=timeframe, limit=1)
-            if not ohlcv.empty:
-                close_price = ohlcv.iloc[0]["close"]
-                if pd.notna(close_price) and close_price > 0.00001:
-                    if 0.00001 <= close_price <= 1000.0:
-                        return close_price
-                    logger.warning(f"Invalid historical close price: {close_price}")
-        except Exception as e:
-            logger.error(f"Failed to fetch historical data for {pair}: {e}")
-        return None
-
-    def _should_use_market_order(self, ordertype: str, side: str, params: dict) -> bool:
-        return ordertype.lower() == "market" or (
-            side.lower() == "sell" and params.get("exit_as_market", False)
-        )
-
-    def _get_valid_price(self, pair: str, side: str) -> float:
-        price = self.get_rate(pair, side=side)
-        if not (0.00001 <= price <= 1000.0):
-            raise ValueError(f"Invalid price: {price}")
-        return price
-
-    def _place_and_wait_for_order(self, contract: Contract, order: Order) -> dict:
-        try:
-            trade = self.ib.placeOrder(contract, order)
-            logger.info(f"Order placed: {order.action} {order.totalQuantity} {contract.symbol}")
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return {"id": None, "status": "failed", "info": str(e)}
-
-        return self._wait_for_order_status(trade)
