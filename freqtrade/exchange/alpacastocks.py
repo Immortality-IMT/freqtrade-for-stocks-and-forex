@@ -1,19 +1,21 @@
-# alpacastocks.py
-# This file contains the implementation for the Alpaca Stocks exchange integration in Freqtrade.
 import json
 import logging
 import sys
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pyarrow.feather as feather
 import requests
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass
+from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
 from alpaca.trading.requests import GetAssetsRequest, LimitOrderRequest, MarketOrderRequest
 from alpaca.trading.stream import TradingStream
 
+from freqtrade.exceptions import OperationalException
 from freqtrade.exchange.stockexchange import Stockexchange
 
 
@@ -29,14 +31,12 @@ class Alpacastocks(Stockexchange):
     DECIMAL_PLACES = 2
     SIGNIFICANT_DIGITS = 3
     TICK_SIZE = 4
-    MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
-
+    MAX_DATA_DELAY = pd.Timedelta(minutes=1440)  # Allowed data delay during market hours
     PAIRLIST_FILE = "user_data/data/alpacastocks/alpaca_pairs.json"
-
     _ft_has_default = {
         "stoploss_on_exchange": False,
-        "order_time_in_force": ["GTC"],
-        "ohlcv_candle_limit": 500,
+        "order_time_in_force": ["GTC", "DAY"],
+        "ohlcv_candle_limit": 10000,
         "ohlcv_has_history": True,
         "ohlcv_partial_candle": True,
         "ohlcv_require_since": False,
@@ -55,7 +55,7 @@ class Alpacastocks(Stockexchange):
         "mark_ohlcv_timeframe": "8h",
         "funding_fee_timeframe": "8h",
         "ccxt_futures_name": "swap",
-        "needs_trading_fees": False,
+        "needs_trading_fees": True,
         "order_props_in_contracts": ["amount", "filled", "remaining"],
         "market_props_in_contracts": ["status"],
         "market_has_ticker": False,
@@ -67,12 +67,12 @@ class Alpacastocks(Stockexchange):
         "order_has_price": True,
         "order_has_amount": True,
         "order_has_cost": False,
-        "order_has_fee": False,
+        "order_has_fee": True,
         "order_has_slippage": False,
         "order_has_filled": True,
         "order_has_remaining": True,
         "order_has_status_history": False,
-        "ws_enabled": False,
+        "ws_enabled": True,
     }
 
     def __init__(
@@ -89,29 +89,21 @@ class Alpacastocks(Stockexchange):
             validate=validate,
             load_leverage_tiers=load_leverage_tiers,
         )
-
         exchange_conf = exchange_config if exchange_config else config.get("exchange", {})
-
-        # Retrieve API key and secret
+        self.id = "alpacastocks"
         self.key = exchange_conf.get("key")
         self.secret = exchange_conf.get("secret")
-
         if not self.key or not self.secret:
             raise ValueError("API key and secret are required for Alpaca")
-
-        # Determine base URL based on dry_run setting
         self.dry_run = config.get("dry_run", False)
-
         if self.dry_run:
             logger.info("Connecting to Alpaca paper trading.")
         else:
             logger.info("Connecting to Alpaca live trading.")
-
-        # Initialize TradingClient
         self.trading_client = TradingClient(self.key, self.secret, paper=self.dry_run)
-
-        # Initialize WebSocket client
         self.ws_client = None
+        self._ws_thread = None
+        self._last_market_state = None
         if self._ft_has_default["ws_enabled"]:
             self.setup_websocket()
 
@@ -119,164 +111,343 @@ class Alpacastocks(Stockexchange):
     def name(self):
         return "alpacastocks"
 
-    def get_markets(self, reload=False, params=None, tradable_only=False, active_only=False):
-        """
-        Retrieve a list of markets (trading pairs) available on the exchange.
-
-        :param reload: If True, reload the markets from the exchange.
-        :param params: Additional parameters for fetching markets.
-        :param tradable_only: If True, return only tradable markets.
-        :param active_only: If True, return only active markets.
-        """
-
-        pairlist_file_path = Path(self.PAIRLIST_FILE)
-
-        try:
-            if not hasattr(self, "_markets") or reload:
-                if pairlist_file_path.exists():
-                    # Load markets from file
-                    with pairlist_file_path.open() as f:
-                        self._markets = json.load(f)
-                else:
-                    try:
-                        search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
-                        assets = self.trading_client.get_all_assets(search_params)
-                        assets_dict = [dict(item) for item in assets]
-                        self._markets = {}
-                        for asset in assets_dict:
-                            if tradable_only and not asset["tradable"]:
-                                continue
-                            if active_only and asset["status"] != "active":
-                                continue
-                            pair = f"{asset['symbol']}/USD"
-                            self._markets[pair] = {
-                                "id": pair,
-                                "symbol": pair,
-                                "base": asset["symbol"],
-                                "quote": "USD",
-                                "spot": True,
-                                "margin": False,
-                                "active": asset["status"] == "active",
-                                "maker": 0.001,
-                                "taker": 0.002,
-                                "info": asset,
-                                "precision": {"amount": 8, "price": 8},
-                                "limits": {
-                                    "amount": {"min": 0.001, "max": 1000000},
-                                    "price": {"min": 0.01, "max": 1000000},
-                                    "cost": {"min": 0.01, "max": 1000000},
-                                },
-                                "future": False,
-                                "option": False,
-                                "linear": True,
-                                "inverse": False,
-                                "contractSize": 1,
-                                "expiry": None,
-                                "expiry_date": None,
-                                "strike": None,
-                                "underlying": None,
-                                "settle": None,
-                                "settleDate": None,
-                                "listing": None,
-                                "listed": None,
-                                "market_type": "spot",
-                            }
-                            logger.debug(f"Added pair: {pair}")
-
-                        # logger.info(f"Retrieved markets: {self._markets}")
-
-                        with pairlist_file_path.open("w") as f:
-                            json.dump(self._markets, f, default=str)
-                        logger.info("Saved market pairs to file.")
-
-                    except Exception as e:
-                        error_message = str(e).lower()
-                        if "forbidden" in error_message:
-                            logger.error(
-                                "Authentication failed - Invalid API credentials. "
-                                "Please check your Alpaca API key and secret. "
-                                "Make sure they are correct and have proper permissions."
-                            )
-                            sys.exit(1)
-
-            return self._markets
-        except Exception as e:
-            logger.error(f"Failed to retrieve markets: {str(e)}")
-            return {}
-
     def setup_websocket(self):
-        """Initialize WebSocket for real-time updates."""
+        if (
+            self.ws_client is not None
+            and self._ws_thread is not None
+            and self._ws_thread.is_alive()
+        ):
+            logger.debug("WebSocket client already running.")
+            return
         self.ws_client = TradingStream(self.key, self.secret, paper=self.dry_run)
         self.ws_client.subscribe_trade_updates(self.handle_trade_update)
-        self.ws_client.run()
+        self._ws_thread = threading.Thread(target=self.ws_client.run, daemon=True)
+        self._ws_thread.start()
 
-    def handle_trade_update(self, trade_update):
-        """Handle real-time trade updates from WebSocket."""
+    async def handle_trade_update(self, trade_update):
         logger.info(f"Trade update received: {trade_update}")
 
-    def create_order(
-        self,
-        pair: str,
-        ordertype: str,
-        side: str,
-        amount: float,
-        price: float | None = None,
-        params=None,
-    ):
-        """Create an order on Alpaca."""
-        symbol = pair.split("/")[0]
-        if params is None:
-            params = {}
-
+    def create_order(self, pair, ordertype, side, amount, price=None, params=None, **kwargs):
+        symbol = pair.split("/", 1)[0]
+        params = params or {}
         try:
+            # Map Freqtrade side to Alpaca OrderSide enum
+            side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
             if ordertype == "market":
-                # Use notional for market orders to specify USD amount
-                order_data = MarketOrderRequest(symbol=symbol, notional=amount, side=side.lower())
+                amount = round(amount, 2)
+                if amount < 1.0:
+                    amount = 1.0
+                    logger.warning(f"Adjusting notional to minimum: ${amount:.2f}")
+                order_req = MarketOrderRequest(
+                    symbol=symbol,
+                    notional=amount,
+                    side=side,
+                    time_in_force=TimeInForce.DAY,
+                )
             elif ordertype == "limit":
-                # For limit orders, amount is in shares (qty)
-                order_data = LimitOrderRequest(
-                    symbol=symbol, qty=amount, side=side.lower(), limit_price=price
+                order_req = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=int(amount),
+                    side=side,
+                    limit_price=price,
+                    time_in_force=TimeInForce.GTC,
                 )
             else:
-                raise ValueError(f"Unsupported order type: {ordertype}")
-
-            order = self.trading_client.submit_order(order_data)
-            return order.id  # Return order ID for tracking
+                raise OperationalException(f"Unsupported order type: {ordertype}")
+            alpaca_order = self.trading_client.submit_order(order_req)
+            raw_qty = alpaca_order.qty
+            raw_filled = alpaca_order.filled_qty
+            qty = float(raw_qty) if raw_qty is not None else float(raw_filled or 0)
+            filled = float(raw_filled or 0)
+            remaining = qty - filled
+            return {
+                "id": str(alpaca_order.id),
+                "symbol": f"{symbol}/USD",
+                "type": alpaca_order.order_type.value,
+                "side": "buy" if alpaca_order.side == OrderSide.BUY else "sell",
+                "price": float(alpaca_order.limit_price or 0),
+                "amount": qty,
+                "filled": filled,
+                "remaining": remaining,
+                "status": alpaca_order.status.lower(),
+                "cost": filled * float(alpaca_order.filled_avg_price or 0),
+                "info": dict(alpaca_order),
+            }
         except APIError as e:
             logger.error(f"Failed to create order: {e}")
-            return None
+            raise
 
     def cancel_order(self, order_id: str):
-        """Cancel an order on Alpaca."""
         try:
             self.trading_client.cancel_order_by_id(order_id)
-            logger.info(f"Order {order_id} canceled successfully.")
+            return {"id": order_id, "status": "canceled", "info": {}}
         except APIError as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
-
-    def fetch_order(self, order_id: str):
-        """Fetch order details from Alpaca."""
-        try:
-            order = self.trading_client.get_order_by_id(order_id)
-            return order
-        except APIError as e:
-            logger.error(f"Failed to fetch order {order_id}: {e}")
             return None
+
+    def cancel_order_with_result(self, order_id: str, pair: str, amount: float) -> dict:
+        """
+        Cancel an order and return the result in a Freqtrade-compatible format.
+
+        :param order_id: The ID of the order to cancel.
+        :param pair: The trading pair (e.g., "AAPL/USD").
+        :param amount: The amount of the order to cancel.
+        :return: A dictionary with order details post-cancellation.
+        """
+        try:
+            # Fetch the order to check its status
+            alpaca_order = self.trading_client.get_order_by_id(order_id)
+            alpaca_status = alpaca_order.status.lower()
+            logger.debug(f"Order {order_id} status before cancellation: {alpaca_status}")
+
+            # Define non-cancellable statuses
+            non_cancellable_statuses = [
+                "filled",
+                "canceled",
+                "expired",
+                "rejected",
+                "done_for_day",
+                "stopped",
+                "suspended",
+            ]
+            if alpaca_status in non_cancellable_statuses:
+                logger.info(
+                    f"Order {order_id} is in {alpaca_status} state and cannot be canceled."
+                    f"Returning order details."
+                )
+                raw_qty = alpaca_order.qty
+                raw_filled = alpaca_order.filled_qty
+                filled = float(raw_filled or 0)
+                qty = float(raw_qty) if raw_qty is not None else filled
+                remaining = qty - filled
+                order_type = alpaca_order.order_type.value.lower()
+                taker_or_maker = "taker" if order_type == "market" else "maker"
+                fee_rate = self.get_fee(pair, taker_or_maker=taker_or_maker)
+                filled_avg_price = float(alpaca_order.filled_avg_price or 0)
+                fee_cost = filled * filled_avg_price * fee_rate
+                filled_cost = filled * filled_avg_price
+                order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
+                result = {
+                    "id": str(alpaca_order.id),
+                    "symbol": pair,
+                    "type": order_type,
+                    "side": order_side,
+                    "price": float(alpaca_order.limit_price or filled_avg_price or 0),
+                    "amount": qty,
+                    "filled": filled,
+                    "remaining": remaining,
+                    "status": alpaca_status,
+                    "timestamp": pd.to_datetime(alpaca_order.submitted_at)
+                    .tz_convert("UTC")
+                    .timestamp()
+                    * 1000
+                    if alpaca_order.submitted_at
+                    else None,
+                    "datetime": alpaca_order.submitted_at.isoformat()
+                    if alpaca_order.submitted_at
+                    else None,
+                    "cost": filled_cost,
+                    "filled_cost": filled_cost,
+                    "fee": {
+                        "cost": fee_cost,
+                        "currency": "USD",
+                        "rate": fee_rate,
+                    },
+                    "info": dict(alpaca_order),
+                }
+                return result
+
+            # Attempt to cancel the order if it's in a cancellable state
+            self.trading_client.cancel_order_by_id(order_id)
+            # Fetch the order again to get updated status
+            alpaca_order = self.trading_client.get_order_by_id(order_id)
+            raw_qty = alpaca_order.qty
+            raw_filled = alpaca_order.filled_qty
+            filled = float(raw_filled or 0)
+            qty = float(raw_qty) if raw_qty is not None else filled
+            remaining = qty - filled
+            order_type = alpaca_order.order_type.value.lower()
+            taker_or_maker = "taker" if order_type == "market" else "maker"
+            fee_rate = self.get_fee(pair, taker_or_maker=taker_or_maker)
+            filled_avg_price = float(alpaca_order.filled_avg_price or 0)
+            fee_cost = filled * filled_avg_price * fee_rate
+            filled_cost = filled * filled_avg_price
+            order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
+            result = {
+                "id": str(alpaca_order.id),
+                "symbol": pair,
+                "type": order_type,
+                "side": order_side,
+                "price": float(alpaca_order.limit_price or filled_avg_price or 0),
+                "amount": qty,
+                "filled": filled,
+                "remaining": remaining,
+                "status": alpaca_order.status.lower(),
+                "timestamp": pd.to_datetime(alpaca_order.submitted_at).tz_convert("UTC").timestamp()
+                * 1000
+                if alpaca_order.submitted_at
+                else None,
+                "datetime": alpaca_order.submitted_at.isoformat()
+                if alpaca_order.submitted_at
+                else None,
+                "cost": filled_cost,
+                "filled_cost": filled_cost,
+                "fee": {
+                    "cost": fee_cost,
+                    "currency": "USD",
+                    "rate": fee_rate,
+                },
+                "info": dict(alpaca_order),
+            }
+            logger.info(f"Order {order_id} canceled successfully for pair {pair}")
+            return result
+        except APIError as e:
+            if 'order is already in "filled" state' in str(e):
+                logger.info(
+                    f"Order {order_id} is already filled,"
+                    f"skipping cancellation and returning order details."
+                )
+                alpaca_order = self.trading_client.get_order_by_id(order_id)
+                raw_qty = alpaca_order.qty
+                raw_filled = alpaca_order.filled_qty
+                filled = float(raw_filled or 0)
+                qty = float(raw_qty) if raw_qty is not None else filled
+                remaining = qty - filled
+                order_type = alpaca_order.order_type.value.lower()
+                taker_or_maker = "taker" if order_type == "market" else "maker"
+                fee_rate = self.get_fee(pair, taker_or_maker=taker_or_maker)
+                filled_avg_price = float(alpaca_order.filled_avg_price or 0)
+                fee_cost = filled * filled_avg_price * fee_rate
+                filled_cost = filled * filled_avg_price
+                order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
+                result = {
+                    "id": str(alpaca_order.id),
+                    "symbol": pair,
+                    "type": order_type,
+                    "side": order_side,
+                    "price": float(alpaca_order.limit_price or filled_avg_price or 0),
+                    "amount": qty,
+                    "filled": filled,
+                    "remaining": remaining,
+                    "status": alpaca_order.status.lower(),
+                    "timestamp": pd.to_datetime(alpaca_order.submitted_at)
+                    .tz_convert("UTC")
+                    .timestamp()
+                    * 1000
+                    if alpaca_order.submitted_at
+                    else None,
+                    "datetime": alpaca_order.submitted_at.isoformat()
+                    if alpaca_order.submitted_at
+                    else None,
+                    "cost": filled_cost,
+                    "filled_cost": filled_cost,
+                    "fee": {
+                        "cost": fee_cost,
+                        "currency": "USD",
+                        "rate": fee_rate,
+                    },
+                    "info": dict(alpaca_order),
+                }
+                return result
+            logger.error(f"Failed to cancel order {order_id} for pair {pair}: {e}")
+            raise OperationalException(f"Order cancellation failed: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error while canceling order {order_id}: {e}")
+            raise OperationalException(f"Unexpected error during order cancellation: {e}")
+
+    def fetch_order(self, order_id: str, symbol: str, params: dict | None = None) -> dict | None:
+        params = params or {}
+        if not isinstance(order_id, str) or not order_id.strip():
+            logger.warning(f"fetch_order called with invalid order_id: {order_id}")
+            return None
+        try:
+            alpaca_order = self.trading_client.get_order_by_id(order_id)
+            logger.debug(
+                f"Fetched order {order_id} for {symbol}: status={alpaca_order.status},"
+                f"qty={alpaca_order.qty}, filled_qty={alpaca_order.filled_qty}"
+            )
+        except Exception as e:
+            logger.error(f"Error fetching order with ID {order_id}: {e}")
+            return None
+
+        raw_qty = alpaca_order.qty
+        raw_filled = alpaca_order.filled_qty
+        filled = float(raw_filled or 0)
+        qty = float(raw_qty) if raw_qty is not None else filled
+
+        # Ensure remaining is 0 if fully filled
+        remaining = max(0.0, qty - filled)
+
+        order_type = alpaca_order.order_type.value.lower()
+        taker_or_maker = "taker" if order_type == "market" else "maker"
+        fee_rate = self.get_fee(symbol, taker_or_maker=taker_or_maker)
+        filled_avg_price = float(alpaca_order.filled_avg_price or 0)
+        fee_cost = filled * filled_avg_price * fee_rate
+        filled_cost = filled * filled_avg_price
+        order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
+
+        # Map Alpaca status to Freqtrade status
+        alpaca_status = alpaca_order.status.lower()
+        status_map = {
+            "new": "open",
+            "partially_filled": "open",
+            "filled": "closed",  # Mark as closed when fully filled
+            "done_for_day": "closed",
+            "canceled": "canceled",
+            "expired": "canceled",
+            "rejected": "canceled",
+            "pending_cancel": "canceled",
+            "pending_replace": "open",
+            "replaced": "open",
+            "stopped": "canceled",
+            "suspended": "canceled",
+        }
+        freqtrade_status = status_map.get(alpaca_status, "open")
+
+        # Force close if fully filled
+        if filled >= qty:
+            freqtrade_status = "closed"
+            remaining = 0.0
+
+        freqtrade_order = {
+            "id": str(alpaca_order.id),
+            "symbol": symbol,
+            "type": order_type,
+            "side": order_side,
+            "price": float(alpaca_order.limit_price or filled_avg_price or 0),
+            "amount": qty,
+            "filled": filled,
+            "remaining": remaining,
+            "status": freqtrade_status,
+            "timestamp": pd.to_datetime(alpaca_order.submitted_at).tz_convert("UTC").timestamp()
+            * 1000
+            if alpaca_order.submitted_at
+            else None,
+            "datetime": alpaca_order.submitted_at.isoformat()
+            if alpaca_order.submitted_at
+            else None,
+            "cost": filled_cost,
+            "filled_cost": filled_cost,
+            "fee": {
+                "cost": fee_cost,
+                "currency": "USD",
+                "rate": fee_rate,
+            },
+            "info": dict(alpaca_order),
+        }
+
+        logger.debug(f"Returning Freqtrade order: {freqtrade_order}")
+        return freqtrade_order
 
     @property
     def markets(self):
         return self._markets
 
     def reload_markets(self) -> None:
-        """Reload the markets data, forcing a fresh fetch from Alpaca."""
         self.get_markets(reload=True)
 
     def get_fee(self, symbol, now=None, taker_or_maker="maker"):
-        # Replace with the actual fee calculation for the symbol
-        fee = {
-            "maker": 0.001,
-            "taker": 0.001,
-        }
+        fee = {"maker": 0.001, "taker": 0.002}
         return fee.get(taker_or_maker, 0.001)
 
     @property
@@ -288,7 +459,7 @@ class Alpacastocks(Stockexchange):
         return self.precisionMode
 
     def validate_required_startup_candles(self, startup_candle_count, timeframe):
-        pass
+        return True
 
     def get_proxy_coin(self):
         return "USD"
@@ -299,8 +470,16 @@ class Alpacastocks(Stockexchange):
     def get_max_leverage(self, pair, stake_amount):
         return 1
 
-    def get_min_pair_stake_amount(self, *args, **kwargs):
-        return 1
+    def get_min_pair_stake_amount(
+        self,
+        pair: str,
+        price: float | None = None,
+        amount: float | None = None,
+        side: str | None = None,
+        is_entry: bool = True,
+        **kwargs: Any,
+    ) -> float:
+        return 1.0
 
     def get_max_pair_stake_amount(self, *args, **kwargs):
         return 1000000
@@ -309,7 +488,6 @@ class Alpacastocks(Stockexchange):
         return pair.split("/")[0]
 
     def ws_connection_reset(self):
-        # No-op implementation for Alpaca
         pass
 
     def get_pair_quote_currency(self, pair):
@@ -338,7 +516,6 @@ class Alpacastocks(Stockexchange):
         leverage=None,
         wallet_balance=None,
     ):
-        # Implementation here
         return None
 
     def update_liquidation_prices(self, trade, row):
@@ -361,22 +538,11 @@ class Alpacastocks(Stockexchange):
             logger.error(f"Failed to update liquidation price: {str(e)}")
 
     def market_is_tradable(self, market):
-        """
-        Check if the market is tradable.
-        :param market: Market dictionary
-        :return: True if the market is tradable, False otherwise
-        """
-        return market["active"] and market["spot"]
+        return market.get("tradable", False) and market.get("spot", False)
 
     def validate_timeframes(self, timeframes):
-        """
-        Validate the timeframes supported by the exchange.
-
-        :param timeframes: List of timeframes to validate.
-        """
         if isinstance(timeframes, str):
             timeframes = [timeframes]
-
         supported_timeframes = ["1m", "5m", "15m", "1h", "1d"]
         logger.info(f"Validating timeframes: {timeframes}")
         for timeframe in timeframes:
@@ -385,23 +551,10 @@ class Alpacastocks(Stockexchange):
                 raise ValueError(f"Timeframe '{timeframe}' is not supported by Alpaca.")
 
     def convert_timeframe(self, timeframe):
-        """
-        Convert Freqtrade timeframe to Alpaca timeframe.
-
-        :param timeframe: Freqtrade timeframe.
-        :return: Alpaca timeframe.
-        """
         conversion_map = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "1d": "1Day"}
         return conversion_map.get(timeframe, timeframe)
 
     def get_option(self, option, default=None):
-        """
-        Get an option value from the exchange configuration.
-
-        :param option: The option key.
-        :param default: The default value if the option is not found.
-        :return: The option value.
-        """
         return self._ft_has_default.get(option, default)
 
     def get_historical_bars(
@@ -415,52 +568,34 @@ class Alpacastocks(Stockexchange):
         feed="iex",
         currency="USD",
     ):
-        """
-        Fetch historical bars data from Alpaca API.
-
-        :param symbols: List of stock symbols.
-        :param timeframe: Timeframe for the bars.
-        :param start: Start date in ISO 8601 format.
-        :param end: End date in ISO 8601 format.
-        :param limit: Maximum number of data points to return.
-        :param adjustment: Corporate action adjustment for the stocks.
-        :param feed: Source feed of the data.
-        :param currency: Currency of all prices.
-        """
-
         url = "https://data.alpaca.markets/v2/stocks/bars"
         params = {
             "symbols": ",".join(symbols),
             "timeframe": self.convert_timeframe(timeframe),
-            "start": start,
-            "end": end,
             "limit": limit,
             "adjustment": adjustment,
             "feed": feed,
             "currency": currency,
         }
-
-        # Include start and end only if they are not None
         if start:
             params["start"] = start
         if end:
             params["end"] = end
-
         headers = {"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret}
-
         logger.debug(f"API Request: GET {url}")
-        logger.debug(f"API Headers: {headers}")
         logger.debug(f"API Parameters: {params}")
-
-        # Add timeout parameter to prevent hanging
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        if response.status_code != 200:
-            logger.error(f"Failed to fetch historical bars: {response.text}")
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            logger.debug(f"API Response: {data}")
+            return data
+        except requests.exceptions.HTTPError as http_err:
+            logger.error(f"HTTP error fetching historical bars: {http_err}")
             return {}
-
-        data = response.json()
-        logger.debug(f"API Response: {data}")
-        return data
+        except Exception as e:
+            logger.error(f"Failed to fetch historical bars: {e}")
+            return {}
 
     def get_historic_ohlcv(
         self,
@@ -477,26 +612,19 @@ class Alpacastocks(Stockexchange):
         try:
             if params is None:
                 params = {}
-
             logger.debug(f"Request parameters: {params}")
             logger.debug(f"since_ms: {since_ms}, until_ms: {until_ms}")
-
             symbol = pair.split("/")[0]
-
-            # Convert since and until_ms to ISO 8601 format
             if since_ms:
                 start = pd.to_datetime(since_ms, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
-                start = pd.to_datetime("2024-01-01T00:00:00Z", utc=True).strftime(
+                start = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
-                )  # Default start date
-
+                )
             if until_ms:
                 end = pd.to_datetime(until_ms, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%SZ")
             else:
-                # Use current UTC time (or current_time minus a small buffer) as the end time.
                 end = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-
             bars = self.get_historical_bars(
                 [symbol],
                 timeframe,
@@ -507,42 +635,42 @@ class Alpacastocks(Stockexchange):
                 params.get("feed", "iex"),
                 params.get("currency", "USD"),
             )
-
-            if not bars or "bars" not in bars or not bars["bars"].get(symbol):
+            if (
+                not bars
+                or "bars" not in bars
+                or not isinstance(bars["bars"], dict)
+                or not bars["bars"].get(symbol)
+            ):
                 logger.warning(f"No data available for {pair} {timeframe}")
                 return pd.DataFrame()
-
             data = []
-            for bar in bars["bars"][symbol]:
-                # Remove unit='s' as 't' is in ISO format
-                data.append(
-                    {
-                        "date": pd.to_datetime(bar["t"], utc=True),
-                        "open": bar["o"],
-                        "high": bar["h"],
-                        "low": bar["l"],
-                        "close": bar["c"],
-                        "volume": bar["v"],
-                    }
-                )
-
+            for bar in bars["bars"].get(symbol, []):
+                try:
+                    data.append(
+                        {
+                            "date": pd.to_datetime(bar["t"], utc=True),
+                            "open": float(bar["o"]),
+                            "high": float(bar["h"]),
+                            "low": float(bar["l"]),
+                            "close": float(bar["c"]),
+                            "volume": float(bar["v"]),
+                        }
+                    )
+                except (KeyError, TypeError) as e:
+                    logger.warning(f"Invalid bar data for {symbol}: {e}")
+                    continue
             df = pd.DataFrame(data)
+            if df.empty:
+                logger.warning(f"No valid data retrieved for {pair} {timeframe}")
+                return pd.DataFrame()
             df["date"] = pd.to_datetime(df["date"])
             df.sort_values(by="date", inplace=True)
             df.reset_index(drop=True, inplace=True)
-
             logger.debug(f"DataFrame columns: {df.columns}")
             logger.debug(f"First row: {df.head(1)}")
-
-            if df.empty:
-                logger.warning(f"No data retrieved for {pair} {timeframe}")
-                return pd.DataFrame()
-
             return df
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP error occurred: {http_err}")
         except Exception as e:
-            logger.error(f"An error occurred: {e}")
+            logger.error(f"An error occurred fetching OHLCV for {pair}: {e}")
             return pd.DataFrame()
 
     def _download_pair_history(self, data, DATETIME_PRINT_FORMAT):
@@ -556,12 +684,6 @@ class Alpacastocks(Stockexchange):
             return f"{data.iloc[0]['date']:{DATETIME_PRINT_FORMAT}}"
 
     def save_to_feather(self, df, file_path):
-        """
-        Save the DataFrame to a Feather file.
-
-        :param df: DataFrame to save.
-        :param file_path: Path to save the Feather file.
-        """
         try:
             if df.empty:
                 logger.warning("DataFrame is empty, not saving to Feather file.")
@@ -572,26 +694,13 @@ class Alpacastocks(Stockexchange):
             logger.error(f"Failed to save DataFrame to Feather file: {str(e)}")
 
     def klines(self, pair, timeframe=None, *, candle_type="spot", **kwargs) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV data for a pair and timeframe.
-
-        :param pair: The trading pair, or a tuple containing (pair, timeframe, candle_type).
-        :param timeframe: The timeframe (e.g., '1m', '1h', '1d').
-        :param candle_type: The type of candles ('spot' for standard candles).
-        :return: DataFrame containing OHLCV data.
-        """
         try:
-            # Initialize pair_str to hold the string pair name
             pair_str = pair
-            # Check if pair is provided as a tuple (pair, timeframe, candle_type)
             if isinstance(pair, tuple) and len(pair) == 3:
-                # Unpack tuple, but use pair_str for the string pair name
                 pair_str, timeframe, candle_type = pair
             else:
-                # Ensure timeframe is provided when not using a tuple
                 if timeframe is None:
                     raise ValueError("timeframe must be provided if not using a tuple.")
-            # Proceed to fetch OHLCV data, now using pair_str
             ohlcv = self.get_historic_ohlcv(pair_str, timeframe)
             return ohlcv.copy()
         except Exception as e:
@@ -599,46 +708,28 @@ class Alpacastocks(Stockexchange):
             return pd.DataFrame()
 
     def refresh_latest_ohlcv(self, pairs=None, timeframe="1h", **kwargs):
-        """
-        Fetches the latest OHLCV data for the given pairs from Alpaca.
-        """
-        if not self.is_market_open():
-            # If the market is closed, this message will have already been logged by is_market_open.
-            # Optionally, you can decide not to proceed with fetching data.
-            return {}
-
-        # Continue with fetching data when the market is open
         latest_ohlcv = {}
-        current_time = pd.Timestamp.now(tz="UTC")
-
+        market_open = self.is_market_open()
+        if not market_open:
+            return {}
         for raw_pair in pairs or []:
             if isinstance(raw_pair, tuple) and len(raw_pair) == 3:
                 pair_symbol = raw_pair[0]
             else:
                 pair_symbol = raw_pair
-
             try:
-                start_time = current_time - pd.Timedelta(minutes=5)
-                limit = 1  # Get only the latest candle
                 ohlcv_data = self.get_historic_ohlcv(
                     pair=pair_symbol,
                     timeframe=timeframe,
-                    since=int(start_time.timestamp() * 1000),
-                    until_ms=int(current_time.timestamp() * 1000),
-                    limit=limit,
+                    limit=1,
                 )
                 if not ohlcv_data.empty:
                     latest_ohlcv[pair_symbol] = ohlcv_data
-                else:
-                    logger.warning(f"No OHLCV data found for pair {pair_symbol} at {current_time}.")
             except Exception as e:
                 logger.error(f"Error fetching latest OHLCV for {pair_symbol}: {str(e)}")
-                continue
-
         return latest_ohlcv
 
     def get_balances(self):
-        """Retrieve account balances (already implemented)"""
         try:
             account = self.trading_client.get_account()
             return {
@@ -653,7 +744,6 @@ class Alpacastocks(Stockexchange):
             return {}
 
     def fetch_positions(self, symbols=None, params=None):
-        """New positions fetch method"""
         try:
             positions = self.trading_client.get_all_positions()
             return [self._format_position(pos) for pos in positions]
@@ -662,7 +752,6 @@ class Alpacastocks(Stockexchange):
             return []
 
     def _format_position(self, position):
-        """Helper to format Alpaca position"""
         qty = float(position.qty)
         return {
             "symbol": f"{position.symbol}/USD",
@@ -676,17 +765,228 @@ class Alpacastocks(Stockexchange):
         }
 
     def is_market_open(self) -> bool:
-        """
-        Check if the market is open using Alpaca's clock API.
-
-        :return: True if the market is open, False otherwise.
-        """
         try:
             clock = self.trading_client.get_clock()
+            self._last_market_state = clock.is_open
             if not clock.is_open:
                 logger.info("Market is closed")
             return clock.is_open
         except Exception as e:
             logger.error(f"Failed to retrieve market clock: {e}")
-            # If there is an error, assume the market is closed
+            return self._last_market_state if self._last_market_state is not None else False
+
+    def get_rate(self, pair: str, side: str | None = None, *args, **kwargs) -> float:
+        try:
+            df = self.klines(pair, timeframe="1m", candle_type="spot")
+            if df.empty:
+                raise ValueError(f"No price data available for {pair}")
+            return float(df["close"].iat[-1])
+        except Exception as e:
+            logger.error(f"Failed to fetch rate for {pair}: {e}")
+            return 0.0
+
+    def get_funding_fees(self, pair: str, amount: float, **kwargs) -> float:
+        return 0.0
+
+    def check_order_canceled_empty(self, order: dict) -> bool:
+        if not order:
+            return True
+        status = order.get("status", "").lower()
+        return status in ["canceled", "cancelled", "not-found"]
+
+    def fetch_order_or_stoploss_order(
+        self, order_id: str, symbol: str, params: dict | None = None, **kwargs
+    ) -> dict | None:
+        return self.fetch_order(order_id, symbol, params)
+
+    def order_has_fee(self, order: dict) -> bool:
+        return True
+
+    def get_trades_for_order(
+        self, order_id: str, symbol: str, params: dict | None = None, **kwargs
+    ) -> list:
+        return []
+
+    def get_order_id_conditional(self, order: dict) -> str:
+        return order.get("id", "")
+
+    def handle_order_fee(self, trade, order_obj, order):
+        order_id = order_obj.get("id")
+        logger.debug(
+            f"Alpaca handle_order_fee called for trade {trade.id}, processing order ID: {order_id}"
+        )
+        fee_info = order_obj.get("fee")
+        if not fee_info:
+            logger.debug(f"Order {order_id}: No 'fee' info found in order_obj.")
+            return None
+        fee_cost = fee_info.get("cost", 0.0)
+        fee_currency = fee_info.get("currency", self.config.get("stake_currency", "USD"))
+        stake_currency = self.config.get("stake_currency", "USD")
+        is_open_fee = order_id is not None and str(trade.open_order_id) == str(order_id)
+        is_close_fee = order_id is not None and str(trade.close_order_id) == str(order_id)
+        if is_open_fee:
+            logger.info(
+                f"Applying OPEN fee for trade {trade.id}, order {order_id}: "
+                f"Cost={fee_cost}, Currency={fee_currency}"
+            )
+            trade.fee_open = True
+            trade.fee_open_cost = fee_cost
+            trade.fee_open_currency = fee_currency
+            trade.fee_open_stake_currency = stake_currency
+        elif is_close_fee:
+            logger.info(
+                f"Applying CLOSE fee for trade {trade.id}, order {order_id}: "
+                f"Cost={fee_cost}, Currency={fee_currency}"
+            )
+            trade.fee_close = True
+            trade.fee_close_cost = fee_cost
+            trade.fee_close_currency = fee_currency
+            trade.fee_close_stake_currency = stake_currency
+        else:
+            logger.debug(
+                f"Order {order_id} does not match open or close order for trade {trade.id}."
+            )
+        return None
+
+    def extract_cost_curr_rate(self, *args, **kwargs) -> tuple[float, str, float]:
+        logger.debug("Alpacastocks.extract_cost_curr_rate called.")
+        logger.debug(f"  args: {args}")
+        logger.debug(f"  kwargs: {kwargs}")
+        cost = 0.0
+        currency = self.config.get("stake_currency", "USD")
+        rate = 0.0
+        if args and len(args) > 0 and isinstance(args[0], dict) and "cost" in args[0]:
+            fee_info = args[0]
+            cost = float(fee_info.get("cost", 0.0))
+            currency = fee_info.get("currency", currency)
+        elif args and len(args) > 2:
+            arg_cost = args[2]
+            try:
+                cost = float(arg_cost)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not convert args[2] '{arg_cost}' to float for cost.")
+                cost = 0.0
+        logger.debug(
+            f"extract_cost_curr_rate returning cost={cost}, currency={currency}, rate={rate}"
+        )
+        return cost, currency, rate
+
+    def get_markets(self, reload=False, params=None, tradable_only=False, active_only=False):
+        pairlist_file_path = Path(self.PAIRLIST_FILE)
+        reload_needed = self._should_reload_markets(pairlist_file_path, reload)
+
+        if reload_needed:
+            self._load_markets_from_api(pairlist_file_path, tradable_only, active_only)
+        else:
+            self._load_markets_from_file(pairlist_file_path, tradable_only, active_only)
+
+        return self._markets
+
+    def _should_reload_markets(self, file_path: Path, reload_flag: bool) -> bool:
+        """
+        Determine if markets should be reloaded from the API.
+        """
+        if reload_flag or not hasattr(self, "_markets"):
+            if file_path.exists():
+                file_age = time.time() - file_path.stat().st_mtime
+                if file_age > 86400:
+                    logger.info("Pairlist file is older than 24 hours. Reloading from Alpaca.")
+                    return True
+                return False
+            return True
+        return False
+
+    def _load_markets_from_file(self, file_path: Path, tradable_only: bool, active_only: bool):
+        """
+        Load markets from a local JSON file.
+        """
+        try:
+            with file_path.open("r") as f:
+                self._markets = json.load(f)
+            logger.debug("Loaded market pairs from file.")
+        except Exception as e:
+            logger.error(f"Failed to load market pairs from file: {e}")
+            # Fallback to API reload with original filter flags
+            self._load_markets_from_api(file_path, tradable_only, active_only)
+
+    def _load_markets_from_api(self, file_path: Path, tradable_only: bool, active_only: bool):
+        """
+        Fetch and process market data from Alpaca API.
+        """
+        logger.info("Refreshing market pairs from Alpaca API.")
+        try:
+            search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
+            assets = self.trading_client.get_all_assets(search_params)
+            assets_dict = [dict(item) for item in assets]
+            self._markets = self._process_assets(assets_dict, tradable_only, active_only)
+
+            with file_path.open("w") as f:
+                json.dump(self._markets, f, default=str)
+            logger.info("Saved market pairs to file.")
+
+        except APIError as e:
+            error_message = str(e).lower()
+            if "forbidden" in error_message:
+                logger.error(
+                    "Authentication failed - Invalid API credentials. "
+                    "Please check your Alpaca API key and secret."
+                )
+                sys.exit(1)
+            logger.error(f"Error fetching market data from Alpaca: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error while fetching markets: {e}")
+
+    def _process_assets(self, assets_dict: list, tradable_only: bool, active_only: bool):
+        """
+        Process raw asset data into a market dictionary.
+        """
+        markets = {}
+        for asset in assets_dict:
+            if not self._is_asset_included(asset, tradable_only, active_only):
+                continue
+
+            pair = f"{asset['symbol']}/USD"
+            markets[pair] = {
+                "id": pair,
+                "symbol": pair,
+                "base": asset["symbol"],
+                "quote": "USD",
+                "spot": True,
+                "tradable": asset["tradable"],
+                "margin": False,
+                "active": asset["status"] == "active",
+                "maker": 0.001,
+                "taker": 0.002,
+                "info": asset,
+                "precision": {"amount": 8, "price": 8},
+                "limits": {
+                    "amount": {"min": 0.001, "max": 1000000},
+                    "price": {"min": 0.01, "max": 1000000},
+                    "cost": {"min": 0.01, "max": 1000000},
+                },
+                "future": False,
+                "option": False,
+                "linear": True,
+                "inverse": False,
+                "contractSize": 1,
+                "expiry": None,
+                "expiry_date": None,
+                "strike": None,
+                "underlying": None,
+                "settle": None,
+                "settleDate": None,
+                "listing": None,
+                "listed": None,
+                "market_type": "spot",
+            }
+        return markets
+
+    def _is_asset_included(self, asset: dict, tradable_only: bool, active_only: bool) -> bool:
+        """
+        Determine if an asset should be included in the market list.
+        """
+        if tradable_only and not asset.get("tradable", False):
             return False
+        if active_only and asset.get("status") != "active":
+            return False
+        return True

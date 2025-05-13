@@ -1,8 +1,12 @@
 # pip install ib_insync
-# Interactive brokers
+# Interactive Brokers exchange integration for FreqTrade
 
+import asyncio
 import logging
 import math
+import time
+from datetime import datetime, timezone
+from threading import Event, Thread
 from typing import Any
 
 import pandas as pd
@@ -21,10 +25,12 @@ class Interactivebrokers(Foreignexchange):
     to work with IBKR for forex trading.
     """
 
-    DECIMAL_PLACES = 6  # Forex typically uses 5 decimal places
+    DECIMAL_PLACES = 6
     SIGNIFICANT_DIGITS = 6
-    TICK_SIZE = 0.000001  # Minimum price movement for forex
-    MAX_DATA_DELAY = pd.Timedelta(minutes=5)  # Allowed data delay during market hours
+    TICK_SIZE = 0.000001
+    MAX_DATA_DELAY = pd.Timedelta(minutes=5)
+    MIN_LOT_SIZE = 25_000
+    RECONNECT_TIMEOUT = 30
 
     _ft_has_default = {
         "stoploss_on_exchange": False,
@@ -32,7 +38,7 @@ class Interactivebrokers(Foreignexchange):
         "ohlcv_candle_limit": 500,
         "ohlcv_has_history": True,
         "ohlcv_partial_candle": True,
-        "ohlcv_require_since": False,  # IBKR doesn't use 'since' directly in reqHistoricalData
+        "ohlcv_require_since": False,
         "ohlcv_volume_currency": "base",
         "tickers_have_quoteVolume": True,
         "tickers_have_percentage": True,
@@ -84,34 +90,115 @@ class Interactivebrokers(Foreignexchange):
             validate=validate,
             load_leverage_tiers=load_leverage_tiers,
         )
-        # Initialize IBKR connection
+
         self.ib = IB()
         self.dry_run = config.get("dry_run", False)
         self.latest_ohlcv: dict = {}
-        # Determine the port based on dry_run
+        self._running = True
+        self._reconnect_event = Event()
+        self._connection_thread: Thread | None = None
+        self._ws_connected = False
+        self._markets_cache: dict[str, Any] = {}
+
+        # Set ports based on live/paper trading
         if self.dry_run:
-            self.port = 4002  # IB Gateway paper trading port
-            logger.info("Connecting to IBKR paper trading (IB Gateway).")
+            self.port = config.get("ib_paper_port", 4002)
+            logger.info(f"Connecting to IBKR paper trading (IB Gateway) on port {self.port}.")
         else:
-            self.port = 7497  # TWS live trading port
-            logger.info("Connecting to IBKR live trading (TWS).")
-        # Connect to TWS/IB Gateway
-        try:
-            self.ib.connect("127.0.0.1", self.port, clientId=1)
-            if self.ib.isConnected():
-                logger.info(f"Successfully connected to IBKR on port {self.port}.")
-        except ConnectionRefusedError as e:
-            logger.error(f"Unexpected error while connecting to IBKR: {e}")
-            logger.error("Failed to connect to IBKR. Is TWS from Interactive Brokers running?")
-            logger.error("Get TWS: interactivebrokers.com/en/trading/tws-updatable-latest.php")
-            exit(1)
+            self.port = config.get("ib_live_port", 7497)
+            logger.info(f"Connecting to IBKR live trading (TWS) on port {self.port}.")
 
+        # Set up host
+        self.host = config.get("ib_host", "127.0.0.1")
+        self.client_id = config.get("ib_client_id", 1)
+
+        # Connect to IBKR
+        self._connect_to_ib()
+
+        # Set margin mode and initialize markets
         self.margin_mode = MarginMode.NONE
-
-        self.ws_start()
         self.markets = self.get_markets()
+
+        # Start WebSocket connection
+        self.ws_start()
+
+        # Verify connection is established
         if not self.ib.isConnected():
+            logger.error("Failed to establish connection to Interactive Brokers")
             raise ConnectionError("WebSocket connection failed")
+
+    def _connect_to_ib(self) -> None:
+        max_retries = 3
+        retry_count = 0
+        retry_delay = 5
+
+        while retry_count < max_retries:
+            try:
+                if self.ib.isConnected():
+                    self.ib.disconnect()
+
+                logger.info(
+                    f"Connecting to IBKR on {self.host}:{self.port} (clientId={self.client_id})"
+                )
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+
+                if self.ib.isConnected():
+                    logger.info(f"Successfully connected to IBKR on port {self.port}.")
+                    self._setup_event_loop()
+                    self._ws_connected = True
+                    return
+                else:
+                    logger.warning("Connection attempt returned without error but not connected")
+                    retry_count += 1
+            except ConnectionRefusedError as e:
+                logger.error(f"Connection refused while connecting to IBKR: {e}")
+                retry_count += 1
+            except Exception as e:
+                logger.error(f"Unexpected error while connecting to IBKR: {e}")
+                retry_count += 1
+
+            if retry_count < max_retries:
+                logger.info(
+                    f"Retrying connection in {retry_delay} seconds..."
+                    f"(Attempt {retry_count + 1}/{max_retries})"
+                )
+                time.sleep(retry_delay)
+
+        logger.error("Failed to connect to IBKR after multiple attempts")
+        logger.error("Please ensure TWS or IB Gateway is running with API connections enabled")
+        raise ConnectionError("Could not connect to Interactive Brokers")
+
+    def _setup_event_loop(self) -> None:
+        if self._connection_thread is not None and self._connection_thread.is_alive():
+            logger.info("Event loop thread is already running")
+            return
+
+        self._loop = asyncio.new_event_loop()
+
+        def _start_ib_loop():
+            asyncio.set_event_loop(self._loop)
+            logger.info("Starting IBKR event loop")
+
+            while self._running:
+                try:
+                    if self.ib.isConnected():
+                        self.ib.sleep(1)
+                    else:
+                        if self._reconnect_event.wait(timeout=5):
+                            self._reconnect_event.clear()
+                            try:
+                                self._connect_to_ib()
+                            except Exception as e:
+                                logger.error(f"Error during reconnection: {e}")
+                except Exception as e:
+                    logger.error(f"Error in IBKR event loop: {e}")
+                    time.sleep(1)
+
+            logger.info("IBKR event loop stopped")
+
+        self._connection_thread = Thread(target=_start_ib_loop, daemon=True)
+        self._connection_thread.start()
+        logger.info("Started IBKR event loop in background thread.")
 
     @property
     def id(self) -> str:
@@ -122,10 +209,6 @@ class Interactivebrokers(Foreignexchange):
         return "interactivebrokers"
 
     def get_proxy_coin(self) -> str:
-        """
-        Return the stake currency (proxy coin) used for trading.
-        This is typically the quote currency of the trading pair (e.g., USD for EUR/USD).
-        """
         return self.config.get("stake_currency", "USD")
 
     def create_order(
@@ -136,80 +219,111 @@ class Interactivebrokers(Foreignexchange):
         amount: float,
         price: float | None = None,
         params: dict[Any, Any] | None = None,
+        rate: float | None = None,
         **kwargs,
     ) -> dict:
-        # Build the contract from the pair
-        parts = pair.split("/")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
-        symbol, currency = parts[0].strip().upper(), parts[1].strip().upper()
-        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
+        params = params or {}
 
-        if ordertype == "limit":
-            # If no valid price is provided, attempt to fetch one using get_rate.
-            if price is None or price <= 0:
-                logger.info(
-                    f"No valid price for {pair}, call get_rate to get price for side {side}."
-                )
-                price = self.get_rate(pair, side=side)
-            if price is None or price <= 0:
-                logger.error(
-                    f"Attempted to create limit order for {pair} with invalid price: {price}"
-                )
-                raise ValueError(f"Limit order for {pair} requires a valid price > 0.")
-            formatted_price = round(price, 5)
-            order = Order(
-                action=side, totalQuantity=round(amount), orderType="LMT", lmtPrice=formatted_price
-            )
-        elif ordertype == "market":
-            order = Order(action=side, totalQuantity=round(amount), orderType="MKT")
+        if rate is not None and (price is None or price <= 0):
+            price = rate
+
+        try:
+            contract = self._create_and_qualify_contract(pair)
+        except ValueError as e:
+            logger.error(f"Contract qualification failed: {e}")
+            return {"id": None, "status": "failed", "info": str(e)}
+
+        amount = self._adjust_amount_for_min_lot(amount)
+
+        # Use the helper method
+        use_market = self._should_use_market_order(ordertype, side, params)
+
+        if use_market:
+            order = self._create_order_object(side, amount, None, ordertype)
         else:
-            raise ValueError(f"Unsupported order type: {ordertype}")
+            try:
+                if price is None or price <= 0:
+                    price = self.get_rate(pair, side=side)
 
-        # Place the order via IBKR API
-        trade = self.ib.placeOrder(contract, order)
-        # Return a CCXT-style order dict
-        return {
-            "id": str(trade.order.orderId),
-            "symbol": pair,
-            "type": ordertype.lower(),
-            "side": side.lower(),
-            "amount": amount,
-            "price": price,
-            "filled": 0.0,
-            "remaining": amount,
-            "status": "open",
-            "info": trade.order,
-        }
+                if not (0.00001 <= price <= 1000.0):
+                    raise ValueError(f"Invalid price for order: {price}")
+
+                order = self._create_order_object(side, amount, price, ordertype)
+            except ValueError as e:
+                logger.error(f"Failed to get valid price for order: {e}")
+                return {"id": None, "status": "failed", "info": str(e)}
+
+        try:
+            trade = self.ib.placeOrder(contract, order)
+            logger.info(
+                f"Order placed: {order.action} {order.totalQuantity} {pair}"
+                f" at {getattr(order, 'lmtPrice', 'MARKET')}"
+            )
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return {"id": None, "status": "failed", "info": str(e)}
+
+        return self._wait_for_order_status(trade)
 
     def fetch_order(
         self,
         order_id: str,
-        pair: str | None = None,  # Changed from Optional[str]
+        pair: str | None = None,
     ) -> dict | None:
-        """Fetch order from IBKR and format as CCXT order."""
-        trades = self.ib.trades()
-        for trade in trades:
-            if str(trade.order.orderId) == order_id:
-                # Convert IBKR trade to CCXT-style order dict
-                filled = trade.orderStatus.filled
-                remaining = trade.orderStatus.remaining
-                return {
-                    "id": str(trade.order.orderId),
-                    "symbol": f"{trade.contract.symbol}/{trade.contract.currency}",
-                    "type": trade.order.orderType.lower(),
-                    "side": "buy" if trade.order.action == "BUY" else "sell",
-                    "amount": trade.order.totalQuantity,
-                    "price": trade.order.lmtPrice if trade.order.orderType == "LMT" else None,
-                    "filled": filled,
-                    "remaining": remaining,
-                    "status": self._parse_order_status(trade.orderStatus.status),
-                    "info": trade,
-                }
-        return None
+        try:
+            oid = int(order_id)
+        except ValueError:
+            logger.error(f"Invalid order ID format: {order_id}")
+            return None
+
+        try:
+            for trade in self.ib.trades():
+                if trade.order.orderId == oid:
+                    filled = float(trade.orderStatus.filled)
+                    total = float(trade.order.totalQuantity)
+                    remaining = total - filled
+
+                    if hasattr(trade.contract, "symbol") and hasattr(trade.contract, "currency"):
+                        symbol = f"{trade.contract.symbol}/{trade.contract.currency}"
+                    else:
+                        symbol = pair if pair else "UNKNOWN/UNKNOWN"
+
+                    if trade.order.orderType == "LMT":
+                        price = (
+                            float(trade.order.lmtPrice)
+                            if trade.order.lmtPrice is not None
+                            else None
+                        )
+                    elif hasattr(trade, "fills") and trade.fills:
+                        total_cost = sum(
+                            fill.execution.price * fill.execution.shares for fill in trade.fills
+                        )
+                        total_shares = sum(fill.execution.shares for fill in trade.fills)
+                        price = total_cost / total_shares if total_shares > 0 else None
+                    else:
+                        price = None
+
+                    return {
+                        "id": order_id,
+                        "symbol": symbol,
+                        "type": trade.order.orderType.lower(),
+                        "side": trade.order.action.lower(),
+                        "amount": total,
+                        "price": price,
+                        "filled": filled,
+                        "remaining": remaining,
+                        "status": self._parse_order_status(trade.orderStatus.status),
+                        "info": trade,
+                    }
+
+            logger.debug(f"fetch_order: no trade with orderId={order_id}")
+            return None
+
+        except Exception as e:
+            logger.error(f"Error in fetch_order for {order_id}: {e}")
+            return None
 
     def _parse_order_status(self, ib_status: str) -> str:
-        """Map IBKR order status to CCXT status."""
         status_mapping = {
             "ApiPending": "open",
             "PendingSubmit": "open",
@@ -217,14 +331,21 @@ class Interactivebrokers(Foreignexchange):
             "Submitted": "open",
             "Filled": "closed",
             "Cancelled": "canceled",
+            "Canceled": "canceled",
             "Inactive": "canceled",
+            "ApiCancelled": "canceled",
+            "PendingCancel": "canceling",
         }
         return status_mapping.get(ib_status, "unknown")
 
     def cancel_order(self, order_id: str) -> None:
-        """Cancel an order on IBKR."""
-        self.ib.cancelOrder(order_id)
-        logger.info(f"Order {order_id} canceled successfully.")
+        try:
+            self.ib.cancelOrder(int(order_id))
+            logger.info(f"Order {order_id} cancel request sent successfully.")
+        except ValueError as e:
+            logger.error(f"Invalid order ID format when canceling {order_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
 
     def get_markets(
         self,
@@ -232,8 +353,10 @@ class Interactivebrokers(Foreignexchange):
         params: dict[Any, Any] | None = None,
         tradable_only: bool = False,
         active_only: bool = False,
-    ):
-        """Return a dictionary of available markets."""
+    ) -> dict:
+        if hasattr(self, "_markets_cache") and not reload:
+            return self._markets_cache
+
         markets: dict[str, Any] = {}
         forex_pairs = [
             ("EUR", "USD"),
@@ -257,6 +380,7 @@ class Interactivebrokers(Foreignexchange):
             ("GBP", "AUD"),
             ("USD", "TRY"),
         ]
+
         for base, quote in forex_pairs:
             pair = f"{base}/{quote}"
             markets[pair] = {
@@ -266,28 +390,48 @@ class Interactivebrokers(Foreignexchange):
                 "quote": quote,
                 "precision": {"amount": 2, "price": 5},
                 "limits": {
-                    "amount": {"min": 0.01, "max": 1000000},
+                    "amount": {"min": self.MIN_LOT_SIZE, "max": 10_000_000},
                     "price": {"min": 0.00001, "max": 1000000},
                     "cost": {"min": 0.01, "max": 1000000},
                 },
                 "active": True,
                 "info": {"base": base, "quote": quote},
             }
+
+        self._markets_cache = markets
         return markets
 
     def reload_markets(self, params: dict[Any, Any] | None = None) -> dict:
-        """
-        Reload the markets data and update self.markets.
-        :param params: Optional parameters for market fetching.
-        :return: Updated markets dictionary.
-        """
         self.markets = self.get_markets(reload=True, params=params)
         logger.info("Markets reloaded successfully.")
         return self.markets
 
     def get_fee(self, symbol: str, now: Any = None, taker_or_maker: str = "maker") -> float:
-        """Get the fee structure for a symbol."""
-        return 0.0001 if taker_or_maker == "maker" else 0.0002
+        maker_fee = 0.0001
+        taker_fee = 0.0002
+        return maker_fee if taker_or_maker == "maker" else taker_fee
+
+    async def fetch_historical_data(self, contract, durationStr, ib_timeframe):
+        try:
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",  # Current time
+                durationStr=durationStr,
+                barSizeSetting=ib_timeframe,
+                whatToShow="MIDPOINT",
+                useRTH=False,
+                keepUpToDate=True,
+            )
+            if not bars:
+                logger.warning(
+                    f"No historical data returned for contract:"
+                    f"{contract.symbol}/{contract.currency}"
+                )
+                return []
+            return bars
+        except Exception as e:
+            logger.error(f"Error fetching historical data: {e}")
+            raise
 
     def get_historic_ohlcv(
         self,
@@ -295,96 +439,110 @@ class Interactivebrokers(Foreignexchange):
         since: int | None = None,
         timeframe: str | None = None,
         limit: int = 1000,
-        params: dict[Any, Any] | None = None,
+        params: dict | None = None,
         since_ms: int | None = None,
         is_new_pair: bool = True,
         candle_type: str = "spot",
         until_ms: int | None = None,
     ) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV data from IBKR.
-        :param pair: The trading pair (e.g., 'EUR/USD').
-        :param timeframe: Timeframe string (e.g., '1h', '5m').
-        :param since: Start timestamp for data retrieval.
-        :param limit: Maximum number of candles to fetch.
-        :param params: Additional parameters.
-        :param since_ms: Start timestamp in milliseconds.
-        :param is_new_pair: Whether the pair is new.
-        :param candle_type: Type of candle (e.g., 'spot').
-        :param until_ms: End timestamp in milliseconds.
-        :return: DataFrame containing OHLCV data.
-        """
         if isinstance(pair, tuple):
             pair = pair[0]
-        parts = pair.split("/")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
-        symbol = parts[0].strip().upper()
-        currency = parts[1].strip().upper()
-        full_pair = symbol + currency
-        logger.info("Constructing Forex contract for pair: %s", full_pair)
-        if len(symbol) != 3 or len(currency) != 3 or len(full_pair) != 6:
-            raise ValueError(
-                f"Invalid currency codes: symbol={symbol} (len={len(symbol)}), "
-                f"currency={currency} (len={len(currency)}). "
-                f"Combined: '{full_pair}' (len={len(full_pair)}). "
-                "Expected 3-letter codes for each."
-            )
+
+        symbol, currency = self._extract_currencies_from_pair(pair)
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "CASH"
         contract.currency = currency
         contract.exchange = "IDEALPRO"
+
         if timeframe is None:
             timeframe = self.config.get("timeframe", "1h")
         ib_timeframe = self._convert_timeframe(timeframe)
         durationStr = self._calculate_duration(timeframe, limit)
-        bars = self.ib.reqHistoricalData(
-            contract,
-            endDateTime="",
-            durationStr=durationStr,
-            barSizeSetting=ib_timeframe,
-            whatToShow="MIDPOINT",
-            useRTH=True,
-        )
-        if bars is None:
-            raise ValueError("No historical data returned from IBKR")
-        df = util.df(bars)
-        df.rename(
-            columns={
-                "date": "timestamp",
-                "open": "open",
-                "high": "high",
-                "low": "low",
-                "close": "close",
-                "volume": "volume",
-            },
-            inplace=True,
-        )
-        if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-        elif "timestamp" in df.columns:
-            df["date"] = pd.to_datetime(df["timestamp"])
-        return df
+
+        try:
+            bars = self.ib.run(self.fetch_historical_data(contract, durationStr, ib_timeframe))
+
+            if not bars:
+                logger.warning(f"No bars returned for {pair} with timeframe {timeframe}")
+                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+            df = util.df(bars)
+            if df is None or df.empty:
+                logger.warning(f"Empty DataFrame returned for {pair}")
+                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+            df.rename(
+                columns={
+                    "date": "timestamp",
+                    "open": "open",
+                    "high": "high",
+                    "low": "low",
+                    "close": "close",
+                    "volume": "volume",
+                },
+                inplace=True,
+            )
+
+            if "timestamp" in df.columns:
+                df["date"] = pd.to_datetime(df["timestamp"], utc=True)
+            else:
+                logger.error(f"No timestamp column in DataFrame for {pair}")
+                raise ValueError("DataFrame must have a 'timestamp' column")
+
+            df = df.sort_values(by="date", ascending=True).reset_index(drop=True)
+
+            if not df.empty:
+                current_time = datetime.now(timezone.utc)
+                last_candle = df["date"].iloc[-1]
+                first_candle = df["date"].iloc[0]
+                num_candles = len(df)
+                age_minutes = (current_time - last_candle).total_seconds() / 60
+                logger.info(
+                    f"Retrieved {num_candles} candles for {pair}"
+                    f"from {first_candle} to {last_candle} "
+                    f"(Last candle age: {age_minutes:.2f} minutes)"
+                )
+
+            return df
+
+        except Exception as e:
+            logger.error(f"Failed to fetch historical data for {pair}: {e}")
+            raise
 
     def refresh_latest_ohlcv(self, pairs: list) -> None:
-        """
-        Refresh the latest OHLCV data for the given pairs.
-        Freqtrade may call this method with a tuple in the form:
-            (pair, timeframe, candle_type)
-        """
+        if not pairs:
+            logger.debug("Empty pairs list passed to refresh_latest_ohlcv")
+            return
+
         for item in pairs:
-            if isinstance(item, tuple):
-                pair, timeframe, candle_type = item
-            else:
-                pair = item
-                timeframe = self.config.get("timeframe", "1h")
             try:
-                ohlcv = self.get_historic_ohlcv(pair, None, timeframe, 1)  # Passing None for since
-                self.latest_ohlcv[pair] = ohlcv
-                logger.info("Refreshed latest OHLCV for %s", pair)
+                if isinstance(item, tuple):
+                    if len(item) >= 2:
+                        pair, timeframe = item[0], item[1]
+                        candle_type = item[2] if len(item) > 2 else "spot"
+                    else:
+                        pair = item[0]
+                        timeframe = self.config.get("timeframe", "1h")
+                        candle_type = "spot"
+                else:
+                    pair = item
+                    timeframe = self.config.get("timeframe", "1h")
+                    candle_type = "spot"
+
+                ohlcv = self.get_historic_ohlcv(pair, None, timeframe, limit=3)
+
+                if not ohlcv.empty:
+                    key = (pair, timeframe, candle_type)
+                    self.latest_ohlcv[key] = ohlcv
+                    logger.debug(
+                        f"Refreshed latest OHLCV for {pair}/{timeframe}, "
+                        f"last timestamp: {ohlcv['date'].iloc[-1]}"
+                    )
+                else:
+                    logger.warning(f"No OHLCV data refreshed for {pair}/{timeframe}")
             except Exception as e:
-                logger.error("Failed to refresh latest OHLCV for %s: %s", pair, e)
+                logger.error(f"Failed to refresh latest OHLCV for {pair}: {e}")
 
     def klines(
         self,
@@ -395,16 +553,6 @@ class Interactivebrokers(Foreignexchange):
         params: dict[Any, Any] | None = None,
         **kwargs: Any,
     ) -> pd.DataFrame:
-        """
-        Retrieve OHLCV data for a given trading pair and timeframe.
-        :param pair: Trading pair (e.g., 'EUR/USD')
-        :param timeframe: Timeframe string (e.g., '5m', '1h'). Defaults to the config timeframe.
-        :param since: Timestamp from which to retrieve data. Defaults to 0.
-        :param limit: Maximum number of candles to retrieve.
-        :param params: Additional parameters if needed. Defaults to an empty dict.
-        :param kwargs: Extra keyword arguments passed by Freqtrade.
-        :return: DataFrame containing OHLCV data.
-        """
         if params is None:
             params = {}
         if timeframe is None:
@@ -412,7 +560,6 @@ class Interactivebrokers(Foreignexchange):
         return self.get_historic_ohlcv(pair, since, timeframe, limit)
 
     def get_balances(self):
-        """Retrieve account balances."""
         account = self.ib.accountSummary()
         balances: dict[str, Any] = {}
         for item in account:
@@ -425,7 +572,6 @@ class Interactivebrokers(Foreignexchange):
         return balances
 
     def fetch_positions(self) -> list:
-        """Fetch open positions."""
         positions = self.ib.positions()
         formatted_positions: list[dict[str, Any]] = []
         for pos in positions:
@@ -444,15 +590,11 @@ class Interactivebrokers(Foreignexchange):
         return formatted_positions
 
     def close(self) -> None:
-        """Disconnect from IBKR."""
         self.ib.disconnect()
         logger.info("Disconnected from IBKR.")
 
     def market_is_tradable(self, market: dict) -> bool:
-        """
-        Check if a market is tradable by verifying if the pair is active and available.
-        """
-        return market.get("active", False)
+        return market.get("active", False) and market.get("tradable", True)
 
     def get_pair_quote_currency(self, pair: str) -> str:
         if pair not in self.markets:
@@ -467,13 +609,26 @@ class Interactivebrokers(Foreignexchange):
     def ws_connection_reset(self) -> None:
         if self.ib.isConnected():
             self.ib.disconnect()
-        self.ib.connect("127.0.0.1", self.port, clientId=1)
-        logger.info("WebSocket connection reset")
+        try:
+            self.ib.connect(self.host, self.port, clientId=self.client_id)
+            logger.info("WebSocket connection reset")
+            self._ws_connected = True
+        except Exception as e:
+            logger.error(f"Failed to reset WebSocket connection: {e}")
+            self._ws_connected = False
 
     def ws_start(self) -> None:
         if not self.ib.isConnected():
-            self.ib.connect("127.0.0.1", self.port, clientId=1)
-        logger.info("WebSocket started")
+            try:
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+                self._setup_event_loop()
+                self._ws_connected = True
+                logger.info("WebSocket started")
+            except Exception as e:
+                logger.error(f"Failed to start WebSocket: {e}")
+                self._ws_connected = False
+        else:
+            logger.info("WebSocket already running")
 
     def ws_stop(self) -> None:
         if self.ib.isConnected():
@@ -481,7 +636,7 @@ class Interactivebrokers(Foreignexchange):
         logger.info("WebSocket stopped")
 
     def ws_health_check(self) -> bool:
-        return self.ib.isConnected()
+        return self.ib.isConnected() and self._ws_connected
 
     def _convert_timeframe(self, timeframe: str) -> str:
         mapping = {
@@ -490,59 +645,41 @@ class Interactivebrokers(Foreignexchange):
             "15m": "15 mins",
             "30m": "30 mins",
             "1h": "1 hour",
-            "2h": "2 hours",
-            "3h": "3 hours",
             "4h": "4 hours",
-            "8h": "8 hours",
             "1d": "1 day",
         }
-        if timeframe not in mapping:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
-        return mapping[timeframe]
+        return mapping.get(timeframe, timeframe)
 
     def _calculate_duration(self, timeframe: str, limit: int) -> str:
-        if timeframe.endswith("m"):
-            minutes = int(timeframe[:-1])
-            days_per_candle = minutes / (60 * 24)
-        elif timeframe.endswith("h"):
-            hours = int(timeframe[:-1])
-            days_per_candle = hours / 24
-        elif timeframe.endswith("d"):
-            days_per_candle = 1
+        timeframe_to_candles_per_day = {
+            "1m": 1440,
+            "5m": 288,
+            "15m": 96,
+            "30m": 48,
+            "1h": 24,
+            "4h": 6,
+            "1d": 1,
+        }
+
+        if timeframe not in timeframe_to_candles_per_day:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+        candles_per_day = timeframe_to_candles_per_day[timeframe]
+        total_days = math.ceil(limit / candles_per_day)
+
+        if total_days <= 365:
+            return f"{total_days} D"
         else:
-            days_per_candle = 1
-        total_days = math.ceil(limit * days_per_candle)
-        if total_days > 365:
             years = math.ceil(total_days / 365)
             return f"{years} Y"
-        else:
-            return f"{total_days} D"
-
-    @property
-    def precisionMode(self):
-        return 4
-
-    @property
-    def precision_mode_price(self):
-        return 4
-
-    def get_precision_price(self, pair):
-        return 2
-
-    def validate_required_startup_candles(self, startup_candle_count, timeframe):
-        pass
 
     def validate_timeframes(self, timeframes):
-        """
-        Validate the timeframes supported by the exchange.
-
-        :param timeframes: List of timeframes to validate.
-        """
         if isinstance(timeframes, str):
             timeframes = [timeframes]
 
-        supported_timeframes = ["1m", "5m", "15m", "1h", "1d"]
+        supported_timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
         logger.info(f"Validating timeframes: {timeframes}")
+
         for timeframe in timeframes:
             logger.info(f"Validating timeframe: {timeframe}")
             if timeframe not in supported_timeframes:
@@ -550,133 +687,7 @@ class Interactivebrokers(Foreignexchange):
                     f"Timeframe '{timeframe}' is not supported by Interactive Brokers."
                 )
 
-    def get_option(self, option: str, default: Any = None) -> Any:
-        """
-        Retrieve the value for a given option from the _ft_has_default dictionary.
-        :param option: The option key to retrieve.
-        :param default: Default value if the option is not found.
-        :return: The value of the option or the default.
-        """
-        return self._ft_has_default.get(option, default)
-
-    def get_max_leverage(self, pair: str, stake_amount: float) -> float:
-        """
-        Get the maximum leverage available for a given trading pair and stake amount.
-        :param pair: The trading pair (e.g., 'EUR/USD').
-        :param stake_amount: The amount of stake currency.
-        :return: Maximum leverage available.
-        """
-        return 1.0  # Assuming a leverage of 1 (no leverage)
-
-    def get_min_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
-        """
-        Get the minimum stake amount required for a given trading pair.
-        """
-        return 10.0  # or your custom logic for minimum stake
-
-    def get_max_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
-        """
-        Get the maximum stake amount allowed for a given trading pair.
-        """
-        return 1000000.0  # matches the limit defined in get_markets()
-
-    def get_valid_price_and_stake(self, row, pair, leverage):
-        propose_rate = row["close"]
-        stake_amount = self.calculate_stake_amount(pair, propose_rate, leverage)
-        min_stake_amount = self.exchange.get_min_pair_stake_amount(
-            pair
-        )  # Removed leverage argument here
-        return propose_rate, stake_amount, leverage, min_stake_amount
-
-    def get_contract_size(self, pair: str) -> float:
-        """
-        Returns the contract size (lot size) for a given Forex pair.
-        Many Forex brokers use 100,000 units as a standard lot size.
-        """
-        return 100000.0
-
-    def get_precision_amount(self, pair):
-        return 2
-
-    def get_rate(
-        self,
-        pair: str,
-        side: str | None = None,
-        is_short: bool | None = None,
-        refresh: bool = False,
-        **kwargs,
-    ) -> float:
-        """
-        Get the current exchange rate for a given trading pair.
-        If side is provided ('buy' or 'sell'), it returns the
-        ask or bid price respectively; otherwise, returns the
-        midpoint price.
-
-        :param pair: The trading pair (e.g., 'EUR/USD').
-        :param side: Optional parameter, 'buy' or 'sell' to get ask or bid price.
-        :param is_short: Optional parameter indicating if the position is short.
-        :param refresh: Optional parameter to force refreshing the market data.
-        :return: The current exchange rate as a float.
-        :raises ValueError: If no data is available for the pair.
-        """
-        # if isinstance(pair, tuple):
-        #    pair = pair[0]
-
-        # Ensure the pair is split properly and standardized
-        # symbol, currency = [s.strip().upper() for s in pair.split('/')]
-        # Now 'symbol' and 'currency' should both be exactly 3 characters for standard forex pairs.
-        # contract = Forex(symbol=symbol, currency=currency)
-
-        parts = pair.split("/")
-        if len(parts) != 2:
-            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
-        symbol, currency = parts[0].strip().upper(), parts[1].strip().upper()
-        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
-
-        if self.ib.isConnected() and side is not None:
-            # Request real-time market data for the pair
-            try:
-                market_data = self.ib.reqMktData(contract)
-                if market_data is not None:
-                    if side.lower() == "buy":
-                        price = market_data.ask
-                        if price and price > 0:
-                            logger.info(f"Returning ask price for {pair}: {price}")
-                            return price
-                        else:
-                            logger.warning(f"Invalid ask price received for {pair}: {price}")
-                    elif side.lower() == "sell":
-                        price = market_data.bid
-                        if price and price > 0:
-                            logger.info(f"Returning bid price for {pair}: {price}")
-                            return price
-                        else:
-                            logger.warning(f"Invalid bid price received for {pair}: {price}")
-            except Exception as e:
-                logger.error(f"Failed to request market data for {pair}: {e}")
-
-        # Fallback to historical data for midpoint price
-        timeframe = self.config.get("timeframe", "5m")
-        ohlcv = self.get_historic_ohlcv(
-            pair, None, timeframe=timeframe, limit=1
-        )  # Passing None for since
-        if not ohlcv.empty:
-            close_price = ohlcv.iloc[0]["close"]
-            if close_price and close_price > 0:
-                logger.info(f"Returning historical close price for {pair}: {close_price}")
-                return close_price
-            else:
-                logger.warning(
-                    f"Historical data returned invalid close price for {pair}: {close_price}"
-                )
-        raise ValueError(f"Could not fetch current rate for {pair}")
-
     def get_funding_fees(self, pair: str, timeframe: str | None = None, **kwargs) -> float:
-        """
-        Return the funding fee for a given trading pair.
-        For Forex trading, funding fees may be negligible or not applicable,
-        so returning 0.0 is appropriate.
-        """
         return 0.0
 
     def fetch_order_or_stoploss_order(
@@ -686,46 +697,23 @@ class Interactivebrokers(Foreignexchange):
         *args,
         **kwargs,
     ) -> dict:
-        """
-        Fetch order details from IBKR, including stoploss orders.
-
-        :param order_id: The order ID to fetch.
-        :param pair: The trading pair (optional).
-        :param args: Additional positional arguments (ignored).
-        :param kwargs: Additional keyword arguments (ignored).
-        :return: Order details or a dictionary indicating the order status.
-        """
         order = self.fetch_order(order_id, pair)
         if order is None:
             return {"status": "not_found"}
         return order
 
     def check_order_canceled_empty(self, order: dict) -> bool:
-        """
-        Checks if the order is canceled and has no remaining quantity.
-        This is relevant for some exchanges that might return partially filled
-        and then canceled orders as "canceled" even if they have a filled amount.
-
-        :param order: Order dictionary as returned by `fetch_order`
-        :return: True if the order is canceled and empty (no remaining quantity), False otherwise.
-        """
         if not order:
-            return False  # Or maybe True, depending on how empty orders are represented
+            return False
         return order.get("status") == "canceled" and order.get("remaining", 0) == 0
 
     def order_has_fee(self, order) -> bool:
-        """
-        Return whether the order object includes fee information.
-        For IBKR, fees might not be available, so we return False.
-        """
         return False
 
     def get_trades_for_order(self, order, *args, **kwargs):
-        """Retrieve trades associated with the given order, ignoring extra arguments."""
         if not order:
             return []
 
-        # Extract the order_id from the order parameter
         order_id = None
         if isinstance(order, dict):
             order_id = order.get("order_id", None)
@@ -735,7 +723,6 @@ class Interactivebrokers(Foreignexchange):
         if order_id is None:
             return []
 
-        # Query IB for trades
         trades = self.ib.trades()
         matching_trades = []
 
@@ -744,14 +731,6 @@ class Interactivebrokers(Foreignexchange):
                 matching_trades.append(trade)
 
         return matching_trades
-
-    def get_order_id_conditional(self, order: dict | None) -> str | None:
-        """Extract order ID from the order object or dictionary."""
-        if not order:
-            return None
-        if isinstance(order, dict):
-            return order.get("order_id") if "order_id" in order else None
-        return None
 
     def get_liquidation_price(
         self,
@@ -765,12 +744,273 @@ class Interactivebrokers(Foreignexchange):
         stake_amount: float | None = None,
         wallet_balance: float | None = None,
     ) -> None:
-        """
-        Return the liquidation price for a given trade.
-        Since this is spot forex (or treated as such),
-        liquidation price is not applicable.
-        Therefore, we return None.
-        Corrected syntax error by providing default values
-        for all arguments after the first default.
-        """
         return None
+
+    def cancel_order_with_result(self, *args, **kwargs) -> dict | None:
+        order_id = None
+        for arg in args:
+            if isinstance(arg, str) and arg.isdigit():
+                order_id = arg
+                break
+            if isinstance(arg, dict) and "id" in arg:
+                order_id = arg["id"]
+                break
+            if hasattr(arg, "order_id"):
+                order_id = arg.order_id
+                break
+
+        if not order_id:
+            logger.error(f"cancel_order_with_result: Can't extract order_id from {args}")
+            return None
+
+        try:
+            self.cancel_order(order_id)
+        except Exception as e:
+            logger.error(f"cancel_order_with_result: error canceling {order_id}: {e}")
+
+        updated = self.fetch_order(order_id)
+        if updated:
+            updated["status"] = updated.get("status", "canceled")
+            return updated
+
+        return {
+            "id": order_id,
+            "status": "canceled",
+            "filled": 0.0,
+            "remaining": 0.0,
+        }
+
+    def is_market_open(self):
+        now = datetime.now(timezone.utc)
+        if now.weekday() == 4 and now.hour >= 22:
+            return False
+        if now.weekday() >= 5:
+            return False
+        return True
+
+    def _extract_currencies_from_pair(self, pair: str) -> tuple[str, str]:
+        if isinstance(pair, tuple):
+            pair = pair[0]
+
+        parts = pair.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
+
+        symbol = parts[0].strip().upper()
+        currency = parts[1].strip().upper()
+
+        if len(symbol) != 3 or len(currency) != 3:
+            raise ValueError(
+                f"Invalid currency codes: symbol={symbol} (len={len(symbol)}), "
+                f"currency={currency} (len={len(currency)}). Expected 3-letter codes."
+            )
+
+        return symbol, currency
+
+    def get_rate(
+        self,
+        pair: str,
+        side: str | None = None,
+        is_short: bool | None = None,
+        refresh: bool = False,
+        **kwargs,
+    ) -> float:
+        if isinstance(pair, tuple):
+            pair = pair[0]
+
+        market_price = self._get_market_data_price(pair, side)
+        if market_price is not None:
+            logger.info(f"Returning market price for {pair} ({side}): {market_price}")
+            return market_price
+
+        timeframe = self.config.get("timeframe", "5m")
+        historical_price = self._get_historical_price(pair, timeframe)
+        if historical_price is not None:
+            logger.info(f"Returning historical close price for {pair}: {historical_price}")
+            return historical_price
+
+        raise ValueError(f"Could not fetch valid rate for {pair}")
+
+    def get_min_pair_stake_amount(self, pair: str, leverage: float = 1.0, *args, **kwargs) -> float:
+        return float(self.config.get("stake_amount_min", 10.0))
+
+    def get_max_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
+        return float(self.config.get("stake_amount_max", 1000000.0))
+
+    def get_precision_amount(self, pair: str) -> int:
+        return 2
+
+    def get_precision_price(self, pair: str) -> int:
+        return 5
+
+    @property
+    def precisionMode(self):
+        return 2
+
+    @property
+    def precision_mode_price(self):
+        return 2
+
+    def get_contract_size(self, pair: str) -> float:
+        return 100000.0
+
+    def get_order_id(self, order: dict | None) -> str | None:
+        return self.get_order_id_conditional(order)
+
+    def get_order_id_conditional(self, order: dict | None) -> str | None:
+        if not order:
+            return None
+
+        if isinstance(order, dict):
+            return order.get("id") if "id" in order else None
+        return None
+
+    def get_option(self, key: str, default: Any = None) -> Any:
+        return self._ft_has_default.get(key, default)
+
+    def validate_required_startup_candles(self, required_startup: int, timeframe: str) -> None:
+        if not self.markets:
+            logger.error("No markets available for validation of startup candles")
+            raise ValueError("No markets available for validation")
+
+        first_pair = next(iter(self.markets.keys()))
+        try:
+            ohlcv = self.get_historic_ohlcv(first_pair, timeframe=timeframe, limit=1)
+            if ohlcv.empty:
+                logger.error(
+                    f"Cannot fetch even one candle for {first_pair} on timeframe {timeframe}"
+                )
+                raise ValueError(
+                    f"Cannot fetch historical data for {first_pair} on timeframe {timeframe}"
+                )
+            logger.info(
+                f"Successfully validated startup candles for {first_pair} on timeframe {timeframe}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to validate required startup candles: {e}")
+            raise
+
+    def _create_and_qualify_contract(self, pair: str) -> Contract:
+        symbol, currency = self._extract_currencies_from_pair(pair)
+        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
+        if not self.ib.qualifyContracts(contract):
+            raise ValueError(f"Contract qualification failed for {pair}")
+        return contract
+
+    def _adjust_amount_for_min_lot(self, amount: float) -> float:
+        min_lot = self.MIN_LOT_SIZE
+        return max(min_lot, math.floor(amount / min_lot) * min_lot)
+
+    def _create_order_object(
+        self, side: str, amount: float, price: float | None, ordertype: str
+    ) -> Order:
+        if ordertype.lower() == "market":
+            return Order(action=side.upper(), totalQuantity=amount, orderType="MKT")
+        else:
+            if price is None:
+                raise ValueError("Price must be provided for limit orders")
+            return Order(
+                action=side.upper(),
+                totalQuantity=amount,
+                orderType="LMT",
+                lmtPrice=round(price, self.SIGNIFICANT_DIGITS - 1),
+            )
+
+    def _wait_for_order_status(self, trade) -> dict:
+        deadline = time.time() + 30
+        while time.time() < deadline and trade.orderStatus.status in (
+            "ApiPending",
+            "PendingSubmit",
+            "Submitted",
+        ):
+            self.ib.waitOnUpdate(timeout=1)
+
+        status = trade.orderStatus.status
+        filled = float(trade.orderStatus.filled)
+        remaining = float(trade.order.totalQuantity - filled)
+
+        if status == "Inactive":
+            return {
+                "id": None,
+                "status": "rejected",
+                "info": trade.orderStatus,
+            }
+
+        if status not in ("PreSubmitted", "Submitted", "Filled"):
+            return {
+                "id": None,
+                "status": "failed",
+                "info": trade.orderStatus,
+            }
+
+        oid = str(trade.order.orderId)
+        return {
+            "id": oid,
+            "status": self._parse_order_status(status),
+            "filled": filled,
+            "remaining": remaining,
+            "info": trade,
+        }
+
+    def _get_market_data_price(self, pair: str, side: str | None = None) -> float | None:
+        parts = pair.split("/")
+        if len(parts) != 2:
+            raise ValueError(f"Invalid pair format: {pair}. Expected format 'BASE/QUOTE'")
+
+        symbol, currency = parts[0].strip().upper(), parts[1].strip().upper()
+        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
+
+        try:
+            ticker = self.ib.reqMktData(contract)
+            self.ib.sleep(0.5)
+            if ticker and ticker.bid > 0.00001 and ticker.ask > 0.00001:
+                if side is None:
+                    price = (ticker.bid + ticker.ask) / 2
+                elif side.lower() == "buy":
+                    price = ticker.ask
+                elif side.lower() == "sell":
+                    price = ticker.bid
+                else:
+                    price = (ticker.bid + ticker.ask) / 2
+
+                if 0.00001 <= price <= 1000.0:
+                    return price
+                else:
+                    logger.warning(f"Invalid price from market data: {price}")
+        except Exception as e:
+            logger.error(f"Failed to request market data for {pair}: {e}")
+        return None
+
+    def _get_historical_price(self, pair: str, timeframe: str) -> float | None:
+        try:
+            ohlcv = self.get_historic_ohlcv(pair, timeframe=timeframe, limit=1)
+            if not ohlcv.empty:
+                close_price = ohlcv.iloc[0]["close"]
+                if pd.notna(close_price) and close_price > 0.00001:
+                    if 0.00001 <= close_price <= 1000.0:
+                        return close_price
+                    logger.warning(f"Invalid historical close price: {close_price}")
+        except Exception as e:
+            logger.error(f"Failed to fetch historical data for {pair}: {e}")
+        return None
+
+    def _should_use_market_order(self, ordertype: str, side: str, params: dict) -> bool:
+        return ordertype.lower() == "market" or (
+            side.lower() == "sell" and params.get("exit_as_market", False)
+        )
+
+    def _get_valid_price(self, pair: str, side: str) -> float:
+        price = self.get_rate(pair, side=side)
+        if not (0.00001 <= price <= 1000.0):
+            raise ValueError(f"Invalid price: {price}")
+        return price
+
+    def _place_and_wait_for_order(self, contract: Contract, order: Order) -> dict:
+        try:
+            trade = self.ib.placeOrder(contract, order)
+            logger.info(f"Order placed: {order.action} {order.totalQuantity} {contract.symbol}")
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return {"id": None, "status": "failed", "info": str(e)}
+
+        return self._wait_for_order_status(trade)
