@@ -93,6 +93,8 @@ freqtrade trade -c user_data/forex_config.json -s SampleStrategy
 
 ...and check out the stock and forex display in FreqUI.
 
+=======
+
 # ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade_poweredby.svg)
 
 [![Freqtrade CI](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/freqtrade/freqtrade/actions/workflows/ci.yml)
