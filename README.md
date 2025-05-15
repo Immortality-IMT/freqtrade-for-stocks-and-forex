@@ -1,7 +1,9 @@
 This fork aims to stay in sync with Freqtrade except it adds stocks and forex. 
 You can use your freqtrade strategies without alteration on stocks and foreign exchange. 
-Currently stocks work only for backtesting strategies.
-Both stocks and forex connect to the exchanges but do not open any trades.
+Currently stocks work for backtesting strategies and dry run mode. Forex works only in dry run mode. 
+Both stocks and forex connect to the exchanges and open and close trades.
+
+Never tested in live mode.
 
 Installation is also identical to freqtrade, including generating the user_data directory.
 Config examples are provided in config_examples folder to move to the user_data directory.
@@ -53,6 +55,7 @@ In the application go to Settings...
 - Set the port to paper trade 4002 or live 7497
 - Check Enable ActiveX and socket clients
 - Uncheck read only API
+- The base currency is USD, you need to get USD by making a trade in TWS.
 
 ```
     "exchange": {
@@ -84,8 +87,11 @@ freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timeran
 freqtrade trade -c user_data/forex_config.json -s SampleStrategy
 ```
 
-The discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks and forex round to 2 decimal places.
-Both exchanges limit trade history data to paid subscriptions, a general history data server for both stocks and forex is essential to supplement the limitation.
+- Discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks generally round to 2 decimal places.
+- Both exchanges limit trade history data to paid subscriptions, a general history data server for both stocks and forex is essential to supplement the limitation.
+- When you switch from forex to stocks and back, the 3 sqlite files tradesv3.sqlite in the base directory need to be swapped out otherwise it looks for stocks in forex and currencies in stocks.
+
+...and check out the stock and forex display in FreqUI.
 
 # ![freqtrade](https://raw.githubusercontent.com/freqtrade/freqtrade/develop/docs/assets/freqtrade_poweredby.svg)
 
