@@ -6,7 +6,7 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 
 import pandas as pd
@@ -31,6 +31,10 @@ class Interactivebrokers(Foreignexchange):
     MAX_DATA_DELAY = pd.Timedelta(minutes=5)
     MIN_LOT_SIZE = 25_000
     RECONNECT_TIMEOUT = 30
+
+    _cache_lock: Lock
+    _entry_rate_cache: dict[str, float]
+    _exit_rate_cache: dict[str, float]
 
     _ft_has_default = {
         "stoploss_on_exchange": False,
@@ -73,7 +77,7 @@ class Interactivebrokers(Foreignexchange):
         "order_has_status_history": False,
         "ws_enabled": True,
         "ws_auto_reconnect": True,
-        "ws_reconnect_interval": 300,
+        "ws_reconnect_interval": 30,
     }
 
     def __init__(
@@ -99,6 +103,10 @@ class Interactivebrokers(Foreignexchange):
         self._connection_thread: Thread | None = None
         self._ws_connected = False
         self._markets_cache: dict[str, Any] | None = None
+
+        self._cache_lock = Lock()
+        self._entry_rate_cache = {}
+        self._exit_rate_cache = {}
 
         # Set ports based on live/paper trading
         if self.dry_run:
@@ -1101,3 +1109,57 @@ class Interactivebrokers(Foreignexchange):
         """
         base, quote = self._extract_currencies_from_pair(symbol)
         return Forex(symbol=base, currency=quote, exchange="IDEALPRO")
+
+    def get_rates(self, pair: str, refresh: bool, is_short: bool) -> tuple[float, float]:
+        """
+        Returns entry and exit rates for a forex pair, compatible with Freqtrade UI.
+        Caches rates when `refresh=False`.
+        """
+        entry_rate = None
+        exit_rate = None
+
+        # Try cache first
+        if not refresh:
+            with self._cache_lock:
+                entry_rate = self._entry_rate_cache.get(pair)
+                exit_rate = self._exit_rate_cache.get(pair)
+            if entry_rate is not None:
+                logger.debug(f"Using cached entry rate for {pair}.")
+            if exit_rate is not None:
+                logger.debug(f"Using cached exit rate for {pair}.")
+
+        # Always fetch fresh if cache miss or refresh requested
+        if entry_rate is None or exit_rate is None:
+            ticker = self.fetch_ticker(pair)
+            bid = ticker["bid"]
+            ask = ticker["ask"]
+
+            # For a long entry, buy at ask; for a short entry, sell at bid
+            entry_rate = entry_rate if entry_rate is not None else (ask if not is_short else bid)
+            # For a long exit, sell at bid; for a short exit, buy at ask
+            exit_rate = exit_rate if exit_rate is not None else (bid if not is_short else ask)
+
+            # Cache the newly fetched rates
+            with self._cache_lock:
+                self._entry_rate_cache[pair] = entry_rate
+                self._exit_rate_cache[pair] = exit_rate
+
+        return entry_rate, exit_rate
+
+    def get_conversion_rate(self, base: str, quote: str) -> float:
+        """
+        Returns the mid market conversion rate between two currencies.
+        FreqUI calls this to convert between quote currencies (e.g. P&L displays).
+        """
+        pair = f"{base}/{quote}"
+        try:
+            ticker = self.fetch_ticker(pair)
+        except Exception:
+            # If the direct pair doesn't exist, try the inverse and invert the rate.
+            inverse = f"{quote}/{base}"
+            inv_ticker = self.fetch_ticker(inverse)
+            mid = (inv_ticker["bid"] + inv_ticker["ask"]) / 2
+            return 1.0 / mid
+
+        # Mid market rate = (bid + ask) / 2
+        return (ticker["bid"] + ticker["ask"]) / 2
