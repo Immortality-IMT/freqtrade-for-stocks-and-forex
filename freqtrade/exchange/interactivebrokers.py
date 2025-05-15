@@ -11,11 +11,9 @@ from typing import Any
 
 import pandas as pd
 from ib_insync import IB, Contract, Forex, Order, util
-from sqlalchemy.engine import Engine
 
 from freqtrade.enums import MarginMode
 from freqtrade.exchange.foreignexchange import Foreignexchange
-from freqtrade.persistence.trade_model import Trade
 
 
 logger = logging.getLogger(__name__)
@@ -358,24 +356,31 @@ class Interactivebrokers(Foreignexchange):
         )
 
         ticker = self.ib.reqMktData(contract)
-        self.ib.sleep(0.5)
-        if ticker and ticker.bid > 0.00001 and ticker.ask > 0.00001:
-            if side is None:
-                price = (ticker.bid + ticker.ask) / 2
-            elif side.lower() == "buy":
-                price = ticker.ask
-            elif side.lower() == "sell":
-                price = ticker.bid
-            else:
-                price = (ticker.bid + ticker.ask) / 2
 
-            if not (0.00001 <= price <= 1000.0):
-                raise ValueError(f"Price out of valid forex range: {price}")
+        # Wait up to 2 seconds for valid bid/ask
+        start = time.time()
+        while time.time() - start < 2:
+            self.ib.sleep(0.1)
+            if ticker.bid > 0.00001 and ticker.ask > 0.00001:
+                break
 
-            logger.info(f"Returning price for {pair} ({side}): {price}")
-            return price
+        if not (ticker and ticker.bid > 0.00001 and ticker.ask > 0.00001):
+            raise ValueError(f"Invalid market data for {pair}: bid={ticker.bid}, ask={ticker.ask}")
 
-        raise ValueError(f"Invalid market data for {pair}: bid={ticker.bid}, ask={ticker.ask}")
+        if side is None:
+            price = (ticker.bid + ticker.ask) / 2
+        elif side.lower() == "buy":
+            price = ticker.ask
+        elif side.lower() == "sell":
+            price = ticker.bid
+        else:
+            price = (ticker.bid + ticker.ask) / 2
+
+        if not (0.00001 <= price <= 1000.0):
+            raise ValueError(f"Price out of valid forex range: {price}")
+
+        logger.info(f"Returning price for {pair} ({side}): {price}")
+        return price
 
     def _fallback_to_historical_rate(self, pair: str) -> float:
         try:
@@ -1088,33 +1093,21 @@ class Interactivebrokers(Foreignexchange):
 
     def fetch_tickers(self, symbols: list[str] | None = None) -> dict[str, dict]:
         tickers = {}
+        # Default to all open positions if no list given
         symbols = symbols or [p["symbol"] for p in self.fetch_positions()]
-
         for sym in symbols:
-            contract = self._get_contract(sym)
+            contract = self._get_contract(sym)  # your helper to build IB Contract
+            # Request a fresh quote
             data = self.ib.reqMktData(contract, "", False, False)
-
-            # Wait briefly for data (optional)
-            # time.sleep(0.1)
-
-            bid = data.bid
-            ask = data.ask
-            last = (bid + ask) / 2 if bid and ask else data.last
-
-            # Sanity check: IBKR sometimes returns nan — bail early
-            if any(math.isnan(v) for v in [bid, ask, last]):
-                raise ValueError(
-                    f"Invalid market data for {sym}: bid={bid}, ask={ask}, last={last}"
-                )
-
+            # Wait briefly for IB to populate data (you may need a small sleep here)
+            last = (data.bid + data.ask) / 2 if data.bid and data.ask else data.last
             tickers[sym] = {
                 "symbol": sym,
-                "bid": bid,
-                "ask": ask,
+                "bid": data.bid,
+                "ask": data.ask,
                 "last": last,
                 "info": {},
             }
-
         return tickers
 
     def _get_contract(self, symbol: str) -> Forex:
@@ -1177,40 +1170,3 @@ class Interactivebrokers(Foreignexchange):
 
         # Mid market rate = (bid + ask) / 2
         return (ticker["bid"] + ticker["ask"]) / 2
-
-    def disconnect(self) -> None:
-        """
-        Gracefully disconnect from IBKR and dispose of all SQLAlchemy connections
-        via the ORM sessions bound engine to avoid pool exhaustion.
-        """
-        try:
-            logger.info("Disconnecting from IBKR...")
-            # Stop your IBKR WS loop (if any)
-            try:
-                self.ws_stop()
-            except Exception as e:
-                logger.warning(f"Failed to stop websocket: {e}")
-            # Disconnect IB connection
-            if self.ib.isConnected():
-                self.ib.disconnect()
-            logger.info("Disconnected from IBKR.")
-        finally:
-            # Tear down all pooled DB connections via the sessions engine
-            try:
-                bind = Trade.session.get_bind()
-                if isinstance(bind, Engine):
-                    bind.dispose()
-                    logger.info("Disposed of engine via Trade.session.")
-                else:
-                    logger.warning("Session bind is not an Engine, skipping dispose().")
-            except Exception:
-                logger.exception(
-                    "Could not dispose DB engine via Trade.session; pool may still exhaust."
-                )
-
-    def stop(self) -> None:
-        """
-        Hook called by Freqtrade when the bot is stopping.
-        Ensures proper IBKR disconnection and DB cleanup.
-        """
-        self.disconnect()
