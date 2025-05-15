@@ -11,6 +11,7 @@ import pyarrow.feather as feather
 import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
@@ -18,8 +19,6 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
-    StockLatestQuoteRequest,
-    StockLatestTradeRequest,
 )
 from alpaca.trading.stream import TradingStream
 
