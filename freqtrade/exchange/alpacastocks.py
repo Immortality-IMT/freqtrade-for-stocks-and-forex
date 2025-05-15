@@ -10,9 +10,17 @@ import pandas as pd
 import pyarrow.feather as feather
 import requests
 from alpaca.common.exceptions import APIError
+from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, OrderSide, TimeInForce
-from alpaca.trading.requests import GetAssetsRequest, LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import AssetClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import (
+    GetAssetsRequest,
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StockLatestQuoteRequest,
+    StockLatestTradeRequest,
+)
 from alpaca.trading.stream import TradingStream
 
 from freqtrade.exceptions import OperationalException
@@ -101,6 +109,7 @@ class Alpacastocks(Stockexchange):
         else:
             logger.info("Connecting to Alpaca live trading.")
         self.trading_client = TradingClient(self.key, self.secret, paper=self.dry_run)
+        self.data_client = StockHistoricalDataClient(self.key, self.secret)
         self.ws_client = None
         self._ws_thread = None
         self._last_market_state = None
@@ -192,7 +201,7 @@ class Alpacastocks(Stockexchange):
         :param order_id: The ID of the order to cancel.
         :param pair: The trading pair (e.g., "AAPL/USD").
         :param amount: The amount of the order to cancel.
-        :return: A dictionary with order details post-cancellation.
+        :return: A dictionary with order details post cancellation.
         """
         try:
             # Fetch the order to check its status
@@ -990,3 +999,150 @@ class Alpacastocks(Stockexchange):
         if active_only and asset.get("status") != "active":
             return False
         return True
+
+    def fetch_balance(self, params: dict | None = None) -> dict:
+        """
+        Fetch account balances for Freqtrade strategies and FreqUI.
+
+        Returns a dict of currencies with fields 'free', 'used' and 'total'.
+        """
+        try:
+            # Reuse your existing helper
+            balances = self.get_balances()
+            return balances
+        except Exception as e:
+            logger.error(f"Error fetching balance via Alpaca: {e}")
+            return {}
+
+    def fetch_ticker(self, symbol: str, params: dict | None = None) -> dict:
+        try:
+            request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            quote = self.data_client.get_stock_latest_quote(request)
+
+            trade_request = StockLatestTradeRequest(symbol_or_symbols=symbol)
+            trade = self.data_client.get_stock_latest_trade(trade_request)
+
+            timestamp = int(quote.timestamp.timestamp() * 1000)
+
+            return {
+                "symbol": symbol,
+                "timestamp": timestamp,
+                "datetime": self.iso8601(timestamp),
+                "high": None,
+                "low": None,
+                "open": None,
+                "close": float(trade.price),
+                "bid": float(quote.bid_price),
+                "bidVolume": None,
+                "ask": float(quote.ask_price),
+                "askVolume": None,
+                "info": {
+                    "quote": quote.dict(),
+                    "trade": trade.dict(),
+                },
+            }
+        except Exception as e:
+            logger.error(f"Error fetching ticker for {symbol} via Alpaca: {e}")
+            return {
+                "symbol": symbol,
+                "timestamp": None,
+                "datetime": None,
+                "high": None,
+                "low": None,
+                "open": None,
+                "close": None,
+                "bid": None,
+                "bidVolume": None,
+                "ask": None,
+                "askVolume": None,
+                "info": {},
+            }
+
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1h",
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ) -> list[list]:
+        try:
+            bars = self.get_historic_ohlcv(
+                pair=symbol,  # <-- Changed from 'symbol=symbol'
+                timeframe=timeframe,
+                since=since,
+                limit=limit,
+                params=params or {},
+            )
+            ohlcv = [
+                [
+                    int(bar["date"].timestamp() * 1000),
+                    float(bar["open"]),
+                    float(bar["high"]),
+                    float(bar["low"]),
+                    float(bar["close"]),
+                    float(bar["volume"]),
+                ]
+                for bar in bars.to_dict("records")
+            ]
+            return ohlcv
+        except Exception as e:
+            logger.error(f"Error fetching OHLCV for {symbol} via Alpaca: {e}")
+            return []
+
+    def fetch_open_orders(
+        self,
+        symbol: str | None = None,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ) -> list[dict]:
+        try:
+            query: dict = {"status": QueryOrderStatus.OPEN}
+            if limit:
+                query["limit"] = limit
+            if params:
+                query.update(params)
+
+            request = GetOrdersRequest(**query)
+            alpaca_orders = self.trading_client.get_orders(request)
+
+            ft_orders = []
+            for o in alpaca_orders:
+                created_ts = int(o.submitted_at.timestamp() * 1000)
+                qty = float(o.qty or 0)
+                filled = float(o.filled_qty or 0)
+                remaining = qty - filled
+                avg_fill_price = float(o.filled_avg_price or 0)
+
+                ft_orders.append(
+                    {
+                        "id": str(o.id),
+                        "clientOrderId": getattr(o, "client_order_id", None),
+                        "timestamp": created_ts,
+                        "datetime": self.iso8601(created_ts),
+                        "symbol": f"{o.symbol}/USD",
+                        "type": o.order_type.value.lower(),
+                        "side": o.side.value.lower(),
+                        "price": float(o.limit_price) if o.limit_price else None,
+                        "amount": qty,
+                        "filled": filled,
+                        "remaining": remaining,
+                        "status": o.status.value.lower(),
+                        "cost": filled * avg_fill_price,
+                        "info": dict(o),
+                    }
+                )
+
+            if symbol:
+                base = symbol.split("/", 1)[0]
+                ft_orders = [o for o in ft_orders if o["symbol"].startswith(base)]
+
+            return ft_orders
+
+        except Exception as e:
+            logger.error(f"Error fetching open orders via Alpaca: {e}")
+            return []
+
+    def iso8601(self, timestamp: int) -> str:
+        return pd.to_datetime(timestamp, unit="ms").isoformat()
