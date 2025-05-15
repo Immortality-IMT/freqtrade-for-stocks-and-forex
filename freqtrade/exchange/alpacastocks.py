@@ -773,12 +773,33 @@ class Alpacastocks(Stockexchange):
         }
 
     def is_market_open(self) -> bool:
+        """
+        Check if the market is currently open. If closed, logs the time until it opens next.
+
+        Returns:
+            bool: True if market is open, False otherwise
+        """
         try:
             clock = self.trading_client.get_clock()
+            current_time_utc = pd.Timestamp.now(tz="UTC")
             self._last_market_state = clock.is_open
+
             if not clock.is_open:
-                logger.info("Market is closed")
+                # Calculate time until next market open
+                time_until_open = clock.next_open - current_time_utc
+                total_seconds = time_until_open.total_seconds()
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+
+                # Log detailed info about market closure
+                next_open_formatted = clock.next_open.strftime("%Y-%m-%d %H:%M UTC")
+                logger.info(
+                    f"Market is closed. Next open: {next_open_formatted} "
+                    f"({int(hours)}h {int(minutes)}m)"
+                )
+
             return clock.is_open
+
         except Exception as e:
             logger.error(f"Failed to retrieve market clock: {e}")
             return self._last_market_state if self._last_market_state is not None else False
