@@ -1088,21 +1088,33 @@ class Interactivebrokers(Foreignexchange):
 
     def fetch_tickers(self, symbols: list[str] | None = None) -> dict[str, dict]:
         tickers = {}
-        # Default to all open positions if no list given
         symbols = symbols or [p["symbol"] for p in self.fetch_positions()]
+
         for sym in symbols:
-            contract = self._get_contract(sym)  # your helper to build IB Contract
-            # Request a fresh quote
+            contract = self._get_contract(sym)
             data = self.ib.reqMktData(contract, "", False, False)
-            # Wait briefly for IB to populate data (you may need a small sleep here)
-            last = (data.bid + data.ask) / 2 if data.bid and data.ask else data.last
+
+            # Wait briefly for data (optional)
+            # time.sleep(0.1)
+
+            bid = data.bid
+            ask = data.ask
+            last = (bid + ask) / 2 if bid and ask else data.last
+
+            # Sanity check: IBKR sometimes returns nan — bail early
+            if any(math.isnan(v) for v in [bid, ask, last]):
+                raise ValueError(
+                    f"Invalid market data for {sym}: bid={bid}, ask={ask}, last={last}"
+                )
+
             tickers[sym] = {
                 "symbol": sym,
-                "bid": data.bid,
-                "ask": data.ask,
+                "bid": bid,
+                "ask": ask,
                 "last": last,
                 "info": {},
             }
+
         return tickers
 
     def _get_contract(self, symbol: str) -> Forex:
@@ -1195,3 +1207,10 @@ class Interactivebrokers(Foreignexchange):
                 logger.exception(
                     "Could not dispose DB engine via Trade.session; pool may still exhaust."
                 )
+
+    def stop(self) -> None:
+        """
+        Hook called by Freqtrade when the bot is stopping.
+        Ensures proper IBKR disconnection and DB cleanup.
+        """
+        self.disconnect()
