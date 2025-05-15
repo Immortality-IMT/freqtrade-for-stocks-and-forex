@@ -1088,7 +1088,7 @@ class Alpacastocks(Stockexchange):
     ) -> list[list]:
         try:
             bars = self.get_historic_ohlcv(
-                pair=symbol,  # <-- Changed from 'symbol=symbol'
+                pair=symbol,
                 timeframe=timeframe,
                 since=since,
                 limit=limit,
