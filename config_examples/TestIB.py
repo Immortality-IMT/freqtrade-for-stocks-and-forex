@@ -17,10 +17,10 @@ class TestIB(IStrategy):
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # Use numpy for random generation
-        dataframe["enter_long"] = np.where(np.random.rand(len(dataframe)) < 0.3, 1, 0)
+        dataframe["enter_long"] = np.where(np.random.rand(len(dataframe)) < 0.5, 1, 0)
         return dataframe
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # Use numpy for random generation
-        dataframe["exit_long"] = np.where(np.random.rand(len(dataframe)) < 0.3, 1, 0)
+        dataframe["exit_long"] = np.where(np.random.rand(len(dataframe)) < 0.5, 1, 0)
         return dataframe
