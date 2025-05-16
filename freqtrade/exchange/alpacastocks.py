@@ -173,13 +173,19 @@ class Alpacastocks(Stockexchange):
                         f"No limit price supplied; using current market price {price:.2f}"
                     )
 
+                if amount > self._get_available_qty(symbol):
+                    logger.warning(
+                        f"Requested {amount} exceeds available qty. Adjusting to available."
+                    )
+                    amount = self._get_available_qty(symbol)
+
                 limit_price = round(price, 2)
                 if limit_price != price:
                     logger.debug(f"Rounded limit price from {price} to {limit_price}")
 
                 order_req = LimitOrderRequest(
                     symbol=symbol,
-                    qty=int(amount),
+                    qty=round(amount, 6),
                     side=side_enum,
                     limit_price=limit_price,
                     time_in_force=TimeInForce.GTC,
@@ -207,7 +213,7 @@ class Alpacastocks(Stockexchange):
             }
         except APIError as e:
             logger.error(f"Failed to create order: {e}")
-            raise
+            raise OperationalException(f"Order rejected by Alpaca: {e}")
 
     def cancel_order(self, order_id: str):
         try:
@@ -1507,3 +1513,13 @@ class Alpacastocks(Stockexchange):
         # yield trades as they arrive
         while True:
             yield await q.get()
+
+    def _get_available_qty(self, symbol: str) -> float:
+        try:
+            positions = self.trading_client.get_all_positions()
+            for pos in positions:
+                if pos.symbol == symbol:
+                    return float(pos.qty)
+        except Exception as e:
+            logger.error(f"Failed to fetch available qty for {symbol}: {e}")
+        return 0.0
