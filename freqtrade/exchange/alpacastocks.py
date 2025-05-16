@@ -567,15 +567,20 @@ class Alpacastocks(Stockexchange):
 
     def get_historical_bars(
         self,
-        symbols,
-        timeframe,
-        start,
-        end,
-        limit=1000,
-        adjustment="raw",
-        feed="iex",
-        currency="USD",
-    ):
+        symbols: list[str],
+        timeframe: str,
+        start: str,
+        end: str,
+        limit: int = 1000,
+        adjustment: str = "raw",
+        feed: str = "iex",
+        currency: str = "USD",
+    ) -> dict:
+        """
+        Fetch *all* bars from Alpaca Data API between start/end by
+        paging through `next_page_token`. Returns a dict with a top-level
+        'bars' key mapping each symbol to its list of bars.
+        """
         url = "https://data.alpaca.markets/v2/stocks/bars"
         params = {
             "symbols": ",".join(symbols),
@@ -584,26 +589,45 @@ class Alpacastocks(Stockexchange):
             "adjustment": adjustment,
             "feed": feed,
             "currency": currency,
+            "start": start,
+            "end": end,
         }
-        if start:
-            params["start"] = start
-        if end:
-            params["end"] = end
-        headers = {"APCA-API-KEY-ID": self.key, "APCA-API-SECRET-KEY": self.secret}
-        logger.debug(f"API Request: GET {url}")
-        logger.debug(f"API Parameters: {params}")
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            logger.debug(f"API Response: {data}")
-            return data
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP error fetching historical bars: {http_err}")
-            return {}
-        except Exception as e:
-            logger.error(f"Failed to fetch historical bars: {e}")
-            return {}
+        headers = {
+            "APCA-API-KEY-ID": self.key,
+            "APCA-API-SECRET-KEY": self.secret,
+        }
+
+        all_bars: dict[str, list] = {s: [] for s in symbols}
+        page_token: str | None = None
+
+        while True:
+            if page_token:
+                params["page_token"] = page_token
+
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as e:
+                logger.error(f"HTTP error fetching historical bars: {e}")
+                break
+
+            data = resp.json()
+            # Accumulate bars for each symbol
+            for sym, bars in data.get("bars", {}).items():
+                all_bars.setdefault(sym, []).extend(bars)
+
+            # Next page?
+            page_token = data.get("next_page_token")
+            if not page_token:
+                break
+
+        logger.info(
+            f"Fetched {sum(len(v) for v in all_bars.values())} bars "
+            f"for {symbols} from {start} to {end}"
+        )
+
+        # **Wrap** under the 'bars' key so Freqtrade can find it:
+        return {"bars": all_bars}
 
     def get_historic_ohlcv(
         self,
