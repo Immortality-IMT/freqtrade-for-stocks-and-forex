@@ -5,19 +5,21 @@ Both stocks and forex connect to the exchanges and open and close trades.
 
 Never tested in live mode.
 
-Installation is also identical to freqtrade, including generating the user_data directory.
-Config examples are provided in config_examples folder to move to the user_data directory.
+Installation is identical to freqtrade, including generating the user_data directory.
+Examples are provided in config_examples folder to move to the user_data directory.
 
 Notes:
 
 For Alpacastocks
 
-- You have to get paper trading API keys, regardless.
-- In config: Use USD instead of USDT, so it is TSLA/USD and stake_currency: USD
-- The custom exchange is named alpacastocks and interactivebrokers
-- config_examples has both stocks_config.json and forex_config.json
+- Get paper trading API keys, regardless.
+- Open config_examples folder and copy paste stocks_config.json and TestAlpaca.py to user dir and strategy folder
+- Run with test commands
+- Note: in config: Use USD instead of USDT, so it is TSLA/USD and stake_currency: USD
+- The custom exchange for stocks is named alpacastocks
 
 ```
+    "db_url": "sqlite:///tradesv3.stocks.dryrun.sqlite",
     "stake_currency": "USD",
     "fiat_display_currency": "USD",
     "exchange": {
@@ -40,10 +42,10 @@ Test with commands...
 ```
 freqtrade download-data --config user_data/stocks_config.json --timeframes 5m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
-freqtrade trade -c user_data/stocks_config.json -s SampleStrategy
+freqtrade trade -c user_data/stocks_config.json -s TestAlpaca
 ```
 
-For Interactivebrokers
+For Interactivebrokers, Forex
 
 - Download TWS - https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
 - cd ~/Downloads
@@ -57,7 +59,11 @@ In the application go to Settings...
 - Uncheck read only API
 - The base currency is USD, you need to get USD by making a trade in TWS.
 
-```
+- Open config_examples folder and copy paste forex_config.json and TestIB.py to user dir and strategy folder
+- Run with test commands
+
+```    
+    "db_url": "sqlite:///tradesv3.forex.dryrun.sqlite",
     "exchange": {
         "name": "interactivebrokers",
         "key": "",
@@ -84,12 +90,11 @@ Test with commands...
 ```
 freqtrade download-data --config user_data/forex_config.json --timeframes 5m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timerange=20240101-20240201
-freqtrade trade -c user_data/forex_config.json -s SampleStrategy
+freqtrade trade -c user_data/forex_config.json -s TestIB
 ```
 
 - Discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks generally round to 2 decimal places.
-- Both exchanges limit trade history data to paid subscriptions, a general history data server for both stocks and forex is essential to supplement the limitation.
-- When you switch from forex to stocks and back, the 3 sqlite files tradesv3.sqlite in the base directory need to be swapped out otherwise it looks for stocks in forex and currencies in stocks.
+- Exchanges limit trade history data to paid subscriptions, a general history data server for both stocks and forex is essential to supplement the limitation.
 
 ...and check out the stock and forex display in FreqUI.
 
