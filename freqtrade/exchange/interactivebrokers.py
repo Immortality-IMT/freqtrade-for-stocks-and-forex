@@ -341,12 +341,29 @@ class Interactivebrokers(Foreignexchange):
         side: str | None = None,
         **kwargs,
     ) -> float:
+        """
+        Try to fetch a live price; on failure due to stale/nan data or disconnect,
+        trigger a reconnect and retry once before falling back to historical.
+        """
         pair = pair[0] if isinstance(pair, tuple) else pair
+        # First attempt
         try:
             return self._fetch_live_price(pair, side)
         except Exception as e:
-            logger.error(f"Failed to request market data for {pair}: {e}")
-
+            logger.error(f"Failed to request market data for {pair} (live): {e}")
+            # Trigger IBKR reconnect on data farm or stale data errors
+            try:
+                logger.info("Attempting to reconnect to IBKR and retry price fetch")
+                self._reconnect_event.set()
+                self._connect_to_ib()
+                # brief pause to re-establish streams
+                time.sleep(1)
+                price = self._fetch_live_price(pair, side)
+                logger.info(f"Price fetch after reconnect succeeded for {pair}: {price}")
+                return price
+            except Exception as e2:
+                logger.error(f"Retry after reconnect failed for {pair}: {e2}")
+        # Final fallback
         return self._fallback_to_historical_rate(pair)
 
     def _fetch_live_price(self, pair: str, side: str | None) -> float:
