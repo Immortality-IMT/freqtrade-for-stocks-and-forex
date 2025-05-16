@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
 )
 from alpaca.trading.stream import TradingStream
+from dateutil.parser import isoparse
 
 from freqtrade.exceptions import OperationalException
 from freqtrade.exchange.stockexchange import Stockexchange
@@ -80,6 +83,8 @@ class Alpacastocks(Stockexchange):
         "order_has_remaining": True,
         "order_has_status_history": False,
         "ws_enabled": True,
+        "ws_auto_reconnect": True,
+        "ws_reconnect_interval": 30,
     }
 
     def __init__(
@@ -98,6 +103,11 @@ class Alpacastocks(Stockexchange):
         )
         exchange_conf = exchange_config if exchange_config else config.get("exchange", {})
         self.id = "alpacastocks"
+
+        self._entry_rate_cache: dict[str, float] = {}
+        self._exit_rate_cache: dict[str, float] = {}
+        self._cache_lock = threading.Lock()
+
         self.key = exchange_conf.get("key")
         self.secret = exchange_conf.get("secret")
         if not self.key or not self.secret:
@@ -162,11 +172,16 @@ class Alpacastocks(Stockexchange):
                     logger.warning(
                         f"No limit price supplied; using current market price {price:.2f}"
                     )
+
+                limit_price = round(price, 2)
+                if limit_price != price:
+                    logger.debug(f"Rounded limit price from {price} to {limit_price}")
+
                 order_req = LimitOrderRequest(
                     symbol=symbol,
                     qty=int(amount),
                     side=side_enum,
-                    limit_price=price,
+                    limit_price=limit_price,
                     time_in_force=TimeInForce.GTC,
                 )
             else:
@@ -1067,49 +1082,90 @@ class Alpacastocks(Stockexchange):
             logger.error(f"Error fetching balance via Alpaca: {e}")
             return {}
 
-    def fetch_ticker(self, symbol: str, params: dict | None = None) -> dict:
+    def fetch_ticker(self, pair: str, params: dict | None = None) -> dict:
+        """
+        Pulls latest quote + trade from Alpaca for `pair` (e.g. "MSFT/USD").
+        First tries to use any datetime attributes on the Pydantic models,
+        then ISO strings, then finally now() if all else fails.
+        """
+        symbol = pair.split("/", 1)[0]
+
+        def normalize(obj):
+            # If it's a Pydantic model with attrs, keep both forms
+            data = obj.dict() if hasattr(obj, "dict") else obj
+            return obj, data.get("data", data) if isinstance(data, dict) else data
+
         try:
-            request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-            quote = self.data_client.get_stock_latest_quote(request)
+            # 1) Fetch quote and trade
+            quote_obj, qdata = normalize(
+                self.data_client.get_stock_latest_quote(
+                    StockLatestQuoteRequest(symbol_or_symbols=symbol)
+                )
+            )
+            trade_obj, tdata = normalize(
+                self.data_client.get_stock_latest_trade(
+                    StockLatestTradeRequest(symbol_or_symbols=symbol)
+                )
+            )
 
-            trade_request = StockLatestTradeRequest(symbol_or_symbols=symbol)
-            trade = self.data_client.get_stock_latest_trade(trade_request)
+            # If wrapped in list, grab first
+            if isinstance(qdata, list):
+                qdata = qdata[0]
+            if isinstance(tdata, list):
+                tdata = tdata[0]
 
-            timestamp = int(quote.timestamp.timestamp() * 1000)
+            # 2) Timestamp resolution
+            ts_dt = None
+            # a) Model attribute (datetime)
+            for attr in ("timestamp", "timestamp_utc"):
+                val = getattr(quote_obj, attr, None) or getattr(trade_obj, attr, None)
+                if isinstance(val, datetime):
+                    ts_dt = val
+                    break
 
+            # b) ISO string in dict
+            if ts_dt is None:
+                ts_str = (
+                    qdata.get("timestamp")
+                    or qdata.get("timestamp_utc")
+                    or tdata.get("timestamp")
+                    or tdata.get("timestamp_utc")
+                )
+                if ts_str:
+                    ts_dt = isoparse(ts_str)
+
+            # c) Fallback to UTC now
+            if ts_dt is None:
+                ts_dt = datetime.now(timezone.utc)
+                logger.warning(
+                    f"No timestamp in quote/trade for {symbol}; using now()={ts_dt.isoformat()}"
+                )
+
+            ts_ms = int(ts_dt.timestamp() * 1000)
+
+            # 3) Assemble CCXT-style ticker
             return {
-                "symbol": symbol,
-                "timestamp": timestamp,
-                "datetime": self.iso8601(timestamp),
+                "symbol": pair,
+                "timestamp": ts_ms,
+                "datetime": ts_dt.isoformat(),
                 "high": None,
                 "low": None,
                 "open": None,
-                "close": float(trade.price),
-                "bid": float(quote.bid_price),
+                "close": float(tdata.get("price", 0.0)),
+                "bid": float(qdata.get("bid_price", 0.0)),
                 "bidVolume": None,
-                "ask": float(quote.ask_price),
+                "ask": float(qdata.get("ask_price", 0.0)),
                 "askVolume": None,
                 "info": {
-                    "quote": quote.dict(),
-                    "trade": trade.dict(),
+                    "quote": qdata,
+                    "trade": tdata,
                 },
             }
-        except Exception as e:
-            logger.error(f"Error fetching ticker for {symbol} via Alpaca: {e}")
-            return {
-                "symbol": symbol,
-                "timestamp": None,
-                "datetime": None,
-                "high": None,
-                "low": None,
-                "open": None,
-                "close": None,
-                "bid": None,
-                "bidVolume": None,
-                "ask": None,
-                "askVolume": None,
-                "info": {},
-            }
+
+        except Exception:
+            logger.exception(f"Error fetching ticker for {symbol} via Alpaca")
+            # bubble up real API/connectivity errors
+            raise
 
     def fetch_ohlcv(
         self,
@@ -1199,3 +1255,255 @@ class Alpacastocks(Stockexchange):
 
     def iso8601(self, timestamp: int) -> str:
         return pd.to_datetime(timestamp, unit="ms").isoformat()
+
+    def fetch_trades(
+        self,
+        pair: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ) -> list[dict]:
+        """
+        Pulls historical trades from Alpaca and returns them in CCXT/Freqtrade format,
+        so FreqUI can render live and backtested order-flow.
+        """
+        symbol = pair.split("/", 1)[0]
+        data_client: StockHistoricalDataClient = (
+            self.data_client
+        )  # your instantiated Alpaca data client
+
+        # Convert since (ms) to ISO8601, if provided
+        start: str | None = None
+        if since:
+            start = datetime.fromtimestamp(since / 1000, tz=timezone.utc).isoformat()
+
+        # Default limit if not set
+        max_trades = limit or 1000
+
+        # Fetch trades (Alpaca returns a .data list of Trade objects)
+        api_resp = data_client.get_stock_trades(
+            symbol_or_symbols=symbol, start=start, limit=max_trades, **(params or {})
+        )
+
+        ccxt_trades = []
+        for t in api_resp.data:
+            # Alpaca Trade.timestamp is ISO str; parse to ms
+            ts = int(isoparse(t.timestamp).timestamp() * 1000)
+            ccxt_trades.append(
+                {
+                    "id": t.trade_id,
+                    "timestamp": ts,
+                    "datetime": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "symbol": symbol,
+                    "side": t.taker_side.value.lower(),  # "buy" or "sell"
+                    "price": float(t.price),
+                    "amount": float(t.size),
+                }
+            )
+
+        return ccxt_trades
+
+    async def watch_ohlcv(
+        self,
+        pair: str,
+        timeframe: str = "1m",
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ):
+        """
+        Streams live OHLCV bars from Alpaca into Freqtrade/FreqUI.
+        Yields lists: [ timestamp(ms), open, high, low, close, volume ].
+        """
+        # 1) Symbol part
+        symbol = pair.split("/", 1)[0]
+
+        # 2) Convert Freqtrade TF (e.g. "1m", "5m") to Alpaca bar_timeframe (e.g. "1Min", "5Min")
+        minutes = int(timeframe.rstrip("m"))
+        alpaca_tf = f"{minutes}Min"
+
+        # 3) Create the stream client
+        stream = TradingStream(self.key, self.secret, paper=self.dry_run)
+
+        # 4) Use an asyncio.Queue to hand bars over to the generator
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _on_bar(bar):
+            ts = int(bar.start * 1000)
+            await queue.put(
+                [
+                    ts,
+                    float(bar.open),
+                    float(bar.high),
+                    float(bar.low),
+                    float(bar.close),
+                    float(bar.volume),
+                ]
+            )
+
+        # 5) Subscribe to bar updates
+        stream.subscribe_bars(_on_bar, symbol, bar_timeframe=alpaca_tf)
+
+        # 6) Kick off the streaming loop in the background
+        self._stream_task = asyncio.create_task(stream._run_forever())
+
+        # 7) Yield bars as they arrive
+        while True:
+            ohlcv = await queue.get()
+            yield ohlcv
+
+    async def watch_ticker(self, pairs: list[str], params: dict | None = None):
+        """
+        Streams live bid/ask updates from Alpaca into Freqtrade/FreqUI.
+        Yields dicts: {
+            'symbol': 'MSFT',
+            'timestamp': 1234567890123,      # ms
+            'bid': 250.12,
+            'ask': 250.15
+        }
+        """
+        # 1) Instantiate the stream client
+        stream = TradingStream(self.key, self.secret, paper=self.dry_run)
+
+        # 2) Prepare an asyncio queue for quotes
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+
+        # 3) Quote callback
+        async def _on_quote(quote):
+            # Alpaca's quote.timestamp is ISO8601
+            ts_ms = int(isoparse(quote.timestamp).timestamp() * 1000)
+            await queue.put(
+                {
+                    "symbol": quote.symbol,
+                    "timestamp": ts_ms,
+                    "bid": float(quote.bid_price),
+                    "ask": float(quote.ask_price),
+                }
+            )
+
+        # 4) Subscribe to quotes for each pair
+        for pair in pairs:
+            symbol = pair.split("/", 1)[0]
+            stream.subscribe_quotes(_on_quote, symbol)
+
+        # 5) Launch the websocket loop
+        self._stream_task = asyncio.create_task(stream._run_forever())
+
+        # 6) Yield quotes continuously
+        while True:
+            quote_update = await queue.get()
+            yield quote_update
+
+    def get_rates(self, pair: str, refresh: bool, is_short: bool) -> tuple[float, float]:
+        """
+        Returns entry and exit rates for any symbol, compatible with Freqtrade UI.
+        Caches rates when `refresh=False`.
+        """
+        entry_rate = None
+        exit_rate = None
+
+        # 1) Try cache first
+        if not refresh:
+            with self._cache_lock:
+                entry_rate = self._entry_rate_cache.get(pair)
+                exit_rate = self._exit_rate_cache.get(pair)
+            if entry_rate is not None:
+                logger.debug(f"Using cached entry rate for {pair}.")
+            if exit_rate is not None:
+                logger.debug(f"Using cached exit rate for {pair}.")
+
+        # 2) On cache miss or when refresh requested, fetch fresh bid/ask
+        if entry_rate is None or exit_rate is None:
+            ticker = self.fetch_ticker(pair)
+            bid = ticker["bid"]
+            ask = ticker["ask"]
+
+            # Long entry buys at ask, short entry sells at bid
+            entry_rate = entry_rate if entry_rate is not None else (ask if not is_short else bid)
+            # Long exit sells at bid, short exit buys at ask
+            exit_rate = exit_rate if exit_rate is not None else (bid if not is_short else ask)
+
+            # 3) Cache them
+            with self._cache_lock:
+                self._entry_rate_cache[pair] = entry_rate
+                self._exit_rate_cache[pair] = exit_rate
+
+        return entry_rate, exit_rate
+
+    def get_conversion_rate(self, base: str, quote: str) -> float:
+        """
+        Returns the mid market conversion rate between two symbols,
+        with full exception safety so FreqUI never sees a missing rate.
+        """
+        # 0) trivial case
+        if base == quote:
+            return 1.0
+
+        # 1) try direct pair
+        pair = f"{base}/{quote}"
+        try:
+            ticker = self.fetch_ticker(pair)
+            return (ticker["bid"] + ticker["ask"]) / 2
+        except Exception:
+            logger.debug(f"Direct conversion fetch failed for {pair}, trying inverse.")
+
+        # 2) try inverse pair
+        inv_pair = f"{quote}/{base}"
+        try:
+            inv = self.fetch_ticker(inv_pair)
+            mid = (inv["bid"] + inv["ask"]) / 2
+            return 1.0 / mid
+        except Exception:
+            logger.warning(
+                f"Inverse conversion fetch also failed for {inv_pair}. Falling back to 1.0"
+            )
+
+        # 3) ultimate fallback
+        return 1.0
+
+    async def watch_trades(
+        self,
+        pair: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ):
+        """
+        Streams live trade ticks from Alpaca into Freqtrade/FreqUI.
+        Yields dicts: {
+            'id':       '123456789',
+            'timestamp': 1234567890123,  # ms
+            'datetime': '2025-05-16T12:34:56.789Z',
+            'symbol':   'MSFT',
+            'side':     'buy' or 'sell',
+            'price':    250.12,
+            'amount':   100
+        }
+        """
+        symbol = pair.split("/", 1)[0]
+        stream = TradingStream(self.key, self.secret, paper=self.dry_run)
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def _on_trade(trade):
+            ts = int(isoparse(trade.timestamp).timestamp() * 1000)
+            await q.put(
+                {
+                    "id": trade.trade_id,
+                    "timestamp": ts,
+                    "datetime": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "symbol": symbol,
+                    "side": trade.taker_side.value.lower(),
+                    "price": float(trade.price),
+                    "amount": float(trade.size),
+                }
+            )
+
+        # subscribe to live trades for this symbol
+        stream.subscribe_trades(_on_trade, symbol)
+
+        # kick off the websocket
+        self._stream_task = asyncio.create_task(stream._run_forever())
+
+        # yield trades as they arrive
+        while True:
+            yield await q.get()
