@@ -140,23 +140,32 @@ class Alpacastocks(Stockexchange):
         params = params or {}
         try:
             # Map Freqtrade side to Alpaca OrderSide enum
-            side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+            side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
+
+            # MARKET
             if ordertype == "market":
-                amount = round(amount, 2)
-                if amount < 1.0:
-                    amount = 1.0
-                    logger.warning(f"Adjusting notional to minimum: ${amount:.2f}")
+                notional = round(amount, 2)
+                if notional < 1.0:
+                    notional = 1.0
+                    logger.warning(f"Adjusting notional to minimum: ${notional:.2f}")
                 order_req = MarketOrderRequest(
                     symbol=symbol,
-                    notional=amount,
-                    side=side,
+                    notional=notional,
+                    side=side_enum,
                     time_in_force=TimeInForce.DAY,
                 )
+            # LIMIT
             elif ordertype == "limit":
+                if price is None:
+                    # fetch the latest close price via your get_rate()
+                    price = self.get_rate(f"{symbol}/USD")
+                    logger.warning(
+                        f"No limit price supplied; using current market price {price:.2f}"
+                    )
                 order_req = LimitOrderRequest(
                     symbol=symbol,
                     qty=int(amount),
-                    side=side,
+                    side=side_enum,
                     limit_price=price,
                     time_in_force=TimeInForce.GTC,
                 )
