@@ -35,9 +35,7 @@
         "name": "Immortality",
         "key": "<YOUR_PUBLIC_KEY>",
         "secret": "<YOUR_PRIVATE_KEY>",
-        "nodereal_api_key": "c9bbfff8eb53496480d5e15186a11371",
-        "ccxt_config": {"enableRateLimit": true},
-        "ccxt_async_config": {"enableRateLimit": true, "rateLimit": 200},
+        "api_key": "<YOUR API KEY>",  // bsc-chain or eth-chain
         "pair_whitelist": ["IMT/BNB"],
         "pair_blacklist": ["ETH/USDT", "BNB/BTC"],
     },
