@@ -95,6 +95,7 @@ freqtrade trade -c user_data/forex_config.json -s TestIB
 
 - Discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks generally round to 2 decimal places.
 - Exchanges limit trade history data to paid subscriptions, a general history data server for both stocks and forex is essential to supplement the limitation.
+- Initialize user folder - freqtrade create-userdir --userdir user_data
 
 ...and check out the stock and forex display in FreqUI.
 

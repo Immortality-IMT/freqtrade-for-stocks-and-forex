@@ -1,0 +1,73 @@
+//pip install freqtrade web3.py requests numpy ta-lib
+//freqtrade trade --strategy ImmortalityStrategy --config user_data/config.json
+//https://open-platform.nodereal.io/c9bbfff8eb53496480d5e15186a11371/pancakeswap-free/graphql
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "max_open_trades": 10,
+    "stake_currency": "BNB",
+    "stake_amount": 0.005,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "db_url": "sqlite:///tradesv3.immortality.dryrun.sqlite",
+    "dry_run_wallet": 100000,
+    "cancel_open_orders_on_exit": false,
+    "trading_mode": "spot",
+    "margin_mode": "",
+    "entry_pricing": {
+    "price_side": "ask",
+    "use_order_book": false,
+    "order_book_top": 1,
+        "check_depth_of_market": {
+          "bids": 1,
+          "asks": 1
+        }
+    },
+    "exit_pricing": {
+    "price_side": "bid",
+    "use_order_book": false,
+    "order_book_top": 1,
+        "check_depth_of_market": {
+          "bids": 1,
+          "asks": 1
+        }
+    },
+    "exchange": {
+        "name": "Immortality",
+        "key": "<YOUR_PUBLIC_KEY>",
+        "secret": "<YOUR_PRIVATE_KEY>",
+        "nodereal_api_key": "c9bbfff8eb53496480d5e15186a11371",
+        "ccxt_config": {"enableRateLimit": true},
+        "ccxt_async_config": {"enableRateLimit": true, "rateLimit": 200},
+        "pair_whitelist": ["IMT/BNB"],
+        "pair_blacklist": ["ETH/USDT", "BNB/BTC"],
+    },
+    "pairlists": [
+            {
+            "method": "StaticPairList",
+            "pairs": ["IMT/BNB"]
+            }
+    ],
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": ""
+    },
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "jwt_secret_key": "xxx",
+        "ws_token": "xxx",
+        "CORS_origins": [],
+        "username": "freqtrader",
+        "password": "xxx"
+    },
+    "bot_name": "freqtrade",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}

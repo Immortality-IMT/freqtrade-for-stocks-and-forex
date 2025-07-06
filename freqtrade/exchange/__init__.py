@@ -53,3 +53,4 @@ from freqtrade.exchange.modetrade import Modetrade
 from freqtrade.exchange.okx import Myokx, Okx, Okxus
 from freqtrade.exchange.oanda import Oanda
 from freqtrade.exchange.stockexchange import Stockexchange
+from freqtrade.exchange.immortality import Immortality
