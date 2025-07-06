@@ -614,11 +614,28 @@ class FreqtradeBot(LoggingMixin):
         if not whitelist:
             self.log_once("Active pair whitelist is empty.", logger.info)
             return trades_created
-        # Remove pairs for currently opened trades from the whitelist
-        for trade in Trade.get_open_trades():
-            if trade.pair in whitelist:
-                whitelist.remove(trade.pair)
-                logger.debug("Ignoring %s in pair whitelist", trade.pair)
+
+        if self.config.get("allow_multiple_positions", False):
+            now_utc = datetime.now(timezone.utc)
+            # Remove pairs for currently opened trades from the whitelist
+            for trade in Trade.get_open_trades():
+                time_since_trade = now_utc - trade.open_date_utc
+                if trade.pair in whitelist and time_since_trade < timedelta(minutes=15):
+                    whitelist.remove(trade.pair)
+                    logger.debug("Removed %s from pair whitelist", trade.pair)
+                for order in trade.orders:
+                    if order.ft_is_open and order.ft_pair in whitelist:
+                        whitelist.remove(order.ft_pair)
+                        logger.info("Removed %s from pair whitelist, order open", order.ft_pair)
+
+            whitelist_temp = whitelist
+            whitelist = list(set(whitelist_temp))
+        else:
+            # Remove pairs for currently opened trades from the whitelist
+            for trade in Trade.get_open_trades():
+                if trade.pair in whitelist:
+                    whitelist.remove(trade.pair)
+                    logger.debug("Ignoring %s in pair whitelist", trade.pair)
 
         if not whitelist:
             self.log_once(

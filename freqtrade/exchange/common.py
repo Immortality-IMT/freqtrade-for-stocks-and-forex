@@ -66,7 +66,6 @@ SUPPORTED_EXCHANGES = [
     "okx",
     "myokx",
     "alpacastocks",
-    "oanda",
     "interactivebrokers",
 ]
 
