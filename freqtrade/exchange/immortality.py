@@ -134,8 +134,7 @@ def init_websocket(self):
     for attempt in range(max_retries):
         try:
             self.logger.info(
-                "Attempting WebSocket connection ",
-                f"(attempt {attempt + 1}/{max_retries}) to {ws_url}",
+                f"Attempting WebSocket connection (attempt {attempt + 1}/{max_retries}) to {ws_url}"
             )
             self.ws = websocket.WebSocket()
             self.ws.connect(ws_url)
@@ -466,8 +465,8 @@ class Immortality(Stockexchange):
         while attempt < max_retries:
             try:
                 self.logger.info(
-                    "Attempting WebSocket connection ",
-                    f"(attempt {attempt + 1}/{max_retries}) to {ws_url}",
+                    f"Attempting WebSocket connection (attempt {attempt + 1}/{max_retries}) "
+                    f"to {ws_url}"
                 )
                 self._exchange_ws = websocket.WebSocketApp(
                     ws_url,
@@ -977,6 +976,9 @@ class Immortality(Stockexchange):
 
     def _init_ccxt(self, exchange_conf, ccxt_wrapper, ccxt_config):
         return None
+
+    def get_proxy_coin(self) -> str:
+        return self.config["stake_currency"]
 
     def get_proxy_currency(self) -> str:
         return self.config["stake_currency"]
