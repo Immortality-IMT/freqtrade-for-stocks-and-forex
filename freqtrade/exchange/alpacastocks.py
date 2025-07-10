@@ -167,7 +167,6 @@ class Alpacastocks(Stockexchange):
             # LIMIT
             elif ordertype == "limit":
                 if price is None:
-                    # fetch the latest close price via your get_rate()
                     price = self.get_rate(f"{symbol}/USD")
                     logger.warning(
                         f"No limit price supplied; using current market price {price:.2f}"
@@ -183,12 +182,21 @@ class Alpacastocks(Stockexchange):
                 if limit_price != price:
                     logger.debug(f"Rounded limit price from {price} to {limit_price}")
 
+                qty = round(amount, 6)
+                # Check if qty is fractional with a small epsilon for floating-point precision
+                if abs(qty - int(qty)) > 1e-6:
+                    time_in_force = TimeInForce.DAY
+                    logger.info(f"Using time_in_force=DAY for fractional order of {qty} shares.")
+                else:
+                    time_in_force = TimeInForce.GTC
+                    logger.info(f"Using time_in_force=GTC for whole share order of {qty} shares.")
+
                 order_req = LimitOrderRequest(
                     symbol=symbol,
-                    qty=round(amount, 6),
+                    qty=qty,
                     side=side_enum,
                     limit_price=limit_price,
-                    time_in_force=TimeInForce.GTC,
+                    time_in_force=time_in_force,
                 )
             else:
                 raise OperationalException(f"Unsupported order type: {ordertype}")

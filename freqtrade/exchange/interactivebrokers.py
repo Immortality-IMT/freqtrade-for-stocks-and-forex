@@ -422,12 +422,17 @@ class Interactivebrokers(Foreignexchange):
         self,
         order_id: str,
         pair: str | None = None,
-    ) -> dict | None:
+    ) -> dict:
+        # Handle None or invalid order_id
+        if order_id is None:
+            logger.error("Cannot fetch order with order_id=None")
+            return {"status": "not_found"}
+
         try:
             oid = int(order_id)
-        except ValueError:
+        except (ValueError, TypeError):
             logger.error(f"Invalid order ID format: {order_id}")
-            return None
+            return {"status": "not_found"}
 
         try:
             for trade in self.ib.trades():
@@ -442,7 +447,6 @@ class Interactivebrokers(Foreignexchange):
                         symbol = pair if pair else "UNKNOWN/UNKNOWN"
 
                     price: float | None = None
-
                     if trade.order.orderType == "LMT":
                         price = float(trade.order.lmtPrice)
                     elif hasattr(trade, "fills") and trade.fills:
@@ -451,8 +455,7 @@ class Interactivebrokers(Foreignexchange):
                         )
                         total_shares = sum(fill.execution.shares for fill in trade.fills)
                         price = total_cost / total_shares if total_shares > 0 else None
-                    else:
-                        price = None
+
                     return {
                         "id": order_id,
                         "symbol": symbol,
@@ -467,11 +470,11 @@ class Interactivebrokers(Foreignexchange):
                     }
 
             logger.debug(f"fetch_order: no trade with orderId={order_id}")
-            return None
+            return {"status": "not_found"}
 
         except Exception as e:
             logger.error(f"Error in fetch_order for {order_id}: {e}")
-            return None
+            return {"status": "not_found"}
 
     def _parse_order_status(self, ib_status: str) -> str:
         status_mapping = {
