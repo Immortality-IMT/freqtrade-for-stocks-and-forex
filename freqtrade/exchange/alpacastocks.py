@@ -770,10 +770,29 @@ class Alpacastocks(Stockexchange):
             return pd.DataFrame()
 
     def refresh_latest_ohlcv(self, pairs=None, timeframe="1h", **kwargs):
+        """
+        Refresh the latest OHLCV data for the given pairs.
+        If the market is closed, sleep until 5 minutes before it opens.
+        """
+        is_open, time_until_open = self.is_market_open()
+        if not is_open:
+            if time_until_open > 300:  # More than 5 minutes until open
+                sleep_time = time_until_open - 300
+                logger.info(
+                    f"Market is closed, sleeping for {sleep_time:.1f} seconds ",
+                    "until 5 minutes before market opens.",
+                    "Reminder that JPX (Japan) opens at 8:00 PM ",
+                    "and the SSE (China) and HKEX open at 9:30 PM",
+                )
+                time.sleep(sleep_time)
+            else:
+                logger.info(
+                    "Market is closed, but opening in less than 5 minutes. ",
+                    "Proceeding to fetch data.",
+                )
+
+        # Now fetch the data
         latest_ohlcv = {}
-        market_open = self.is_market_open()
-        if not market_open:
-            return {}
         for raw_pair in pairs or []:
             if isinstance(raw_pair, tuple) and len(raw_pair) == 3:
                 pair_symbol = raw_pair[0]
@@ -826,37 +845,34 @@ class Alpacastocks(Stockexchange):
             "info": dict(position),
         }
 
-    def is_market_open(self) -> bool:
+    def is_market_open(self) -> tuple[bool, float]:
         """
-        Check if the market is currently open. If closed, logs the time until it opens next.
+        Check if the market is currently open and return the time until it opens if closed.
 
         Returns:
-            bool: True if market is open, False otherwise
+            tuple: (is_open, time_until_open)
+                - is_open: True if market is open, False otherwise
+                - time_until_open: seconds until the market opens (0 if open)
         """
         try:
             clock = self.trading_client.get_clock()
             current_time_utc = pd.Timestamp.now(tz="UTC")
             self._last_market_state = clock.is_open
-
             if not clock.is_open:
-                # Calculate time until next market open
-                time_until_open = clock.next_open - current_time_utc
-                total_seconds = time_until_open.total_seconds()
-                hours, remainder = divmod(total_seconds, 3600)
+                time_until_open = (clock.next_open - current_time_utc).total_seconds()
+                hours, remainder = divmod(time_until_open, 3600)
                 minutes, _ = divmod(remainder, 60)
-
-                # Log detailed info about market closure
                 next_open_formatted = clock.next_open.strftime("%Y-%m-%d %H:%M UTC")
                 logger.info(
                     f"Market is closed. Next open: {next_open_formatted} "
                     f"({int(hours)}h {int(minutes)}m)"
                 )
-
-            return clock.is_open
-
+                return False, time_until_open
+            else:
+                return True, 0.0
         except Exception as e:
             logger.error(f"Failed to retrieve market clock: {e}")
-            return self._last_market_state if self._last_market_state is not None else False
+            return self._last_market_state if self._last_market_state is not None else False, 0.0
 
     def get_rate(self, pair: str, side: str | None = None, *args, **kwargs) -> float:
         try:
@@ -1142,7 +1158,7 @@ class Alpacastocks(Stockexchange):
 
             # c) Fallback to UTC now
             if ts_dt is None:
-                ts_dt = datetime.now(timezone.utc)
+                ts_dt = datetime.now(timezone.utc)  # noqa: UP017
                 logger.warning(
                     f"No timestamp in quote/trade for {symbol}; using now()={ts_dt.isoformat()}"
                 )
@@ -1281,7 +1297,7 @@ class Alpacastocks(Stockexchange):
         # Convert since (ms) to ISO8601, if provided
         start: str | None = None
         if since:
-            start = datetime.fromtimestamp(since / 1000, tz=timezone.utc).isoformat()
+            start = datetime.fromtimestamp(since / 1000, tz=timezone.utc).isoformat()  # noqa: UP017
 
         # Default limit if not set
         max_trades = limit or 1000
@@ -1295,11 +1311,12 @@ class Alpacastocks(Stockexchange):
         for t in api_resp.data:
             # Alpaca Trade.timestamp is ISO str; parse to ms
             ts = int(isoparse(t.timestamp).timestamp() * 1000)
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()  # noqa: UP017
             ccxt_trades.append(
                 {
                     "id": t.trade_id,
                     "timestamp": ts,
-                    "datetime": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "datetime": dt,
                     "symbol": symbol,
                     "side": t.taker_side.value.lower(),  # "buy" or "sell"
                     "price": float(t.price),
@@ -1492,11 +1509,13 @@ class Alpacastocks(Stockexchange):
 
         async def _on_trade(trade):
             ts = int(isoparse(trade.timestamp).timestamp() * 1000)
+            # Alpaca Trade.timestamp is ISO str; parse to ms
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()  # noqa: UP017
             await q.put(
                 {
                     "id": trade.trade_id,
                     "timestamp": ts,
-                    "datetime": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                    "datetime": dt,
                     "symbol": symbol,
                     "side": trade.taker_side.value.lower(),
                     "price": float(trade.price),

@@ -5,7 +5,7 @@ Freqtrade is the main module of this bot. It contains the FreqtradeBot class.
 import logging
 import traceback
 from copy import deepcopy
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta, timezone
 from math import isclose
 from threading import Lock
 from time import sleep
@@ -179,10 +179,10 @@ class FreqtradeBot(LoggingMixin):
 
         def log_took_too_long(duration: float, time_limit: float):
             logger.warning(
-                f"Strategy analysis took {duration:.2f}s, more than 25% of the timeframe "
-                f"({time_limit:.2f}s). This can lead to delayed orders and missed signals."
-                "Consider either reducing the amount of work your strategy performs "
-                "or reduce the amount of pairs in the Pairlist."
+                f"Strategy analysis took {duration:.2f}s, more than 25% of the timeframe ",
+                f"({time_limit:.2f}s). This can lead to delayed orders and missed signals.",
+                "Consider either reducing the amount of work your strategy performs ",
+                "or reduce the amount of pairs in the Pairlist.",
             )
 
         self._measure_execution = MeasureTime(log_took_too_long, timeframe_secs * 0.25)
@@ -604,34 +604,41 @@ class FreqtradeBot(LoggingMixin):
     # enter positions / open trades logic and methods
     #
 
+    #
+    # enter positions / open trades logic and methods
+    #
+
+    def _prune_whitelist(self, whitelist: list[str], now_utc: datetime) -> list[str]:
+        """
+        Remove pairs with open trades or orders within the last 15 minutes.
+        """
+        pruned = whitelist.copy()
+        for trade in Trade.get_open_trades():
+            time_since_trade = now_utc - trade.open_date_utc
+            if trade.pair in pruned and time_since_trade < timedelta(minutes=15):
+                pruned.remove(trade.pair)
+                logger.debug("Removed %s from pair whitelist", trade.pair)
+            for order in trade.orders:
+                if order.ft_is_open and order.ft_pair in pruned:
+                    pruned.remove(order.ft_pair)
+                    logger.info("Removed %s from pair whitelist, order open", order.ft_pair)
+        return list(set(pruned))
+
     def enter_positions(self) -> int:
         """
         Tries to execute entry orders for new trades (positions)
         """
         trades_created = 0
-
         whitelist = deepcopy(self.active_pair_whitelist)
         if not whitelist:
             self.log_once("Active pair whitelist is empty.", logger.info)
             return trades_created
 
         if self.config.get("allow_multiple_positions", False):
-            now_utc = datetime.now(timezone.utc)
-            # Remove pairs for currently opened trades from the whitelist
-            for trade in Trade.get_open_trades():
-                time_since_trade = now_utc - trade.open_date_utc
-                if trade.pair in whitelist and time_since_trade < timedelta(minutes=15):
-                    whitelist.remove(trade.pair)
-                    logger.debug("Removed %s from pair whitelist", trade.pair)
-                for order in trade.orders:
-                    if order.ft_is_open and order.ft_pair in whitelist:
-                        whitelist.remove(order.ft_pair)
-                        logger.info("Removed %s from pair whitelist, order open", order.ft_pair)
-
-            whitelist_temp = whitelist
-            whitelist = list(set(whitelist_temp))
+            now_utc = datetime.now(timezone.utc)  # noqa: UP017
+            whitelist = self._prune_whitelist(whitelist, now_utc)
         else:
-            # Remove pairs for currently opened trades from the whitelist
+            # Remove currently opened trades from whitelist
             for trade in Trade.get_open_trades():
                 if trade.pair in whitelist:
                     whitelist.remove(trade.pair)
@@ -643,21 +650,21 @@ class FreqtradeBot(LoggingMixin):
                 logger.info,
             )
             return trades_created
+
         if PairLocks.is_global_lock(side="*"):
-            # This only checks for total locks (both sides).
-            # per-side locks will be evaluated by `is_pair_locked` within create_trade,
-            # once the direction for the trade is clear.
             lock = PairLocks.get_pair_longest_lock("*")
             if lock:
                 self.log_once(
-                    f"Global pairlock active until "
-                    f"{lock.lock_end_time.strftime(constants.DATETIME_PRINT_FORMAT)}. "
-                    f"Not creating new trades, reason: {lock.reason}.",
+                    f"""Global pairlock active until
+                        {lock.lock_end_time.strftime(constants.DATETIME_PRINT_FORMAT)}.
+                        Not creating new trades, reason: {lock.reason}.""",
                     logger.info,
+                    True,
                 )
             else:
                 self.log_once("Global pairlock active. Not creating new trades.", logger.info)
             return trades_created
+
         # Create entity and execute trade for each pair from whitelist
         for pair in whitelist:
             try:
