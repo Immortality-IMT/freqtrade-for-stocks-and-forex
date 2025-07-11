@@ -96,7 +96,7 @@ freqtrade trade -c user_data/forex_config.json -s TestIB
 
 For Immortality coin,
 
-You can trade Immortality coin direct from you wallet using Freqtrade strategies.
+You can trade Immortality coin direct from your wallet using Freqtrade strategies.
 
 - Get a nodereal.io API key
 - Copy your public and private key pair from your crypto wallet
