@@ -1,9 +1,10 @@
 # pip install ib_insync
-# Interactive Brokers exchange integration for FreqTrade
+# Interactive Brokers exchange forex integration for FreqTrade
 
 import asyncio
 import logging
 import math
+import socket
 import time
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 class Interactivebrokers(Foreignexchange):
     """
     Interactive Brokers forex exchange class. Contains adjustments needed for Freqtrade
-    to work with IBKR for forex trading, including market open/close recognition.
+    to work with IBKR for forex trading.
     """
 
     DECIMAL_PLACES = 6
@@ -108,6 +109,7 @@ class Interactivebrokers(Foreignexchange):
         self._entry_rate_cache = {}
         self._exit_rate_cache = {}
 
+        # Set ports based on live/paper trading
         if self.dry_run:
             self.port = config.get("ib_paper_port", 4002)
             logger.info(f"Connecting to IBKR paper trading (IB Gateway) on port {self.port}.")
@@ -115,22 +117,29 @@ class Interactivebrokers(Foreignexchange):
             self.port = config.get("ib_live_port", 7497)
             logger.info(f"Connecting to IBKR live trading (TWS) on port {self.port}.")
 
+        # Set up host
         self.host = config.get("ib_host", "127.0.0.1")
         self.client_id = config.get("ib_client_id", 1)
 
+        # Connect to IBKR
         self._connect_to_ib()
 
+        # Set margin mode and initialize markets
         self.margin_mode = MarginMode.NONE
         self.markets = self.get_markets()
+
+        # Start WebSocket connection
         self.ws_start()
 
+        # Verify connection is established
         if not self.ib.isConnected():
             logger.error("Failed to establish connection to Interactive Brokers")
+            raise ConnectionError("WebSocket connection failed")
 
     def _connect_to_ib(self) -> None:
-        max_retries = 5
+        max_retries = 3
         retry_count = 0
-        retry_delay = 5  # Initial delay in seconds
+        retry_delay = 5
 
         while retry_count < max_retries:
             try:
@@ -151,56 +160,23 @@ class Interactivebrokers(Foreignexchange):
                 else:
                     logger.warning("Connection attempt returned without error but not connected")
                     retry_count += 1
+            except ConnectionRefusedError as e:
+                logger.error(f"Connection refused while connecting to IBKR: {e}")
+                retry_count += 1
             except Exception as e:
-                logger.error(f"API connection failed: {e}")
+                logger.error(f"Unexpected error while connecting to IBKR: {e}")
                 retry_count += 1
 
             if retry_count < max_retries:
                 logger.info(
-                    f"Retrying connection in {retry_delay} seconds... "
+                    f"Retrying connection in {retry_delay} seconds..."
                     f"(Attempt {retry_count + 1}/{max_retries})"
                 )
                 time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
 
-        # After max retries, inform the user and sleep instead of crashing
-        logger.error("Failed to connect to Interactive Brokers after 5 attempts.")
-        logger.error(
-            "Trader Workstation (TWS) or IB Gateway may not be running or configured "
-            "to accept API connections."
-        )
-        logger.error("Please check the API settings in TWS/IB Gateway:")
-        logger.error("1. Ensure TWS/IB Gateway is running and listening on port 4002.")
-        logger.error(
-            "2. Go to File > Global Configuration > API > Settings, and enable "
-            "'Allow connections from localhost only' or add 127.0.0.1 to Trusted IPs."
-        )
-        logger.error(
-            "For more details, see: "
-            "https://www.interactivebrokers.com/en/trading/tws-updateable-stable.php"
-        )
-        logger.info(
-            "The program will sleep for 60 seconds and then retry connecting. "
-            "Please fix the configuration and keep TWS running."
-        )
-
-        while True:  # Infinite retry loop
-            time.sleep(60)  # Sleep for 60 seconds
-            try:
-                logger.info(
-                    f"Re-attempting connection to IBKR on {self.host}:{self.port} "
-                    f"(clientId={self.client_id})"
-                )
-                self.ib.connect(self.host, self.port, clientId=self.client_id)
-                if self.ib.isConnected():
-                    logger.info(f"Successfully connected to IBKR on port {self.port}.")
-                    util.startLoop()
-                    self._setup_event_loop()
-                    self._ws_connected = True
-                    return
-            except Exception as e:
-                logger.error(f"API connection failed again: {e}")
-                logger.info("Will retry in 60 seconds...")
+        logger.error("Failed to connect to IBKR after multiple attempts")
+        logger.error("Please ensure TWS or IB Gateway is running with API connections enabled")
+        raise ConnectionError("Could not connect to Interactive Brokers")
 
     def _setup_event_loop(self) -> None:
         if self._connection_thread is not None and self._connection_thread.is_alive():
@@ -366,21 +342,29 @@ class Interactivebrokers(Foreignexchange):
         side: str | None = None,
         **kwargs,
     ) -> float:
+        """
+        Try to fetch a live price; on failure due to stale/nan data or disconnect,
+        trigger a reconnect and retry once before falling back to historical.
+        """
         pair = pair[0] if isinstance(pair, tuple) else pair
+        # First attempt
         try:
             return self._fetch_live_price(pair, side)
         except Exception as e:
             logger.error(f"Failed to request market data for {pair} (live): {e}")
+            # Trigger IBKR reconnect on data farm or stale data errors
             try:
                 logger.info("Attempting to reconnect to IBKR and retry price fetch")
                 self._reconnect_event.set()
                 self._connect_to_ib()
+                # brief pause to re-establish streams
                 time.sleep(1)
                 price = self._fetch_live_price(pair, side)
                 logger.info(f"Price fetch after reconnect succeeded for {pair}: {price}")
                 return price
             except Exception as e2:
                 logger.error(f"Retry after reconnect failed for {pair}: {e2}")
+        # Final fallback
         return self._fallback_to_historical_rate(pair)
 
     def _fetch_live_price(self, pair: str, side: str | None) -> float:
@@ -391,6 +375,7 @@ class Interactivebrokers(Foreignexchange):
 
         ticker = self.ib.reqMktData(contract)
 
+        # Wait up to 2 seconds for valid bid/ask
         start = time.time()
         while time.time() - start < 2:
             self.ib.sleep(0.1)
@@ -474,6 +459,7 @@ class Interactivebrokers(Foreignexchange):
                         symbol = pair if pair else "UNKNOWN/UNKNOWN"
 
                     price: float | None = None
+
                     if trade.order.orderType == "LMT":
                         price = float(trade.order.lmtPrice)
                     elif hasattr(trade, "fills") and trade.fills:
@@ -598,7 +584,7 @@ class Interactivebrokers(Foreignexchange):
         try:
             bars = await self.ib.reqHistoricalDataAsync(
                 contract,
-                endDateTime="",
+                endDateTime="",  # Current time
                 durationStr=durationStr,
                 barSizeSetting=ib_timeframe,
                 whatToShow="MIDPOINT",
@@ -702,28 +688,6 @@ class Interactivebrokers(Foreignexchange):
             logger.debug("Empty pairs list passed to refresh_latest_ohlcv")
             return
 
-        if not self.is_market_open():
-            next_open = self.get_next_market_open()
-            if next_open:
-                now_utc = datetime.now(timezone.utc)  # noqa: UP017
-                time_until_open = (next_open - now_utc).total_seconds()
-                if time_until_open > 300:  # More than 5 minutes until open
-                    sleep_time = time_until_open - 300
-                    hours_until_open = time_until_open / 3600
-                    logger.info(
-                        f"Market is closed. Next open in {hours_until_open:.2f} hours. "
-                        f"Sleeping for {sleep_time:.1f} seconds ",
-                        "until 5 minutes before market opens.",
-                    )
-                    time.sleep(sleep_time)
-                else:
-                    logger.info(
-                        "Market is closed, but opening in less than 5 minutes. ",
-                        "Proceeding to fetch data.",
-                    )
-            else:
-                logger.warning("Market is closed, but could not determine next open time.")
-
         for item in pairs:
             try:
                 if isinstance(item, tuple):
@@ -781,8 +745,24 @@ class Interactivebrokers(Foreignexchange):
         return balances
 
     def close(self) -> None:
-        self.ib.disconnect()
-        logger.info("Disconnected from IBKR.")
+        try:
+            if self.ib.isConnected():
+                self.ib.disconnect()
+                logger.info("Disconnected from IBKR.")
+            # Ensure the socket is fully closed
+            self.ib.client._sock = None  # Clear the socket reference
+        except Exception as e:
+            logger.error(f"Error during IBKR disconnection: {e}")
+        finally:
+            # Attempt to release the port
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
+                sock.bind((self.host, self.port))  # Try binding to the port
+                sock.close()
+                logger.info(f"Port {self.port} released successfully.")
+            except OSError as e:
+                logger.warning(f"Failed to release port {self.port}: {e}")
 
     def market_is_tradable(self, market: dict) -> bool:
         return market.get("active", False) and market.get("tradable", True)
@@ -972,47 +952,12 @@ class Interactivebrokers(Foreignexchange):
         }
 
     def is_market_open(self):
-        """
-        Determine if the forex market is currently open based on UTC time.
-        Open from Sunday 22:00 UTC to Friday 22:00 UTC.
-        """
         now = datetime.now(timezone.utc)  # noqa: UP017
-        weekday = now.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
-        hour = now.hour
-
-        if weekday == 6:  # Sunday
-            return hour >= 22
-        elif weekday == 4:  # Friday
-            return hour < 22
-        elif weekday == 5:  # Saturday
+        if now.weekday() == 4 and now.hour >= 22:
             return False
-        else:  # Monday to Thursday
-            return True
-
-    def get_next_market_open(self):
-        """
-        Calculate the next market opening time if the market is currently closed.
-        Returns the next Sunday at 22:00 UTC or today if Sunday before 22:00 UTC.
-        """
-        now = datetime.now(timezone.utc)  # noqa: UP017
-        if self.is_market_open():
-            return None  # Market is open
-
-        if now.weekday() == 6:  # Sunday
-            if now.hour < 22:
-                next_open = now.replace(hour=22, minute=0, second=0, microsecond=0)
-            else:
-                # This shouldn't happen since market would be open
-                next_open = now + pd.Timedelta(days=7)
-                next_open = next_open.replace(hour=22, minute=0, second=0, microsecond=0)
-        else:
-            days_until_sunday = (6 - now.weekday()) % 7
-            if days_until_sunday == 0:
-                days_until_sunday = 7
-            next_sunday = now + pd.Timedelta(days=days_until_sunday)
-            next_open = next_sunday.replace(hour=22, minute=0, second=0, microsecond=0)
-
-        return next_open
+        if now.weekday() >= 5:
+            return False
+        return True
 
     def _extract_currencies_from_pair(self, pair: str) -> tuple[str, str]:
         if isinstance(pair, tuple):
@@ -1210,6 +1155,7 @@ class Interactivebrokers(Foreignexchange):
         return trades
 
     def fetch_balance(self) -> dict:
+        # Simply alias your existing balance call
         return self.get_balances()
 
     def fetch_positions(self) -> list[dict]:
@@ -1231,14 +1177,17 @@ class Interactivebrokers(Foreignexchange):
         return positions
 
     def fetch_ticker(self, symbol: str) -> dict:
+        # Reuse fetch_tickers under the hood
         return self.fetch_tickers([symbol])[symbol]
 
     def fetch_tickers(self, symbols: list[str] | None = None) -> dict[str, dict]:
         tickers = {}
+        # Default to all open positions if no list given
         symbols = symbols or [p["symbol"] for p in self.fetch_positions()]
         for sym in symbols:
             contract = self._get_contract(sym)
             data = self.ib.reqMktData(contract, "", False, False)
+            # Wait briefly for IB to populate data (you may need a small sleep here)
             last = (data.bid + data.ask) / 2 if data.bid and data.ask else data.last
             tickers[sym] = {
                 "symbol": sym,
@@ -1250,13 +1199,21 @@ class Interactivebrokers(Foreignexchange):
         return tickers
 
     def _get_contract(self, symbol: str) -> Forex:
+        """
+        Creates and returns an IBKR Forex contract for a given symbol/pair.
+        """
         base, quote = self._extract_currencies_from_pair(symbol)
         return Forex(symbol=base, currency=quote, exchange="IDEALPRO")
 
     def get_rates(self, pair: str, refresh: bool, is_short: bool) -> tuple[float, float]:
+        """
+        Returns entry and exit rates for a forex pair, compatible with Freqtrade UI.
+        Caches rates when `refresh=False`.
+        """
         entry_rate = None
         exit_rate = None
 
+        # Try cache first
         if not refresh:
             with self._cache_lock:
                 entry_rate = self._entry_rate_cache.get(pair)
@@ -1266,14 +1223,18 @@ class Interactivebrokers(Foreignexchange):
             if exit_rate is not None:
                 logger.debug(f"Using cached exit rate for {pair}.")
 
+        # Always fetch fresh if cache miss or refresh requested
         if entry_rate is None or exit_rate is None:
             ticker = self.fetch_ticker(pair)
             bid = ticker["bid"]
             ask = ticker["ask"]
 
+            # For a long entry, buy at ask; for a short entry, sell at bid
             entry_rate = entry_rate if entry_rate is not None else (ask if not is_short else bid)
+            # For a long exit, sell at bid; for a short exit, buy at ask
             exit_rate = exit_rate if exit_rate is not None else (bid if not is_short else ask)
 
+            # Cache the newly fetched rates
             with self._cache_lock:
                 self._entry_rate_cache[pair] = entry_rate
                 self._exit_rate_cache[pair] = exit_rate
@@ -1281,22 +1242,19 @@ class Interactivebrokers(Foreignexchange):
         return entry_rate, exit_rate
 
     def get_conversion_rate(self, base: str, quote: str) -> float:
+        """
+        Returns the mid market conversion rate between two currencies.
+        FreqUI calls this to convert between quote currencies (e.g. P&L displays).
+        """
         pair = f"{base}/{quote}"
         try:
             ticker = self.fetch_ticker(pair)
         except Exception:
+            # If the direct pair doesn't exist, try the inverse and invert the rate.
             inverse = f"{quote}/{base}"
             inv_ticker = self.fetch_ticker(inverse)
             mid = (inv_ticker["bid"] + inv_ticker["ask"]) / 2
             return 1.0 / mid
 
+        # Mid market rate = (bid + ask) / 2
         return (ticker["bid"] + ticker["ask"]) / 2
-
-    def cancel_open_orders_of_trade(self, trade, sides=("buy", "sell")):
-        """Cancel open orders related to a trade, handling missing 'side' gracefully."""
-        orders = self.fetch_open_orders(trade.pair)
-        for order in orders:
-            order_side = order.get("side", "unknown")  # Safe access with default
-            if order_side in sides:
-                logger.info(f"Cancelling order {order['id']} for {trade.pair}")
-                self.ib.cancelOrder(order["id"])
