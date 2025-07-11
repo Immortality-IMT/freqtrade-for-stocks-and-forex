@@ -787,16 +787,16 @@ class Alpacastocks(Stockexchange):
             if time_until_open > 300:  # More than 5 minutes until open
                 sleep_time = time_until_open - 300
                 logger.info(
-                    f"Market is closed, sleeping for {sleep_time:.1f} seconds ",
-                    "until 5 minutes before market opens.",
-                    "Reminder that JPX (Japan) opens at 8:00 PM ",
-                    "and the SSE (China) and HKEX open at 9:30 PM",
+                    f"Market is closed, sleeping for {sleep_time:.1f} seconds "
+                    "until 5 minutes before market opens."
+                    "Reminder that JPX (Japan) opens at 8:00 PM "
+                    "and the SSE (China) and HKEX open at 9:30 PM"
                 )
                 time.sleep(sleep_time)
             else:
                 logger.info(
-                    "Market is closed, but opening in less than 5 minutes. ",
-                    "Proceeding to fetch data.",
+                    "Market is closed, but opening in less than 5 minutes. "
+                    "Proceeding to fetch data."
                 )
 
         # Now fetch the data
@@ -814,6 +814,10 @@ class Alpacastocks(Stockexchange):
                 )
                 if not ohlcv_data.empty:
                     latest_ohlcv[pair_symbol] = ohlcv_data
+                else:
+                    logger.warning(
+                        f"No OHLCV data retrieved for {pair_symbol} on timeframe {timeframe}"
+                    )
             except Exception as e:
                 logger.error(f"Error fetching latest OHLCV for {pair_symbol}: {str(e)}")
         return latest_ohlcv
@@ -855,7 +859,8 @@ class Alpacastocks(Stockexchange):
 
     def is_market_open(self) -> tuple[bool, float]:
         """
-        Check if the market is currently open and return the time until it opens if closed.
+        Check if the NYSE market is currently open and return the time until it opens if closed.
+        NYSE is open Monday through Friday, 9:30 AM to 4:00 PM Eastern Time.
 
         Returns:
             tuple: (is_open, time_until_open)

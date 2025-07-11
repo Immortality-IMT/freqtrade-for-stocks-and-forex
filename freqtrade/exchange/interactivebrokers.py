@@ -130,7 +130,7 @@ class Interactivebrokers(Foreignexchange):
     def _connect_to_ib(self) -> None:
         max_retries = 5
         retry_count = 0
-        retry_delay = 5
+        retry_delay = 5  # Initial delay in seconds
 
         while retry_count < max_retries:
             try:
@@ -151,11 +151,8 @@ class Interactivebrokers(Foreignexchange):
                 else:
                     logger.warning("Connection attempt returned without error but not connected")
                     retry_count += 1
-            except ConnectionRefusedError as e:
-                logger.error(f"Connection refused while connecting to IBKR: {e}")
-                retry_count += 1
             except Exception as e:
-                logger.error(f"Unexpected error while connecting to IBKR: {e}")
+                logger.error(f"API connection failed: {e}")
                 retry_count += 1
 
             if retry_count < max_retries:
@@ -164,16 +161,46 @@ class Interactivebrokers(Foreignexchange):
                     f"(Attempt {retry_count + 1}/{max_retries})"
                 )
                 time.sleep(retry_delay)
-                retry_delay *= 2
+                retry_delay *= 2  # Exponential backoff
 
-        logger.error("Failed to connect to IBKR after 5 attempts. Exiting program.")
+        # After max retries, inform the user and sleep instead of crashing
+        logger.error("Failed to connect to Interactive Brokers after 5 attempts.")
         logger.error(
-            "Please ensure TWS or IB Gateway is running with API connections enabled and try again."
+            "Trader Workstation (TWS) or IB Gateway may not be running or configured "
+            "to accept API connections."
+        )
+        logger.error("Please check the API settings in TWS/IB Gateway:")
+        logger.error("1. Ensure TWS/IB Gateway is running and listening on port 4002.")
+        logger.error(
+            "2. Go to File > Global Configuration > API > Settings, and enable "
+            "'Allow connections from localhost only' or add 127.0.0.1 to Trusted IPs."
         )
         logger.error(
-            "Hint: https://www.interactivebrokers.com/en/trading/tws-updateable-stable.php"
+            "For more details, see: "
+            "https://www.interactivebrokers.com/en/trading/tws-updateable-stable.php"
         )
-        raise ConnectionError("Could not connect to Interactive Brokers after 5 attempts")
+        logger.info(
+            "The program will sleep for 60 seconds and then retry connecting. "
+            "Please fix the configuration and keep TWS running."
+        )
+
+        while True:  # Infinite retry loop
+            time.sleep(60)  # Sleep for 60 seconds
+            try:
+                logger.info(
+                    f"Re-attempting connection to IBKR on {self.host}:{self.port} "
+                    f"(clientId={self.client_id})"
+                )
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+                if self.ib.isConnected():
+                    logger.info(f"Successfully connected to IBKR on port {self.port}.")
+                    util.startLoop()
+                    self._setup_event_loop()
+                    self._ws_connected = True
+                    return
+            except Exception as e:
+                logger.error(f"API connection failed again: {e}")
+                logger.info("Will retry in 60 seconds...")
 
     def _setup_event_loop(self) -> None:
         if self._connection_thread is not None and self._connection_thread.is_alive():
@@ -491,14 +518,17 @@ class Interactivebrokers(Foreignexchange):
         }
         return status_mapping.get(ib_status, "unknown")
 
-    def cancel_order(self, order_id: str) -> None:
+    def cancel_order(self, order_id: str, pair: str | None = None) -> dict:
         try:
-            self.ib.cancelOrder(int(order_id))
+            self.ib.client.cancelOrder(int(order_id))
             logger.info(f"Order {order_id} cancel request sent successfully.")
+            return {"status": "canceled", "id": order_id}
         except ValueError as e:
             logger.error(f"Invalid order ID format when canceling {order_id}: {e}")
+            return {"status": "error", "message": str(e)}
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
+            return {"status": "error", "message": str(e)}
 
     def get_markets(
         self,
@@ -1063,29 +1093,73 @@ class Interactivebrokers(Foreignexchange):
             raise
 
     def fetch_open_orders(self, symbol: str | None = None) -> list[dict]:
-        self.ib.reqOpenOrders()
-        orders = []
+        """Fetch all open orders from IBKR and ensure complete order data."""
+        self.ib.reqOpenOrders()  # Request open orders from IBKR
+        orders: list[dict] = []
         for o in self.ib.openOrders():
             sym = f"{o.contract.symbol}/{o.contract.currency}"
-            if symbol and sym != symbol:
+            if symbol and sym != symbol:  # Filter by symbol if provided
                 continue
-            filled = float(o.orderStatus.filled)
-            total = float(o.order.totalQuantity)
+
+            # Safely extract order attributes with defaults
+            filled = float(o.orderStatus.filled) if o.orderStatus.filled else 0.0
+            total = float(o.order.totalQuantity) if o.order.totalQuantity else 0.0
+            side = o.order.action.lower() if o.order.action else "unknown"  # Default to 'unknown'
+
+            # Log a warning if critical data is missing
+            if side == "unknown":
+                logger.warning(
+                    f"Order {o.order.orderId} has no action set. Incomplete data detected."
+                )
+
+            # Build a complete order dictionary
             orders.append(
                 {
                     "id": str(o.order.orderId),
                     "symbol": sym,
-                    "type": o.order.orderType.lower(),
-                    "side": o.order.action.lower(),
+                    "type": o.order.orderType.lower() if o.order.orderType else "unknown",
+                    "side": side,
                     "amount": total,
-                    "price": getattr(o.order, "lmtPrice", None),
-                    "filled": filled,
-                    "remaining": total - filled,
+                    "price": getattr(o.order, "lmtPrice", None),  # Limit price if available
+                    "filled": float(filled),
+                    "remaining": float(total - filled),
                     "status": self._parse_order_status(o.orderStatus.status),
-                    "info": {},
+                    "info": {},  # Additional info can be added
                 }
             )
         return orders
+
+    def sync_orders(self):
+        """
+        Synchronize Freqtrade's internal orders with IBKR's open orders.
+        Removes orders from Freqtrade if they no longer exist in IBKR.
+        """
+        # Fetch current open orders from IBKR
+        open_orders = self.fetch_open_orders()
+        open_order_ids = {order["id"] for order in open_orders}
+
+        # Placeholder: Replace with Freqtrade actual method to get open orders
+        freqtrade_open_orders = self.get_freqtrade_open_orders()
+
+        # Remove orders from Freqtrade that are not in IBKR
+        for trade in freqtrade_open_orders:
+            if trade.order_id not in open_order_ids:
+                logger.warning(
+                    f"Order {trade.order_id} not found in IBKR. Removing from Freqtrade."
+                )
+                self.remove_order_from_freqtrade(trade.order_id)
+
+    def get_freqtrade_open_orders(self):
+        """Retrieve open orders from Freqtrade internal state."""
+        # Placeholder: Implement based on your Freqtrade setup
+        # Example: return self.freqtrade.trades or similar
+        raise NotImplementedError("Implement this to fetch Freqtrade open orders.")
+
+    def remove_order_from_freqtrade(self, order_id):
+        """Remove an order from Freqtrade internal state."""
+        # Placeholder: Implement based on your Freqtrade setup
+        # Example: self.freqtrade.trades.remove(order_id) or similar
+        raise NotImplementedError("Implement this to remove an order from Freqtrade.")
 
     def fetch_closed_orders(self, symbol: str | None = None) -> list[dict]:
         closed = []
@@ -1217,3 +1291,12 @@ class Interactivebrokers(Foreignexchange):
             return 1.0 / mid
 
         return (ticker["bid"] + ticker["ask"]) / 2
+
+    def cancel_open_orders_of_trade(self, trade, sides=("buy", "sell")):
+        """Cancel open orders related to a trade, handling missing 'side' gracefully."""
+        orders = self.fetch_open_orders(trade.pair)
+        for order in orders:
+            order_side = order.get("side", "unknown")  # Safe access with default
+            if order_side in sides:
+                logger.info(f"Cancelling order {order['id']} for {trade.pair}")
+                self.ib.cancelOrder(order["id"])
