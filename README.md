@@ -52,11 +52,12 @@ For Interactivebrokers, Forex
 - chmod u+x tws-latest-linux-x64.sh
 - ./tws-latest-linux-x64.sh
 
-In the application go to Settings... 
+In the TWS application go to Settings... 
 
 - Set the port to paper trade 4002 or live 7497
 - Check Enable ActiveX and socket clients
 - Uncheck read only API
+- Check allow connection from localhost only or set up a trusted IP.
 - The base currency is USD, you need to get USD by making a trade in TWS.
 
 - Open config_examples folder and copy paste forex_config.json and TestIB.py to user dir and strategy folder
@@ -93,8 +94,22 @@ freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timeran
 freqtrade trade -c user_data/forex_config.json -s TestIB
 ```
 
+For Immortality coin,
+
+You can trade Immortality coin direct from you wallet using Freqtrade strategies.
+
+- Get a nodereal.io API key
+- Copy your public and private key pair from your crypto wallet
+- Open config_examples folder and add the public and private key and API key.
+- Copy TestIMT.py to the strategy folder
+
+```
+freqtrade trade -c user_data/immortality_config.json -s TestIMT
+```
+
 - Discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks generally round to 2 decimal places.
-- Exchanges limit trade history data to paid subscriptions, a general history data server for both stocks and forex is essential to supplement the limitation.
+- Exchanges limit trade history data to paid subscriptions, and this is where the backtest fails for forex.
+- While crypto is 24/7, stockmarkets and forex close, during this time the exchanges go into sleep mode and awaken prior to opening.
 - Initialize user folder - freqtrade create-userdir --userdir user_data
 
 ...and check out the stock and forex display in FreqUI.
