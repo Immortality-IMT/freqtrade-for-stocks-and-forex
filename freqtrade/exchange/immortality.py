@@ -283,6 +283,8 @@ class Immortality(Stockexchange):
         "ws_auto_reconnect": True,
         "ws_reconnect_interval": 30,
         "watch_ohlcv": True,
+        "use_entry_signal": True,
+        "use_exit_signal": True,
     }
 
     id = "immortality"
