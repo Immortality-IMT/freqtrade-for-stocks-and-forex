@@ -28,7 +28,7 @@ IMMORTALITY_ADDR = Web3.to_checksum_address("0x2bF2141eD175f3236903cF07de33D7324
 PAIR_ADDRESS = Web3.to_checksum_address(
     "0xfA56E9AbcaA45207bE5E43cF475Ee061768CA915"
 )  # IMT/BNB pair
-MIN_INTERVAL = 100.0  # seconds between NodeReal calls
+MIN_INTERVAL = 80.0  # seconds between NodeReal calls
 NODEREAL_FREE_URL = "https://open-platform.nodereal.io/{api_key}/pancakeswap-free/graphql"
 
 # Trading parameters
@@ -570,8 +570,15 @@ class Immortality(Stockexchange):
                         )
                         ohlcv = ohlcv.drop_duplicates(subset="date").sort_values("date")
 
-                self.latest_ohlcv[key] = ohlcv
-                self.logger.info(f"Refreshed OHLCV for {pair}/{timeframe}, candles: {len(ohlcv)}")
+                # Prune cache to keep only the latest 200 candles
+                if not ohlcv.empty:
+                    ohlcv = ohlcv.tail(200)
+                    self.latest_ohlcv[key] = ohlcv
+                    self.logger.info(
+                        f"Refreshed and pruned OHLCV for {pair}/{timeframe}, candles: {len(ohlcv)}"
+                    )
+                else:
+                    self.logger.warning(f"No OHLCV data for {pair}/{timeframe}, cache not updated")
             except Exception as e:
                 self.logger.error(f"Failed to refresh OHLCV for {pair}/{timeframe}: {str(e)}")
 
@@ -675,10 +682,79 @@ class Immortality(Stockexchange):
         except ExchangeError as e:
             self.logger.error(f"Price validation failed: {str(e)}")
 
-    def get_ohlcv(
-        self, pair: str | tuple, timeframe: str, since_ms: int = 0, limit: int = 200
+    def rate_limit_error_handler(
+        self, cached_df: pd.DataFrame | None, timeframe: str, pair_str: str
     ) -> pd.DataFrame:
-        """Fetches historical OHLCV data."""
+        """Handle 429 rate limit error by generating synthetic candles or falling back."""
+        self.logger.error(
+            "Rate limit exceeded (429) for %s/%s, using cached data", pair_str, timeframe
+        )
+        if cached_df is not None and not cached_df.empty:
+            last_candle = cached_df.iloc[-1]
+            last_ts = last_candle["date"]
+            interval = pd.Timedelta(seconds=self.timeframe_to_seconds(timeframe))
+            now_utc = pd.Timestamp.utcnow()
+            synthetic_candles = []
+            current_ts = last_ts + interval
+            while current_ts <= now_utc:
+                synthetic_candles.append(
+                    [
+                        int(current_ts.timestamp() * 1000),
+                        last_candle["close"],
+                        last_candle["close"] * 1.001,
+                        last_candle["close"] * 0.999,
+                        last_candle["close"],
+                        0.0,
+                    ]
+                )
+                current_ts += interval
+            if synthetic_candles:
+                df = ohlcv_to_dataframe(
+                    synthetic_candles,
+                    timeframe,
+                    pair_str,
+                    fill_missing=True,
+                    drop_incomplete=True,
+                )
+                df = pd.concat([cached_df, df]).drop_duplicates(subset="date").sort_values("date")
+                self.logger.info(
+                    "Generated %d synthetic candles for %s/%s due to 429 error",
+                    len(synthetic_candles),
+                    pair_str,
+                    timeframe,
+                )
+                return df.tail(200)
+        return self._get_fallback_candle(timeframe, pair_str)
+
+    def create_synthetic_candles(
+        self,
+        last_candle: pd.Series,
+        start_time: pd.Timestamp,
+        end_time: pd.Timestamp,
+        interval_seconds: int,
+    ) -> list[list[float]]:
+        """Generate synthetic candles starting from `start_time` until `end_time`."""
+        synthetic = []
+        current_ts = start_time
+        while current_ts <= end_time:
+            ts_ms = int(current_ts.timestamp() * 1000)
+            close = last_candle["close"]
+            synthetic.append(
+                [
+                    ts_ms,
+                    close,
+                    close * 1.001,
+                    close * 0.999,
+                    close,
+                    0.0,
+                ]
+            )
+            current_ts += pd.Timedelta(seconds=interval_seconds)
+        return synthetic
+
+    def prepare_cache_and_throttle(
+        self, pair: str | tuple, timeframe: str, since_ms: int
+    ) -> tuple[str, int, pd.DataFrame | None]:
         if isinstance(pair, tuple):
             pair_str = pair[0]
             self.logger.debug(f"Received tuple pair {pair}, using pair_str={pair_str}")
@@ -686,11 +762,10 @@ class Immortality(Stockexchange):
             pair_str = pair
 
         self.logger.debug(
-            "Fetching OHLCV: pair=%s, timeframe=%s, since_ms=%s, limit=%s",
+            "Fetching OHLCV: pair=%s, timeframe=%s, since_ms=%s",
             pair_str,
             timeframe,
             since_ms,
-            limit,
         )
 
         if pair_str != "IMT/BNB":
@@ -700,6 +775,17 @@ class Immortality(Stockexchange):
             self.logger.error("NodeReal API key not provided in config.")
             raise OperationalException("NodeReal API key is required for OHLCV data retrieval.")
 
+        cache_key = (pair_str, timeframe, "spot")
+        cached_df = self.latest_ohlcv.get(cache_key)
+
+        if cached_df is not None and not cached_df.empty:
+            latest_ts_ms = int(cached_df["date"].iloc[-1].timestamp() * 1000)
+            if since_ms < latest_ts_ms:
+                since_ms = latest_ts_ms
+                self.logger.debug(
+                    f"Using cached latest timestamp: {since_ms} for {pair_str}/{timeframe}"
+                )
+
         now_s = time.time()
         if now_s - self._last_call_time < self._min_interval:
             to_sleep = self._min_interval - (now_s - self._last_call_time)
@@ -707,16 +793,97 @@ class Immortality(Stockexchange):
             time.sleep(to_sleep)
         self._last_call_time = time.time()
 
+        return pair_str, since_ms, cached_df
+
+    def process_and_filter_dataframe(
+        self,
+        df: pd.DataFrame,
+        cached_df: pd.DataFrame | None,
+        since_ms: int,
+        pair_str: str,
+        timeframe: str,
+    ) -> pd.DataFrame:
+        if since_ms:
+            df = df[df["date"].astype("int64") // 10**6 >= since_ms]
+
+        cutoff_ms = int(time.time() * 1000) - (90 * 24 * 3600 * 1000)
+        df = df[(df["date"].astype("int64") // 10**6) >= cutoff_ms]
+
+        if cached_df is not None and not cached_df.empty:
+            df = pd.concat([cached_df, df]).drop_duplicates(subset="date").sort_values("date")
+            self.logger.debug(f"Merged with cached data, total candles: {len(df)}")
+
+        if df.empty:
+            self.logger.warning(
+                "Empty OHLCV DataFrame after filtering for %s/%s, using fallback",
+                pair_str,
+                timeframe,
+            )
+            return self._get_fallback_candle(timeframe, pair_str)
+
+        self.logger.debug("OHLCV DataFrame sample:\n%s", df.head(5).to_string())
+
+        self._validate_latest_price(df, pair_str, timeframe)
+
+        self.logger.info("Retrieved %d candles for %s/%s", len(df), pair_str, timeframe)
+
+        df = self._append_synthetic_candle_if_needed(df, timeframe)
+
+        if len(df) > 200:
+            df = df.tail(200)
+            self.logger.debug("Trimmed returned OHLCV DataFrame to last 200 rows")
+
+        return df
+
+    def get_ohlcv(
+        self, pair: str | tuple, timeframe: str, since_ms: int = 0, limit: int = 200
+    ) -> pd.DataFrame:
+        """Fetches historical OHLCV data."""
         try:
-            candles = fetch_ohlcv_nodereal(self.api_key, PAIR_ADDRESS, limit)
+            pair_str, since_ms, cached_df = self.prepare_cache_and_throttle(
+                pair, timeframe, since_ms
+            )
+
+            fetch_limit = 10 if since_ms > 0 else limit
+            candles = fetch_ohlcv_nodereal(self.api_key, PAIR_ADDRESS, fetch_limit)
+
             if not candles:
                 self.logger.warning(
-                    "No OHLCV data fetched for %s/%s, using fallback", pair_str, timeframe
+                    "No OHLCV data fetched for %s/%s, checking cache", pair_str, timeframe
                 )
+                if cached_df is not None and not cached_df.empty:
+                    last_candle = cached_df.iloc[-1]
+                    interval_seconds = self.timeframe_to_seconds(timeframe)
+                    synthetic_candles = self.create_synthetic_candles(
+                        last_candle,
+                        last_candle["date"] + pd.Timedelta(seconds=interval_seconds),
+                        pd.Timestamp.utcnow(),
+                        interval_seconds,
+                    )
+                    if synthetic_candles:
+                        df = ohlcv_to_dataframe(
+                            synthetic_candles,
+                            timeframe,
+                            pair_str,
+                            fill_missing=True,
+                            drop_incomplete=True,
+                        )
+                        df = (
+                            pd.concat([cached_df, df])
+                            .drop_duplicates(subset="date")
+                            .sort_values("date")
+                        )
+                        self.logger.info(
+                            "Generated %d synthetic candles for %s/%s",
+                            len(synthetic_candles),
+                            pair_str,
+                            timeframe,
+                        )
+                        return df.tail(200)
                 return self._get_fallback_candle(timeframe, pair_str)
 
             if self.timeframe_to_seconds(timeframe) < 3600:
-                raw_cap = 50
+                raw_cap = 50 if since_ms == 0 else 10
                 recent = candles[-raw_cap:]
                 candles = self.interpolate_ohlcv(recent, timeframe)
                 self.logger.debug("Interpolated to %d candles for %s", len(candles), timeframe)
@@ -725,34 +892,15 @@ class Immortality(Stockexchange):
                 candles, timeframe, pair_str, fill_missing=True, drop_incomplete=True
             )
 
-            if since_ms:
-                df = df[df["date"].astype("int64") // 10**6 >= since_ms]
+            return self.process_and_filter_dataframe(df, cached_df, since_ms, pair_str, timeframe)
 
-            cutoff_ms = int(time.time() * 1000) - (90 * 24 * 3600 * 1000)
-            df = df[(df["date"].astype("int64") // 10**6) >= cutoff_ms]
-
-            if df.empty:
-                self.logger.warning(
-                    "Empty OHLCV DataFrame after filtering for %s/%s, using fallback",
-                    pair_str,
-                    timeframe,
-                )
-                return self._get_fallback_candle(timeframe, pair_str)
-
-            self.logger.debug("OHLCV DataFrame sample:\n%s", df.head(5).to_string())
-
-            self._validate_latest_price(df, pair_str, timeframe)
-
-            self.logger.info("Retrieved %d candles for %s/%s", len(df), pair_str, timeframe)
-
-            df = self._append_synthetic_candle_if_needed(df, timeframe)
-
-            if len(df) > 200:
-                df = df.tail(200)
-                self.logger.debug("Trimmed returned OHLCV DataFrame to last 200 rows")
-
-            return df
-
+        except requests.HTTPError as e:
+            if e.response.status_code == 429:
+                return self.rate_limit_error_handler(cached_df, timeframe, pair_str)
+            self.logger.error(
+                "HTTP error fetching OHLCV for %s/%s: %s", pair_str, timeframe, str(e)
+            )
+            return self._get_fallback_candle(timeframe, pair_str)
         except Exception as e:
             self.logger.error("Error fetching OHLCV for %s/%s: %s", pair_str, timeframe, str(e))
             self.logger.error("Traceback: %s", traceback.format_exc())
