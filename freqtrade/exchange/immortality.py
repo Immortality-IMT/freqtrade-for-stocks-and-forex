@@ -6,8 +6,7 @@ import time
 import traceback
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 import requests
@@ -25,9 +24,11 @@ BSC_WS_URL = "wss://bsc-mainnet.nodereal.io/ws/v1/{ws_api_key}"
 BSC_RPC_URL = "https://bsc-mainnet.nodereal.io/v1/{api_key}"
 PANCAKESWAP_ROUTER_ADDR = Web3.to_checksum_address("0x10ED43C718714eb63d5aA57B78B54704E256024E")
 WBNB_ADDR = Web3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")
-IMMORTALITY_ADDR = Web3.to_checksum_address("0x2bF2141eD175f3236903cF07de33D7324871802D")
-PAIR_ADDRESS = Web3.to_checksum_address("0xfA56E9AbcaA45207bE5E43cF475Ee061768CA915")  # IMT/BNB
-MIN_INTERVAL = 600.0  # seconds between NodeReal calls
+IMMORTALITY_ADDR = Web3.to_checksum_address("0x2bF2141eD175f3236903cF07de33D7324871802D")  # IMT
+PAIR_ADDRESS = Web3.to_checksum_address(
+    "0xfA56E9AbcaA45207bE5E43cF475Ee061768CA915"
+)  # IMT/BNB pair
+MIN_INTERVAL = 100.0  # seconds between NodeReal calls
 NODEREAL_FREE_URL = "https://open-platform.nodereal.io/{api_key}/pancakeswap-free/graphql"
 
 # Trading parameters
@@ -35,8 +36,10 @@ IMT_DECIMALS = 8
 BUY_BNB_AMOUNT = 0.004  # Match config.json stake_amount
 SELL_IMT_QUANTITY = None  # Dynamically set in sell method based on buy amount or 10_000_000
 RPC_SYNC_DELAY_SECONDS = 7
-CACHE_DIR = "user_data/data/immortality"
-CACHE_MAX_AGE_SECONDS = 90 * 24 * 3600  # 90 days
+TRUNCATE = 0
+ROUND = 1
+DECIMAL_PLACES = 2
+SIGNIFICANT_DIGITS = 3
 
 # ABIs
 PAIR_ABI = [
@@ -148,9 +151,7 @@ def init_websocket(self):
                 self.logger.error("Max retries reached, giving up on WebSocket connection")
 
 
-def fetch_ohlcv_nodereal(
-    api_key: str, pair_address: str, limit: int, since_ms: int = 0
-) -> list[list]:
+def fetch_ohlcv_nodereal(api_key: str, pair_address: str, limit: int) -> list[list]:
     """Fetches OHLCV data from NodeReal's PancakeSwap GraphQL API."""
     query = f"""
     {{
@@ -158,7 +159,7 @@ def fetch_ohlcv_nodereal(
         first: {limit},
         orderBy: hourStartUnix,
         orderDirection: desc,
-        where: {{ pair: "{pair_address.lower()}", hourStartUnix_gt: {since_ms // 1000} }}
+        where: {{ pair: "{pair_address.lower()}" }}
       ) {{
         hourStartUnix
         reserve0
@@ -170,22 +171,12 @@ def fetch_ohlcv_nodereal(
     url = NODEREAL_FREE_URL.format(api_key=api_key)
     headers = {"Content-Type": "application/json"}
     try:
-        logging.debug(f"Sending GraphQL query to {url}: {query}")
         resp = requests.post(url, json={"query": query}, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json().get("data", {}).get("pairHourDatas", [])
         logging.debug(f"NodeReal API raw response: {data}")
-    except requests.RequestException as e:
-        logging.error(
-            f"Failed to fetch OHLCV from NodeReal: {str(e)}, "
-            f"Response: {resp.text if 'resp' in locals() else 'No response'}"
-        )
-        return []
-    except ValueError as e:
-        logging.error(
-            f"Failed to parse NodeReal response: {str(e)}, "
-            f"Response: {resp.text if 'resp' in locals() else 'No response'}"
-        )
+    except (requests.RequestException, ValueError) as e:
+        logging.error(f"Failed to fetch OHLCV from NodeReal: {str(e)}")
         return []
 
     candles: list[list] = []
@@ -197,8 +188,8 @@ def fetch_ohlcv_nodereal(
             r1 = float(entry["reserve1"])  # BNB
             if r0 <= 0 or r1 <= 0:
                 logging.warning(
-                    f"Invalid reserves for {pair_address} at {ts}: reserve0={r0}, "
-                    f"reserve1={r1}, skipping"
+                    "Invalid reserves: "
+                    f"{pair_address} at {ts}: reserve0={r0}, reserve1={r1}, skipping"
                 )
                 continue
             price = r1 / r0  # BNB/IMT
@@ -285,7 +276,7 @@ class Immortality(Stockexchange):
 
     _use_ccxt = False
     _ft_has_default = {
-        "ohlcv_candle_limit": 1000,
+        "ohlcv_candle_limit": 200,  # ← down from 1000
         "order_time_in_force": ["gtc"],
         "stoploss_on_exchange": False,
         "ws_enabled": True,
@@ -293,6 +284,8 @@ class Immortality(Stockexchange):
         "ws_reconnect_interval": 30,
         "watch_ohlcv": True,
     }
+
+    id = "immortality"
 
     def __init__(
         self,
@@ -310,18 +303,16 @@ class Immortality(Stockexchange):
         )
         self.logger = logging.getLogger(__name__)
         self.logger.debug(f"Full configuration: {config}")  # Debug config loading
+        self.dry_run = config.get("dry_run", False)
         self.api_key_value = None  # Cache HTTP API key
         self.ws_api_key_value = None  # Cache WebSocket API key
         self.w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL.format(api_key=self.api_key)))
         if not self.w3.is_connected():
             raise OperationalException("Cannot connect to BSC RPC")
         self.latest_ohlcv: dict[tuple[str, str, str], pd.DataFrame] = {}
-        self._last_call_time: int = 0
-        self._min_interval: float = MIN_INTERVAL
+        self._last_call_time = 0.0
+        self._min_interval = MIN_INTERVAL
         self.candle_builders: dict[tuple[str, str], CandleBuilder] = {}
-        # Create cache directory
-        Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-        self.logger.debug(f"Ensured cache directory exists: {CACHE_DIR}")
         try:
             self._configure_ws()
             self.logger.info("Immortality exchange initialized")
@@ -329,46 +320,36 @@ class Immortality(Stockexchange):
             self.logger.error(f"Failed to initialize WebSocket: {str(e)}")
             raise OperationalException(f"Immortality initialization failed: {str(e)}")
 
-    def _get_cache_path(self, pair: str, timeframe: str) -> str:
-        """Returns the file path for the OHLCV cache."""
-        pair_safe = pair.replace("/", "_")
-        cache_path = str(Path(CACHE_DIR) / f"{pair_safe}_{timeframe}.csv")
-        self.logger.debug(f"Cache path for {pair}/{timeframe}: {cache_path}")
-        return cache_path
-
-    def _load_cached_ohlcv(self, pair: str, timeframe: str) -> pd.DataFrame:
-        """Loads cached OHLCV data from file if available and valid."""
-        cache_path = self._get_cache_path(pair, timeframe)
-        if not Path(cache_path).exists():
-            self.logger.debug(f"No cache file found at {cache_path}")
-            return pd.DataFrame()
-        try:
-            df = pd.read_csv(cache_path)
-            df["date"] = pd.to_datetime(df["date"], utc=True)
-            # Validate cache
-            now_ms = int(time.time() * 1000)
-            cutoff_ms = now_ms - (CACHE_MAX_AGE_SECONDS * 1000)
-            if df.empty or df["date"].max().timestamp() * 1000 < cutoff_ms:
-                self.logger.debug(f"Cache at {cache_path} is empty or too old")
-                return pd.DataFrame()
-            self.logger.debug(f"Loaded {len(df)} candles from cache at {cache_path}")
-            return df
-        except Exception as e:
-            self.logger.error(f"Failed to load cache from {cache_path}: {str(e)}")
-            return pd.DataFrame()
-
-    def _save_cached_ohlcv(self, pair: str, timeframe: str, df: pd.DataFrame) -> None:
-        """Saves OHLCV data to cache file."""
-        cache_path = self._get_cache_path(pair, timeframe)
-        try:
-            df.to_csv(cache_path, index=False)
-            self.logger.debug(f"Saved {len(df)} candles to cache at {cache_path}")
-        except Exception as e:
-            self.logger.error(f"Failed to save cache to {cache_path}: {str(e)}")
-
     @property
     def name(self):
         return "immortality"
+
+    def _configure_ws(self, websocket_url: str | None = None):
+        """Configures the WebSocket connection for real-time data."""
+        ws_url = websocket_url or BSC_WS_URL.format(ws_api_key=self.ws_api_key)
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                self.logger.info(
+                    f"Attempt WebSocket connect (attempt {attempt + 1}/{max_retries}) to {ws_url}"
+                )
+                self._exchange_ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_open=self._on_ws_open,
+                    on_message=self._on_ws_message,
+                    on_error=self._on_ws_error,
+                    on_close=self._on_ws_close,
+                )
+                self._ws_thread = threading.Thread(target=self._run_ws_forever, daemon=True)
+                self._ws_thread.start()
+                self.logger.info(f"WebSocket connection initialized to {ws_url}")
+                break
+            except Exception as e:
+                self.logger.error(f"WebSocket connection failed: {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(2**attempt)  # Exponential backoff: 1s, 2s, 4s, etc.
+                else:
+                    self.logger.error("Max retries reached, giving up on WebSocket connection")
 
     @property
     def api_key(self) -> str:
@@ -380,12 +361,11 @@ class Immortality(Stockexchange):
             if getattr(self, "exchange_config", None)
             else self.config.get("exchange", {})
         )
-        key = exchange_conf.get("nodereal_api_key", "").strip()
+        key = exchange_conf.get("api_key", "").strip()
         self.logger.info(f"NodeReal HTTP API key retrieved: {key!r}")
         if not key:
             self.logger.error(
-                "Missing 'nodereal_api_key' in config.json. "
-                "Please add it to the 'exchange' section."
+                "Missing 'nodereal_api_key' in config.json. Add key to the 'exchange' section."
             )
             raise OperationalException("NodeReal API key is required for OHLCV data retrieval.")
         self.logger.debug(f"Using NodeReal HTTP API key: {key}")
@@ -395,29 +375,7 @@ class Immortality(Stockexchange):
     @property
     def ws_api_key(self) -> str:
         """Retrieve NodeReal WebSocket API key from configuration, falling back to HTTP key."""
-        if self.ws_api_key_value is not None:
-            return self.ws_api_key_value
-        exchange_conf = (
-            self.exchange_config
-            if getattr(self, "exchange_config", None)
-            else self.config.get("exchange", {})
-        )
-        key = exchange_conf.get("nodereal_ws_api_key", "").strip()
-        if not key:
-            key = self.api_key  # Fallback to HTTP API key
-            self.logger.info(
-                "No 'nodereal_ws_api_key' found in config.json, "
-                "using 'nodereal_api_key' for WebSocket"
-            )
-        self.logger.info(f"NodeReal WebSocket API key retrieved: {key!r}")
-        if not key:
-            self.logger.error(
-                "Missing WebSocket API key and no fallback 'nodereal_api_key' in config.json."
-            )
-            raise OperationalException("NodeReal WebSocket API key is required.")
-        self.logger.debug(f"Using NodeReal WebSocket API key: {key}")
-        self.ws_api_key_value = key
-        return key
+        return self.api_key
 
     @property
     def wallet(self) -> str:
@@ -431,8 +389,7 @@ class Immortality(Stockexchange):
         self.logger.info(f"Wallet address retrieved: {key!r}")
         if not key:
             self.logger.error(
-                "Missing 'key' (wallet address) in config.json. "
-                "Please add it to the 'exchange' section."
+                "Missing 'key' (wallet address) in config.json. Add key to the 'exchange' section."
             )
             raise OperationalException("Wallet address is required for trading.")
         self.logger.debug(f"Using wallet address: {key}")
@@ -450,76 +407,14 @@ class Immortality(Stockexchange):
         self.logger.info(f"Private key retrieved: {secret!r}")
         if not secret:
             self.logger.error(
-                "Missing 'secret' (private key) in config.json. "
-                "Please add it to the 'exchange' section."
+                "Missing 'secret' (private key) in config.json. Add key to the 'exchange' section."
             )
             raise OperationalException("Private key is required for trading.")
         self.logger.debug(f"Using private key: {secret}")
         return secret
 
-    def _configure_ws(self, websocket_url: str | None = None):
-        """Configures the WebSocket connection for real-time data."""
-        ws_url = websocket_url or BSC_WS_URL.format(ws_api_key=self.ws_api_key)
-        max_retries = 5
-        attempt = 0
-        while attempt < max_retries:
-            try:
-                self.logger.info(
-                    f"Attempting WebSocket connection (attempt {attempt + 1}/{max_retries}) "
-                    f"to {ws_url}"
-                )
-                self._exchange_ws = websocket.WebSocketApp(
-                    ws_url,
-                    on_open=self._on_ws_open,
-                    on_message=self._on_ws_message,
-                    on_error=self._on_ws_error,
-                    on_close=self._on_ws_close,
-                )
-                self._ws_thread = threading.Thread(
-                    target=lambda: self._exchange_ws.run_forever(
-                        ping_interval=30,  # Send ping every 30 seconds
-                        ping_timeout=10,  # Wait 10 seconds for pong
-                    ),
-                    daemon=True,
-                )
-                self._ws_thread.start()
-                # Wait briefly to confirm connection
-                time.sleep(2)
-                if (
-                    self._exchange_ws
-                    and self._exchange_ws.sock
-                    and self._exchange_ws.sock.connected
-                ):
-                    self.logger.info(f"WebSocket connection initialized to {ws_url}")
-                    return
-                else:
-                    self.logger.warning("WebSocket connection not established, retrying")
-            except Exception as e:
-                self.logger.error(f"WebSocket connection failed: {str(e)}")
-            # Clean up before retry
-            if self._exchange_ws:
-                try:
-                    self._exchange_ws.close()
-                except Exception as e:
-                    self.logger.error(f"Error closing WebSocket during retry: {str(e)}")
-                self._exchange_ws = None
-            attempt += 1
-            if attempt < max_retries:
-                backoff = min(2**attempt, 16)  # Exponential backoff: 2s, 4s, 8s, 16s
-                self.logger.info(f"Waiting {backoff}s before retry")
-                time.sleep(backoff)
-        self.logger.error(
-            f"Max retries ({max_retries}) reached for WebSocket connection to {ws_url}. "
-            "Real-time updates disabled."
-        )
-        self._exchange_ws = None
-
     def _on_ws_open(self, ws):
         """Handles WebSocket connection opening."""
-        if not ws or not ws.sock or not ws.sock.connected:
-            self.logger.error("WebSocket opened but socket is invalid or closed")
-            self.ws_connection_reset()
-            return
         swap_topic = (
             "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"  # Swap event
         )
@@ -534,14 +429,9 @@ class Immortality(Stockexchange):
             self.logger.info(f"Subscribed to Swap events for pair {PAIR_ADDRESS}")
         except Exception as e:
             self.logger.error(f"WebSocket subscription failed: {str(e)}")
-            self.ws_connection_reset()
 
     def _on_ws_message(self, ws, message):
         """Processes incoming WebSocket messages (Swap events)."""
-        if not ws or not ws.sock or not ws.sock.connected:
-            self.logger.error("WebSocket message received but socket is invalid or closed")
-            self.ws_connection_reset()
-            return
         try:
             data = json.loads(message)
             if "params" not in data or "result" not in data["params"]:
@@ -550,66 +440,41 @@ class Immortality(Stockexchange):
             topics = log.get("topics", [])
             if topics[0] != "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822":
                 return
-            self._process_swap_event(log)
+
+            data_hex = log["data"]
+            amount0In = int(data_hex[2:66], 16) / 10**8  # IMT
+            amount1Out = int(data_hex[130:194], 16) / 10**18  # BNB
+            # Handle both IMT->BNB and BNB->IMT swaps
+            if amount0In > 0 and amount1Out > 0:
+                price = amount1Out / amount0In  # BNB/IMT
+                volume = amount0In
+            elif amount0In == 0 and amount1Out == 0:
+                amount0Out = int(data_hex[66:130], 16) / 10**8
+                amount1In = int(data_hex[194:258], 16) / 10**18
+                if amount0Out == 0 or amount1In == 0:
+                    return
+                price = amount1In / amount0Out
+                volume = amount0Out
+            else:
+                return
+
+            timestamp_ms = int(time.time() * 1000)
+            pair = "IMT/BNB"
+            supported_timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+            for tf in supported_timeframes:
+                key = (pair, tf)
+                if key not in self.candle_builders:
+                    self.candle_builders[key] = CandleBuilder(tf)
+                builder = self.candle_builders[key]
+                finalized_candle = builder.update(price, volume, timestamp_ms)
+                if finalized_candle:
+                    self.logger.debug(f"Finalized candle for {pair}/{tf}: {finalized_candle}")
         except Exception as e:
             self.logger.error(f"Error processing WebSocket message: {str(e)}")
-            self.ws_connection_reset()
-
-    def _process_swap_event(self, log: dict) -> None:
-        """Extracts swap event data and updates candles."""
-        data_hex = log["data"]
-        amount0In = int(data_hex[2:66], 16) / 10**8  # IMT
-        amount1Out = int(data_hex[130:194], 16) / 10**18  # BNB
-        if amount0In > 0 and amount1Out > 0:
-            price = amount1Out / amount0In  # BNB/IMT
-            volume = amount0In
-        elif amount0In == 0 and amount1Out == 0:
-            amount0Out = int(data_hex[66:130], 16) / 10**8
-            amount1In = int(data_hex[194:258], 16) / 10**18
-            if amount0Out == 0 or amount1In == 0:
-                return
-            price = amount1In / amount0Out
-            volume = amount0Out
-        else:
-            return
-
-        timestamp_ms = int(time.time() * 1000)
-        pair = "IMT/BNB"
-        supported_timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-        for tf in supported_timeframes:
-            key = (pair, tf)
-            if key not in self.candle_builders:
-                self.candle_builders[key] = CandleBuilder(tf)
-            builder = self.candle_builders[key]
-            finalized_candle = builder.update(price, volume, timestamp_ms)
-            if finalized_candle and tf == self.config.get("timeframe", "1h"):
-                self.logger.debug(f"Finalized candle for {pair}/{tf}: {finalized_candle}")
-                df = pd.DataFrame(
-                    [
-                        [
-                            finalized_candle.timestamp,
-                            finalized_candle.open,
-                            finalized_candle.high,
-                            finalized_candle.low,
-                            finalized_candle.close,
-                            finalized_candle.volume,
-                        ]
-                    ],
-                    columns=["timestamp", "open", "high", "low", "close", "volume"],
-                )
-                df["date"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                cached_df = self._load_cached_ohlcv(pair, tf)
-                if not cached_df.empty:
-                    df = (
-                        pd.concat([cached_df, df])
-                        .drop_duplicates(subset="date")
-                        .sort_values("date")
-                    )
-                self._save_cached_ohlcv(pair, tf, df)
 
     def _on_ws_error(self, ws, error):
         """Handles WebSocket errors."""
-        self.logger.error(f"WebSocket error: {str(error)}")
+        self.logger.error(f"WebSocket error: {error}")
         self.ws_connection_reset()
 
     def _on_ws_close(self, ws, close_status_code, close_msg):
@@ -620,17 +485,16 @@ class Immortality(Stockexchange):
     def _run_ws_forever(self):
         """Runs the WebSocket connection in a separate thread."""
         try:
-            if self._exchange_ws:
-                self._exchange_ws.run_forever(
-                    ping_interval=30,
-                    ping_timeout=10,
-                )
+            self._exchange_ws.run_forever()
         except Exception as e:
             self.logger.error(f"WebSocket thread crashed: {str(e)}")
             self.ws_connection_reset()
 
     async def watch_ohlcv(
-        self, pair: str, timeframe: str, limit: int | None = None
+        self,
+        pair: str,
+        timeframe: str,
+        limit: int | None = None,
     ) -> AsyncGenerator[list[float], None]:
         """Streams real-time OHLCV data for the specified pair and timeframe."""
         if pair != "IMT/BNB":
@@ -651,7 +515,7 @@ class Immortality(Stockexchange):
                     last["close"],
                     last["volume"],
                 )
-                self.logger.info(f"Successful init of {pair}/{timeframe} with historic candle")
+                self.logger.info(f"Initialized {pair}/{timeframe} with historical candle")
 
         while True:
             try:
@@ -666,10 +530,10 @@ class Immortality(Stockexchange):
                         current.close,
                         current.volume,
                     ]
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1)
             except Exception as e:
                 self.logger.error(f"Error in watch_ohlcv for {pair}/{timeframe}: {str(e)}")
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(5)
 
     def refresh_latest_ohlcv(self, pairs: list[str]) -> None:
         """Refreshes the latest OHLCV data, including real-time candles."""
@@ -681,7 +545,7 @@ class Immortality(Stockexchange):
                 )
                 candle_type = item[2] if isinstance(item, tuple) and len(item) > 2 else "spot"
 
-                ohlcv = self.get_ohlcv(pair, timeframe, limit=1000)
+                ohlcv = self.get_ohlcv(pair, timeframe, limit=200)
                 key = (pair, timeframe, candle_type)
 
                 if key in self.candle_builders:
@@ -707,12 +571,12 @@ class Immortality(Stockexchange):
                         ohlcv = ohlcv.drop_duplicates(subset="date").sort_values("date")
 
                 self.latest_ohlcv[key] = ohlcv
-                self.logger.info(f"Refreshed ohlcv for {pair}/{timeframe}, candles: {len(ohlcv)}")
+                self.logger.info(f"Refreshed OHLCV for {pair}/{timeframe}, candles: {len(ohlcv)}")
             except Exception as e:
                 self.logger.error(f"Failed to refresh OHLCV for {pair}/{timeframe}: {str(e)}")
 
     def interpolate_ohlcv(self, raw: list[list], timeframe: str) -> list[list]:
-        """Interpolates hourly OHLCV data to a specified target timeframe."""
+        """Interpolate hourly OHLCV data to a target timeframe."""
         target_seconds = self.timeframe_to_seconds(timeframe)
         if target_seconds >= 3600:
             return raw
@@ -722,10 +586,10 @@ class Immortality(Stockexchange):
         df.set_index("date", inplace=True)
 
         df = (
-            df.resample(f"{target_seconds // 60}T")
+            df.resample(f"{target_seconds // 60}min")
             .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
             .interpolate(method="linear")
-            .fillna(method="ffill")
+            .ffill()
         )
 
         df["high"] = df["high"] * 1.001
@@ -746,151 +610,153 @@ class Immortality(Stockexchange):
             )
         return result
 
-    def _fetch_and_process_ohlcv(
-        self, pair_str: str, timeframe: str, since_ms: int, limit: int
-    ) -> pd.DataFrame:
-        """Fetches and processes OHLCV data from NodeReal API."""
+    def _append_synthetic_candle_if_needed(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """Append a synthetic flat candle if the latest one is outdated."""
         try:
-            fetch_limit = min(limit, 100)  # Limit API calls to avoid rate limits
-            candles = fetch_ohlcv_nodereal(
-                self.api_key, PAIR_ADDRESS, fetch_limit, since_ms=since_ms
+            last_ts = df["date"].iloc[-1]
+            now_utc = pd.Timestamp.utcnow()
+            interval = pd.Timedelta(seconds=self.timeframe_to_seconds(timeframe))
+
+            if now_utc - last_ts >= interval:
+                price = df["close"].iloc[-1]
+                new_row = {
+                    "date": now_utc,
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "volume": 0.0,
+                }
+                df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                self.logger.debug(f"Appended synthetic candle at {now_utc} with price {price}")
+        except Exception as e:
+            self.logger.error(f"Failed to append synthetic candle: {e}")
+
+        return df
+
+    def _get_fallback_candle(self, timeframe: str, pair_str: str) -> pd.DataFrame:
+        """Return a fallback OHLCV DataFrame with synthetic price data."""
+        try:
+            current_price = self.get_price()
+        except ExchangeError as e:
+            self.logger.error(f"Failed to fetch fallback price: {str(e)}")
+            current_price = 0.00000001  # Emergency floor
+
+        ts = int(time.time() * 1000)
+        fallback = [
+            [
+                ts,
+                current_price,
+                current_price * 1.001,
+                current_price * 0.999,
+                current_price,
+                0.0,
+            ]
+        ]
+
+        return ohlcv_to_dataframe(
+            fallback,
+            timeframe,
+            pair_str,
+            fill_missing=False,
+            drop_incomplete=True,
+        )
+
+    def _validate_latest_price(self, df: pd.DataFrame, pair_str: str, timeframe: str) -> None:
+        """Log comparison between latest close price and current market price."""
+        try:
+            latest_close = df.iloc[-1]["close"]
+            current_price = self.get_price()
+            diff_pct = abs(latest_close - current_price) / current_price * 100
+            self.logger.debug(
+                f"Price validation for {pair_str}/{timeframe}: "
+                f"close={latest_close}, get_price={current_price}, diff={diff_pct:.2f}%"
             )
+        except ExchangeError as e:
+            self.logger.error(f"Price validation failed: {str(e)}")
+
+    def get_ohlcv(
+        self, pair: str | tuple, timeframe: str, since_ms: int = 0, limit: int = 200
+    ) -> pd.DataFrame:
+        """Fetches historical OHLCV data."""
+        if isinstance(pair, tuple):
+            pair_str = pair[0]
+            self.logger.debug(f"Received tuple pair {pair}, using pair_str={pair_str}")
+        else:
+            pair_str = pair
+
+        self.logger.debug(
+            "Fetching OHLCV: pair=%s, timeframe=%s, since_ms=%s, limit=%s",
+            pair_str,
+            timeframe,
+            since_ms,
+            limit,
+        )
+
+        if pair_str != "IMT/BNB":
+            raise OperationalException(f"Pair {pair_str} not supported")
+
+        if not self.api_key:
+            self.logger.error("NodeReal API key not provided in config.")
+            raise OperationalException("NodeReal API key is required for OHLCV data retrieval.")
+
+        now_s = time.time()
+        if now_s - self._last_call_time < self._min_interval:
+            to_sleep = self._min_interval - (now_s - self._last_call_time)
+            self.logger.info("Throttling NodeReal call; sleeping %.1fs", to_sleep)
+            time.sleep(to_sleep)
+        self._last_call_time = time.time()
+
+        try:
+            candles = fetch_ohlcv_nodereal(self.api_key, PAIR_ADDRESS, limit)
             if not candles:
                 self.logger.warning(
-                    f"No OHLCV data fetched for {pair_str}/{timeframe}, falling back to get_price"
+                    "No OHLCV data fetched for %s/%s, using fallback", pair_str, timeframe
                 )
-                try:
-                    current_price = self.get_price()
-                except ExchangeError as e:
-                    self.logger.error(f"Failed to fetch price: {str(e)}")
-                    current_price = 0.00000001  # Default price to prevent empty DataFrame
-                ts = int(time.time() * 1000)
-                candles = [
-                    [
-                        ts,
-                        current_price,
-                        current_price * 1.001,
-                        current_price * 0.999,
-                        current_price,
-                        0.0,
-                    ]
-                ]
+                return self._get_fallback_candle(timeframe, pair_str)
 
-            # Interpolate if timeframe is less than 1 hour
             if self.timeframe_to_seconds(timeframe) < 3600:
-                candles = self.interpolate_ohlcv(candles, timeframe)
-                self.logger.debug(f"Interpolated to {len(candles)} candles for {timeframe}")
+                raw_cap = 50
+                recent = candles[-raw_cap:]
+                candles = self.interpolate_ohlcv(recent, timeframe)
+                self.logger.debug("Interpolated to %d candles for %s", len(candles), timeframe)
 
             df = ohlcv_to_dataframe(
                 candles, timeframe, pair_str, fill_missing=True, drop_incomplete=True
             )
+
+            if since_ms:
+                df = df[df["date"].astype("int64") // 10**6 >= since_ms]
+
+            cutoff_ms = int(time.time() * 1000) - (90 * 24 * 3600 * 1000)
+            df = df[(df["date"].astype("int64") // 10**6) >= cutoff_ms]
+
+            if df.empty:
+                self.logger.warning(
+                    "Empty OHLCV DataFrame after filtering for %s/%s, using fallback",
+                    pair_str,
+                    timeframe,
+                )
+                return self._get_fallback_candle(timeframe, pair_str)
+
+            self.logger.debug("OHLCV DataFrame sample:\n%s", df.head(5).to_string())
+
+            self._validate_latest_price(df, pair_str, timeframe)
+
+            self.logger.info("Retrieved %d candles for %s/%s", len(df), pair_str, timeframe)
+
+            df = self._append_synthetic_candle_if_needed(df, timeframe)
+
+            if len(df) > 200:
+                df = df.tail(200)
+                self.logger.debug("Trimmed returned OHLCV DataFrame to last 200 rows")
+
             return df
+
         except Exception as e:
-            self.logger.error(f"Error fetching OHLCV for {pair_str}/{timeframe}: {str(e)}")
-            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            self.logger.error("Error fetching OHLCV for %s/%s: %s", pair_str, timeframe, str(e))
+            self.logger.error("Traceback: %s", traceback.format_exc())
             return pd.DataFrame()
-
-    def _filter_and_cache_ohlcv(
-        self,
-        pair_str: str,
-        timeframe: str,
-        df: pd.DataFrame,
-        cached_df: pd.DataFrame,
-        since_ms: int,
-    ) -> pd.DataFrame:
-        """Filters, caches, and validates OHLCV data."""
-        # Combine with cached data
-        if not cached_df.empty:
-            df = pd.concat([cached_df, df]).drop_duplicates(subset="date").sort_values("date")
-            self.logger.debug(f"Combined {len(cached_df)} cached and {len(df)} new candles")
-
-        # Filter by since_ms
-        if since_ms:
-            df = df[df["date"].astype("int64") // 10**6 >= since_ms]
-
-        # Filter out old data (90 days)
-        now_ms = int(time.time() * 1000)
-        cutoff_ms = now_ms - (CACHE_MAX_AGE_SECONDS * 1000)
-        df = df[(df["date"].astype("int64") // 10**6) >= cutoff_ms]
-
-        # Save cached data
-        if not df.empty:
-            self._save_cached_ohlcv(pair_str, timeframe, df)
-
-        # Log a sample of the OHLCV DataFrame
-        self.logger.debug(
-            f"OHLCV DataFrame sample for {pair_str}/{timeframe}:\n{df.head(5).to_string()}"
-        )
-
-        # Compare latest close price with get_price
-        try:
-            if not df.empty:
-                latest_close = df.iloc[-1]["close"]
-                current_price = self.get_price()
-                if current_price:
-                    price_diff = abs(latest_close - current_price) / current_price * 100
-                    self.logger.debug(
-                        f"Price validation for {pair_str}/{timeframe}: "
-                        f"Latest DataFrame close={latest_close}, get_price={current_price}, "
-                        f"difference={price_diff:.2f}%"
-                    )
-        except ExchangeError as e:
-            self.logger.error(f"Price validation failed: {str(e)}")
-
-        self.logger.info(
-            f"Retrieved {len(df)} candles for {pair_str}/{timeframe} "
-            f"(cached: {len(cached_df)}, new: {len(df)})"
-        )
-        return df
-
-    def get_ohlcv(
-        self, pair: str | tuple, timeframe: str, since_ms: int = 0, limit: int = 1000
-    ) -> pd.DataFrame:
-        """Fetches historical OHLCV data, using cache if available."""
-        # Handle tuple input from DataProvider
-        if isinstance(pair, tuple):
-            pair_str = pair[0]  # Extract pair (e.g., "IMT/BNB")
-            self.logger.debug(f"Received invalid tuple pair {pair}, using pair_str={pair_str}")
-        else:
-            pair_str = pair
-        self.logger.debug(
-            f"Fetching OHLCV for pair={pair_str}, timeframe={timeframe}, "
-            f"since_ms={since_ms}, limit={limit}"
-        )
-        if pair_str != "IMT/BNB":
-            raise OperationalException(f"Pair {pair_str} not supported")
-
-        api_key = self.api_key
-        if not api_key:
-            self.logger.error(
-                "NodeReal API key not provided in config.json. "
-                "Please add 'nodereal_api_key' to config.json."
-            )
-            raise OperationalException("NodeReal API key is required for OHLCV data retrieval.")
-
-        # Load cached data
-        cached_df = self._load_cached_ohlcv(pair_str, timeframe)
-        last_cached_ms = 0
-        if not cached_df.empty:
-            last_cached_ms = int(cached_df["date"].max().timestamp() * 1000)
-            self.logger.debug(
-                f"Last cached timestamp: {last_cached_ms} ({cached_df['date'].max()})"
-            )
-
-        # Throttle API calls
-        now_s = time.time()
-        if now_s - self._last_call_time < self._min_interval:
-            to_sleep = self._min_interval - (now_s - self._last_call_time)
-            self.logger.info(f"Throttling NodeReal call; sleeping {to_sleep:.1f}s")
-            time.sleep(to_sleep)
-        self._last_call_time = int(time.time())
-
-        # Fetch and process new data
-        df = self._fetch_and_process_ohlcv(pair_str, timeframe, last_cached_ms, limit)
-
-        # Filter, cache, and validate
-        df = self._filter_and_cache_ohlcv(pair_str, timeframe, df, cached_df, since_ms)
-        return df
 
     def klines(
         self,
@@ -904,16 +770,17 @@ class Immortality(Stockexchange):
         Fetches OHLCV data for a given pair and timeframe.
 
         Args:
-            pair (str or tuple): The trading pair...
+            pair (str or tuple): Trading pair
             (e.g., "IMT/BNB" or ("IMT/BNB", timeframe, candle_type)).
             timeframe (str, optional): Timeframe for the candles (e.g., "1m", "5m", "1h").
-            since (int, optional): Start time in milliseconds since epoch.
-            limit (int, optional): Maximum number of candles to fetch.
+            Defaults to config timeframe.
+            since (int, optional): Start time in milliseconds since epoch. Defaults to None.
+            limit (int, optional): Maximum number of candles to fetch. Defaults to None.
 
         Returns:
             pd.DataFrame: A pandas DataFrame containing OHLCV data.
         """
-        # Handle tuple input
+        # Handle tuple input from DataProvider
         if isinstance(pair, tuple):
             pair_str = pair[0]  # Extract pair (e.g., "IMT/BNB")
             if len(pair) > 1 and pair[1] and timeframe is None:
@@ -924,26 +791,25 @@ class Immortality(Stockexchange):
         if timeframe is None:
             timeframe = self.config.get("timeframe", "1h")
             self.logger.info(
-                f"No timeframe specified for {pair_str}, using default from config: {timeframe}"
+                f"No timeframe provided for {pair_str}, using default from config: {timeframe}"
             )
         self.logger.debug(
-            f"Calling klines for pair={pair_str}, timeframe={timeframe}, "
-            f"since={since}, limit={limit}"
+            f"Calling klines: pair={pair_str}, timeframe={timeframe}, since={since}, limit={limit}"
         )
         try:
             self.validate_timeframes(timeframe)
-            since_ms = since or 0
-            limit = limit or 1000
+            since_ms = since if since is not None else 0
+            limit = min(limit or cast(int, self._ft_has_default["ohlcv_candle_limit"]), 200)
             return self.get_ohlcv(pair_str, timeframe, since_ms, limit)
         except Exception as e:
-            self.logger.error(f"Error processing klines for {pair_str}/{timeframe}: {str(e)}")
+            self.logger.error(f"Error in klines for {pair_str}/{timeframe}: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
             return pd.DataFrame()
 
     def validate_timeframes(self, timeframe: str) -> None:
         """Validates that the timeframe is supported."""
-        supported_timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-        if timeframe not in supported_timeframes:
+        supported = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+        if timeframe not in supported:
             raise OperationalException(f"Timeframe {timeframe} not supported")
 
     @staticmethod
@@ -954,18 +820,15 @@ class Immortality(Stockexchange):
         unit = timeframe[-1]
         return num * units[unit]
 
-    def ws_connection_reset(self):
-        """Resets WebSocket connection."""
+    def ws_connection_reset(self) -> None:
+        """Resets the WebSocket connection."""
         self.logger.info("WebSocket reset requested")
         if self._exchange_ws:
             try:
                 self._exchange_ws.close()
             except Exception as e:
                 self.logger.error(f"Error closing WebSocket: {str(e)}")
-            finally:
-                self._exchange_ws = None
-        # Delay to prevent rapid reconnection loops
-        time.sleep(2)
+            self._exchange_ws = None
         try:
             self._configure_ws()
         except Exception as e:
@@ -980,21 +843,16 @@ class Immortality(Stockexchange):
     def get_proxy_coin(self) -> str:
         return self.config["stake_currency"]
 
-    def get_proxy_currency(self) -> str:
-        return self.config["stake_currency"]
-
     def get_markets(self):
-        amount8 = 8  # Define amount8 for precision
         return {
             "IMT/BNB": {
-                "name": "IMT/BNB",
                 "id": "IMT/BNB",
                 "symbol": "IMT/BNB",
                 "base": "IMT",
                 "quote": "BNB",
                 "active": True,
                 "spot": True,
-                "precision": {"amount": amount8, "price": 8},
+                "precision": {"amount": 8, "price": 8},
                 "limits": {
                     "amount": {"min": 0.001, "max": 1000000},
                     "price": {"min": 0.00000001, "max": 1000000},
@@ -1003,14 +861,14 @@ class Immortality(Stockexchange):
         }
 
     def reload_markets(self) -> None:
-        self.logger.info("Reload markets called — no action required for Immortality.")
+        self.logger.info("reload_markets called — no action required for Immortality.")
 
     def market_is_tradable(self, market: dict[str, Any]) -> bool:
         return market.get("active", False) and market.get("spot", False)
 
     def fetch_positions(self) -> list[dict]:
         """Returns an empty list as spot trading does not use positions."""
-        self.logger.debug("Fetching positions called — returning empty list for spot trading")
+        self.logger.debug("fetch_positions called — returning empty list for spot trading")
         return []
 
     @property
@@ -1030,7 +888,7 @@ class Immortality(Stockexchange):
             amt = self.w3.to_wei(1, "ether")
             out = self.router.functions.getAmountsOut(amt, [IMMORTALITY_ADDR, WBNB_ADDR]).call()
             tokens = out[1] / 10**18  # BNB decimals
-            self.logger.debug(f"Fetched price: {tokens:.2f} BNB/IMT")
+            self.logger.debug(f"Fetched price: {tokens} BNB/IMT")
             return tokens  # BNB/IMT price
         except Exception as e:
             self.logger.error(f"Price fetch error: {str(e)}")
@@ -1040,9 +898,9 @@ class Immortality(Stockexchange):
         try:
             price = self.get_price()
             return {"bid": price, "ask": price, "last": price}
-        except ExchangeError as e:
-            self.logger.error(f"Ticker fetch error: {str(e)}")
-            raise ExchangeError(f"Failed to fetch ticker: {str(e)}")
+        except Exception as e:
+            self.logger.error(f"Price fetch error: {e}")
+            raise ExchangeError(f"Failed to fetch ticker: {e}")
 
     @retrier
     def buy(
@@ -1078,7 +936,7 @@ class Immortality(Stockexchange):
             balance = self.token.functions.balanceOf(self.wallet).call()
             if balance < units:
                 raise InsufficientFundsError(
-                    f"Insufficient IMT balance: "
+                    "Insufficient IMT balance: "
                     f"{balance / (10 ** self.token.functions.decimals().call())} IMT available"
                 )
             if self.token.functions.allowance(self.wallet, PANCAKESWAP_ROUTER_ADDR).call() < units:
@@ -1101,15 +959,124 @@ class Immortality(Stockexchange):
             raise ExchangeError(f"Sell order failed: {str(e)}")
 
     def get_balances(self) -> dict:
+        """
+        Fetch account balances for BNB and IMT.
+
+        Returns:
+            dict: Dictionary of balances in Freqtrade-compatible format.
+                  In dry run mode, returns a fake BNB balance equal to stake_amount.
+        """
+        # —————————————————————————————————————————————————————————————
+        # In dry run mode, pretend we have exactly stake_amount BNB available
+        # so Freqtrade can create its entry orders unimpeded.
+        if getattr(self, "dry_run", False):
+            stake_amt = float(self.config.get("stake_amount", 0.0))
+            fake_balances = {
+                "BNB": {"free": stake_amt, "used": 0.0, "total": stake_amt},
+                "IMT": {"free": 0.0, "used": 0.0, "total": 0.0},
+            }
+            self.logger.info(f"Dry-run mode: faking BNB balance = {stake_amt}")
+            return fake_balances
+        # —————————————————————————————————————————————————————————————
+        # Live mode: query on chain balances as before
         try:
-            bnb_bal = self.w3.eth.get_balance(self.wallet) / 10**18
-            imt_bal = self.token.functions.balanceOf(self.wallet).call() / (
-                10 ** self.token.functions.decimals().call()
-            )
-            return {"BNB": bnb_bal, "IMT": imt_bal}
+            bnb_balance_wei = self.w3.eth.get_balance(self.wallet)
+            bnb_balance = self.w3.from_wei(bnb_balance_wei, "ether")
+            imt_balance_raw = self.token.functions.balanceOf(self.wallet).call()
+            imt_balance = imt_balance_raw / 10**IMT_DECIMALS
+
+            balances = {
+                "BNB": {"free": float(bnb_balance), "used": 0.0, "total": float(bnb_balance)},
+                "IMT": {"free": float(imt_balance), "used": 0.0, "total": float(imt_balance)},
+            }
+            self.logger.debug(f"Fetched balances: {balances}")
+            self.logger.info(f"BNB Balance: {bnb_balance}, IMT Balance: {imt_balance}")
+            return balances
         except Exception as e:
             self.logger.error(f"Failed to fetch balances: {str(e)}")
             raise ExchangeError(f"Failed to fetch balances: {str(e)}")
+
+    def get_balance(self) -> dict:
+        return self.get_balances()
+
+    def get_conversion_rate(self, currency: str, stake_currency: str) -> float:
+        """
+        Return the conversion rate from the given currency to the stake currency.
+        Used by the RPC balance endpoint to estimate needed stake amounts.
+        """
+        # In dry run or for unsupported pairs, just return 1.0
+        if currency == stake_currency:
+            return 1.0
+
+        # For IMT BNB, use your on chain price fetch
+        if currency == "IMT" and stake_currency == "BNB":
+            try:
+                rate = self.get_price()
+                self.logger.debug(f"Conversion rate IMT→BNB: {rate}")
+                return rate
+            except Exception as e:
+                self.logger.error(f"Failed to get conversion rate: {e}")
+                return 1.0
+
+        # Fallback for any other currencies
+        self.logger.warning(
+            f"Conversion rate from {currency} to {stake_currency} not supported, defaulting to 1.0"
+        )
+        return 1.0
+
+    def get_rate(self, pair: str, side: str = "buy", **kwargs) -> float:
+        """
+        Return the current market rate for the given pair.
+        Freqtrade calls this during entry validation (get_valid_enter_price_and_stake).
+        """
+        try:
+            # We only support IMT/BNB, and `get_price()` fetches that price (BNB per IMT).
+            rate = self.get_price()
+            self.logger.debug(f"get_rate() called for {pair}, side={side}: {rate}")
+            return rate
+        except Exception as e:
+            self.logger.error(f"Failed to get rate for {pair}: {e}")
+            # Fallback to 0 (will be caught later as invalid)
+            return 0.0
+
+    def get_min_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
+        # def get_min_pair_stake_amount(self, pair: str) -> float:
+        """
+        Return the minimum stake amount (in BNB) for the given pair.
+        Freqtrade uses this to validate the minimum required BNB per trade.
+        """
+        # If stake_amount is configured globally, use that
+        stake_amount = self.config.get("stake_amount")
+        if stake_amount is not None:
+            try:
+                return float(stake_amount)
+            except (ValueError, TypeError):
+                self.logger.warning(
+                    f"Invalid stake_amount in config: {stake_amount}, defaulting to 0"
+                )
+        # Fallback: require at least a tiny amount
+        default_min = 0.0001
+        self.logger.debug(f"No valid stake_amount found, using default min stake {default_min}")
+        return default_min
+
+    def get_max_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
+        """
+        Return the maximum stake amount (in BNB) for the given pair.
+        Accepts extra args/kwargs from Freqtrade without error.
+        """
+        # If a global stake_amount is configured, use that as max too
+        stake_amount = self.config.get("stake_amount")
+        if stake_amount is not None:
+            try:
+                return float(stake_amount)
+            except (ValueError, TypeError):
+                self.logger.warning(
+                    f"Invalid stake_amount in config: {stake_amount}, defaulting to unlimited"
+                )
+        # Fallback: no enforced max (use a very large number)
+        max_default = float("inf")
+        self.logger.debug("No valid stake_amount found, using no max limit")
+        return max_default
 
     def get_order(self, order_id: str, pair: str) -> dict:
         try:
@@ -1133,9 +1100,177 @@ class Immortality(Stockexchange):
         self.logger.warning(f"Cancel order not supported for {pair}/{order_id}")
         return {"order_id": order_id, "status": "canceled"}
 
-    def get_fee(self, pair: str, fee_type: str) -> float:
-        return 0.005
+    def get_fee(self, symbol: str, taker_or_maker: str = "taker", **kwargs) -> float:
+        # inspect `taker_or_maker` here
+        return 0.005  # 0.5% default fee
 
     @property
     def markets(self):
-        return self.get_markets()
+        return {
+            "IMT/BNB": {
+                "id": "IMT/BNB",
+                "symbol": "IMT/BNB",
+                "base": "IMT",
+                "quote": "BNB",
+                "active": True,
+                "spot": True,
+                "precision": {"amount": 8, "price": 8},
+                "limits": {
+                    "amount": {"min": 0.001, "max": 1000000},
+                    "price": {"min": 0.00000001, "max": 1000000},
+                },
+            }
+        }
+
+    def create_order(
+        self,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        params: dict | None = None,
+        **kwargs,
+    ) -> dict:
+        params = params or {}
+        otype = ordertype.lower()
+        # Convert limit orders to market
+        if otype == "limit":
+            self.logger.warning(f"Converting limit order to market for {pair}")
+            otype = "market"
+        if otype != "market":
+            raise OperationalException(
+                f"Order type {ordertype} not supported; only 'market' or 'limit' allowed"
+            )
+
+        time_in_force = params.pop("time_in_force", "gtc")
+
+        # ——— Dry run branch ———
+        if getattr(self, "dry_run", False):
+            self.logger.info(
+                f"Dry run: simulating {side} order for {pair}, amount={amount}, price={price}"
+            )
+            current_price = self.get_price()
+            fee_rate = self.get_fee(pair, fee_type="taker")
+            cost = amount * current_price
+            fee_cost = cost * fee_rate
+            ts = int(time.time() * 1000)
+            return {
+                "id": f"dry_run_{ts}_{side}",
+                "symbol": pair,
+                "type": "market",
+                "side": side,
+                "price": current_price,
+                "amount": amount,
+                "filled": amount,
+                "remaining": 0.0,
+                "status": "closed",
+                "cost": amount * current_price,
+                "fee": {
+                    "cost": fee_cost,
+                    "currency": self.config.get("stake_currency", "BNB"),
+                    "rate": fee_rate,
+                    "type": "taker",
+                },
+                "timestamp": ts,
+                "datetime": pd.to_datetime(ts, unit="ms").isoformat(),
+                "info": {"dry_run": True},
+            }
+        # ——— Live mode branch ———
+        if side.lower() == "buy":
+            actual_price = price if price is not None else 0.0
+            return self.buy(pair, amount, actual_price, time_in_force=time_in_force, **params)
+        elif side.lower() == "sell":
+            actual_price = price if price is not None else 0.0
+            return self.sell(pair, amount, actual_price, time_in_force=time_in_force, **params)
+        else:
+            raise OperationalException(f"Invalid side: {side}")
+
+    def get_pair_base_currency(self, pair: str) -> str:
+        if pair == "IMT/BNB":
+            return "IMT"
+        raise OperationalException(f"Unsupported pair: {pair}")
+
+    def get_funding_fees(self, pair: str, **kwargs) -> float:
+        side = kwargs.get("side", "")
+        amount = kwargs.get("amount", 0.0)
+        price = kwargs.get("price", 0.0)
+        self.logger.debug(
+            f"get_funding_fees called for {pair}, side={side}, amount={amount}, price={price}"
+        )
+        return 0.0
+
+    def get_precision_amount(self, pair: str) -> int:
+        """
+        Return the precision (decimal places) for the amount of the base asset.
+        Freqtrade uses this when rounding order amounts.
+        """
+        return DECIMAL_PLACES
+
+    def get_precision_price(self, pair: str) -> int:
+        """
+        Return the precision for the price of the quote asset.
+        """
+        return DECIMAL_PLACES  # Or adjust as needed for BNB
+
+    @property
+    def precisionMode(self):
+        return DECIMAL_PLACES
+
+    @property
+    def precision_mode_price(self):
+        return self.precisionMode
+
+    def get_contract_size(self, pair):
+        return 1
+
+    def check_order_canceled_empty(self, order: dict) -> bool:
+        if not order:
+            return True
+        status = order.get("status", "").lower()
+        return status in ["canceled", "cancelled", "not-found"]
+
+    def order_has_fee(self, order: dict) -> bool:
+        return True
+
+    def extract_cost_curr_rate(self, *args, **kwargs) -> tuple[float, str, float]:
+        self.logger.debug("Immortality.extract_cost_curr_rate called.")
+        self.logger.debug(f"  args: {args}")
+        self.logger.debug(f"  kwargs: {kwargs}")
+        cost = 0.0
+        currency = self.config.get("stake_currency", "BNB")
+        rate = 0.0
+        if args and len(args) > 0 and isinstance(args[0], dict) and "cost" in args[0]:
+            fee_info = args[0]
+            cost = float(fee_info.get("cost", 0.0))
+            currency = fee_info.get("currency", currency)
+        elif args and len(args) > 2:
+            arg_cost = args[2]
+            try:
+                cost = float(arg_cost)
+            except (ValueError, TypeError):
+                self.logger.warning(f"Could not convert args[2] '{arg_cost}' to float for cost.")
+                cost = 0.0
+        self.logger.debug(
+            f"extract_cost_curr_rate returning cost={cost}, currency={currency}, rate={rate}"
+        )
+        return cost, currency, rate
+
+    @property
+    def margin_mode(self):
+        return None
+
+    def get_liquidation_price(
+        self,
+        pair,
+        amount,
+        current_price=None,
+        order_side=None,
+        order_type=None,
+        open_rate=None,
+        is_short=None,
+        stake_amount=None,
+        leverage=None,
+        wallet_balance=None,
+    ):
+        return None
