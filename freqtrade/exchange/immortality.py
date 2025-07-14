@@ -28,7 +28,7 @@ IMMORTALITY_ADDR = Web3.to_checksum_address("0x2bF2141eD175f3236903cF07de33D7324
 PAIR_ADDRESS = Web3.to_checksum_address(
     "0xfA56E9AbcaA45207bE5E43cF475Ee061768CA915"
 )  # IMT/BNB pair
-MIN_INTERVAL = 80.0  # seconds between NodeReal calls
+MIN_INTERVAL = 60.0  # seconds between NodeReal calls
 NODEREAL_FREE_URL = "https://open-platform.nodereal.io/{api_key}/pancakeswap-free/graphql"
 
 # Trading parameters
