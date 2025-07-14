@@ -311,6 +311,7 @@ class Immortality(Stockexchange):
             raise OperationalException("Cannot connect to BSC RPC")
         self.latest_ohlcv: dict[tuple[str, str, str], pd.DataFrame] = {}
         self._last_call_time = 0.0
+        self._last_price: float | None = None
         self._min_interval = MIN_INTERVAL
         self.candle_builders: dict[tuple[str, str], CandleBuilder] = {}
         try:
@@ -1035,12 +1036,21 @@ class Immortality(Stockexchange):
         try:
             amt = self.w3.to_wei(1, "ether")
             out = self.router.functions.getAmountsOut(amt, [IMMORTALITY_ADDR, WBNB_ADDR]).call()
-            tokens = out[1] / 10**18  # BNB decimals
-            self.logger.debug(f"Fetched price: {tokens} BNB/IMT")
-            return tokens  # BNB/IMT price
+            price = out[1] / 10**18
+            # **Cache it on success**
+            self._last_price = price
+            self.logger.debug(f"Fetched price: {price} BNB/IMT")
+            return price
         except Exception as e:
             self.logger.error(f"Price fetch error: {str(e)}")
-            raise ExchangeError(f"Failed to fetch price: {str(e)}")
+            # **Fall back to last known good price if available**
+            if self._last_price is not None:
+                self.logger.warning(
+                    f"Using last known price {self._last_price} due to fetch failure"
+                )
+                return self._last_price
+            # **If no cache, escalate the error**
+            raise ExchangeError(f"Failed to fetch price and no cache available: {str(e)}")
 
     def get_ticker(self, pair: str, refresh: bool | None = None) -> dict:
         try:
@@ -1177,15 +1187,17 @@ class Immortality(Stockexchange):
         Return the current market rate for the given pair.
         Freqtrade calls this during entry validation (get_valid_enter_price_and_stake).
         """
+        # Now get_price either returns a real price or raises
         try:
             # We only support IMT/BNB, and `get_price()` fetches that price (BNB per IMT).
             rate = self.get_price()
             self.logger.debug(f"get_rate() called for {pair}, side={side}: {rate}")
             return rate
-        except Exception as e:
+        except ExchangeError as e:
             self.logger.error(f"Failed to get rate for {pair}: {e}")
-            # Fallback to 0 (will be caught later as invalid)
-            return 0.0
+            # Bubble up so the RPC layer can handle missing price,
+            # instead of returning zero and triggering a ZeroDivisionError
+            raise
 
     def get_min_pair_stake_amount(self, pair: str, *args, **kwargs) -> float:
         # def get_min_pair_stake_amount(self, pair: str) -> float:
