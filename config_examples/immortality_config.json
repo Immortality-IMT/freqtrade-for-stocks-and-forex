@@ -1,15 +1,13 @@
-//pip install freqtrade web3.py requests numpy ta-lib
-//freqtrade trade --strategy ImmortalityStrategy --config user_data/config.json
-//https://open-platform.nodereal.io/c9bbfff8eb53496480d5e15186a11371/pancakeswap-free/graphql
 {
     "$schema": "https://schema.freqtrade.io/schema.json",
     "max_open_trades": 10,
     "stake_currency": "BNB",
-    "stake_amount": 0.005,
+    "stake_amount": 0.004,
     "fiat_display_currency": "USD",
     "dry_run": true,
     "db_url": "sqlite:///tradesv3.immortality.dryrun.sqlite",
-    "dry_run_wallet": 100000,
+    "dry_run_wallet": 1.5,
+    "timeframe": "5m",
     "cancel_open_orders_on_exit": false,
     "trading_mode": "spot",
     "margin_mode": "",
@@ -32,10 +30,10 @@
         }
     },
     "exchange": {
-        "name": "Immortality",
-        "key": "<YOUR_PUBLIC_KEY>",
-        "secret": "<YOUR_PRIVATE_KEY>",
-        "api_key": "<YOUR API KEY>",  // bsc-chain or eth-chain
+        "name": "immortality",
+        "key": "<WALLET_PUBLIC_KEY_ADDRESS>",
+        "secret": "<WALLET_PRIVATE_KEY_ADDRESS>",
+        "api_key": "<NODEREAL.IO API KEY>",
         "pair_whitelist": ["IMT/BNB"],
         "pair_blacklist": ["ETH/USDT", "BNB/BTC"],
     },
