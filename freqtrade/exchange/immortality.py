@@ -306,6 +306,7 @@ class Immortality(Stockexchange):
         self.logger = logging.getLogger(__name__)
         self.logger.debug(f"Full configuration: {config}")  # Debug config loading
         self.dry_run = config.get("dry_run", False)
+        self.slippage_tolerance = config.get("slippage_tolerance", 0.05)  # Default 5%
         self.api_key_value = None  # Cache HTTP API key
         self.ws_api_key_value = None  # Cache WebSocket API key
         self.w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL.format(api_key=self.api_key)))
@@ -316,6 +317,13 @@ class Immortality(Stockexchange):
         self._last_price: float | None = None
         self._min_interval = MIN_INTERVAL
         self.candle_builders: dict[tuple[str, str], CandleBuilder] = {}
+        cache_path = "user_data/data/immortality/cache_IMT-BNB_5m.csv"
+        try:
+            df = pd.read_csv(cache_path, parse_dates=["date"])
+            self.latest_ohlcv[("IMT/BNB", "5m", "spot")] = df
+            self.logger.info(f"Loaded OHLCV cache from {cache_path}, {len(df)} rows")
+        except FileNotFoundError:
+            self.logger.info(f"No cache file found at {cache_path}, starting empty")
         try:
             self._configure_ws()
             self.logger.info("Immortality exchange initialized")
@@ -841,12 +849,15 @@ class Immortality(Stockexchange):
     def get_ohlcv(
         self, pair: str | tuple, timeframe: str, since_ms: int = 0, limit: int = 200
     ) -> pd.DataFrame:
-        """Fetches historical OHLCV data."""
+        """Fetches historical OHLCV data, merges with cache, generates synthetic candles on failure,
+        and persists the latest 200 candles to disk."""
         try:
+            # Prepare cache and throttle timing
             pair_str, since_ms, cached_df = self.prepare_cache_and_throttle(
                 pair, timeframe, since_ms
             )
 
+            # Determine fetch limit: full or incremental
             fetch_limit = 10 if since_ms > 0 else limit
             candles = fetch_ohlcv_nodereal(self.api_key, PAIR_ADDRESS, fetch_limit)
 
@@ -882,20 +893,27 @@ class Immortality(Stockexchange):
                             pair_str,
                             timeframe,
                         )
-                        return df.tail(200)
+                        # Persist and return
+                        return self._persist_and_return(df, pair_str, timeframe)
                 return self._get_fallback_candle(timeframe, pair_str)
 
+            # Interpolate if timeframe < 1h
             if self.timeframe_to_seconds(timeframe) < 3600:
                 raw_cap = 50 if since_ms == 0 else 10
                 recent = candles[-raw_cap:]
                 candles = self.interpolate_ohlcv(recent, timeframe)
                 self.logger.debug("Interpolated to %d candles for %s", len(candles), timeframe)
 
+            # Build DataFrame
             df = ohlcv_to_dataframe(
                 candles, timeframe, pair_str, fill_missing=True, drop_incomplete=True
             )
 
-            return self.process_and_filter_dataframe(df, cached_df, since_ms, pair_str, timeframe)
+            # Merge, filter, validate, append synthetic, trim to 200
+            df = self.process_and_filter_dataframe(df, cached_df, since_ms, pair_str, timeframe)
+
+            # Persist to disk and return final DataFrame
+            return self._persist_and_return(df, pair_str, timeframe)
 
         except requests.HTTPError as e:
             if e.response.status_code == 429:
@@ -908,6 +926,24 @@ class Immortality(Stockexchange):
             self.logger.error("Error fetching OHLCV for %s/%s: %s", pair_str, timeframe, str(e))
             self.logger.error("Traceback: %s", traceback.format_exc())
             return pd.DataFrame()
+
+    def _persist_and_return(self, df: pd.DataFrame, pair_str: str, timeframe: str) -> pd.DataFrame:
+        """Helper to trim, cache in memory, write to disk, and return."""
+        # Keep only last 200 candles
+        df = df.tail(200)
+        cache_key = (pair_str, timeframe, "spot")
+        self.latest_ohlcv[cache_key] = df
+
+        # Persist to CSV
+        cache_path = (
+            f"user_data/data/immortality/cache_{pair_str.replace('/', '-')}_{timeframe}.csv"
+        )
+        try:
+            df.to_csv(cache_path, index=False)
+            self.logger.debug(f"Persisted OHLCV cache to {cache_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to write OHLCV cache to {cache_path}: {e}")
+        return df
 
     def klines(
         self,
@@ -1069,7 +1105,8 @@ class Immortality(Stockexchange):
         try:
             amt_wei = self.w3.to_wei(amount, "ether")
             out = self.router.functions.getAmountsOut(amt_wei, [WBNB_ADDR, IMMORTALITY_ADDR]).call()
-            min_out = int(out[-1] * 0.9 * 0.95)
+            # min_out = int(out[-1] * 0.9 * 0.95)
+            min_out = int(out[-1] * (1 - self.slippage_tolerance))
             fn = self.router.functions.swapExactETHForTokensSupportingFeeOnTransferTokens(
                 min_out, [WBNB_ADDR, IMMORTALITY_ADDR], self.wallet, int(time.time()) + 120
             )
@@ -1108,7 +1145,8 @@ class Immortality(Stockexchange):
                 )
                 time.sleep(RPC_SYNC_DELAY_SECONDS)
             out = self.router.functions.getAmountsOut(units, [IMMORTALITY_ADDR, WBNB_ADDR]).call()
-            min_bnb = int(out[-1] * 0.95)
+            # min_bnb = int(out[-1] * 0.95)
+            min_bnb = int(out[-1] * (1 - self.slippage_tolerance))
             fn = self.router.functions.swapExactTokensForETHSupportingFeeOnTransferTokens(
                 units, min_bnb, [IMMORTALITY_ADDR, WBNB_ADDR], self.wallet, int(time.time()) + 120
             )
@@ -1294,6 +1332,7 @@ class Immortality(Stockexchange):
         params: dict | None = None,
         **kwargs,
     ) -> dict:
+        self.logger.warning("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! CREATE ORDER")
         params = params or {}
         otype = ordertype.lower()
         # Convert limit orders to market
