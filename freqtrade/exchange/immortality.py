@@ -1118,15 +1118,38 @@ class Immortality(Stockexchange):
         self, pair: str, amount: float, rate: float, time_in_force: str = "gtc", **kwargs
     ) -> dict:
         try:
-            # Calculate required BNB to buy the desired IMT amount
-            required_bnb = amount * rate  # amount (IMT) * rate (BNB/IMT) = BNB
-            amt_wei = self.w3.to_wei(required_bnb, "ether")  # Convert BNB to wei
-            path = [WBNB_ADDR, IMMORTALITY_ADDR]
+            # Fetch current market price
+            current_price = self.get_price()
+            self.logger.debug(f"Current market price: {current_price} BNB/IMT")
+            actual_rate = rate if rate > 0 else current_price
 
-            # Estimate IMT output and apply slippage tolerance
+            # Calculate required BNB
+            required_bnb = amount * actual_rate
+            amt_wei = self.w3.to_wei(required_bnb, "ether")
+            self.logger.debug(
+                f"Calculated: amount={amount} IMT, rate={actual_rate},"
+                f"required_bnb={required_bnb}, amt_wei={amt_wei}"
+            )
+
+            # Check BNB balance
+            balances = self.get_balances()
+            bnb_balance = balances["BNB"]["free"]
+            estimated_gas_cost = self.w3.to_wei(0.0005, "ether")
+            total_required_wei = amt_wei + estimated_gas_cost
+            if self.w3.from_wei(total_required_wei, "ether") > bnb_balance:
+                raise ExchangeError(
+                    f"Insufficient BNB balance: {bnb_balance} BNB available, "
+                    f"{self.w3.from_wei(total_required_wei, 'ether')} BNB required"
+                )
+
+            path = [WBNB_ADDR, IMMORTALITY_ADDR]
             out = self.router.functions.getAmountsOut(amt_wei, path).call()
             min_out = int(out[-1] * (1 - self.slippage_tolerance))
-            deadline = int(time.time()) + 180  # 3 minutes
+            self.logger.debug(
+                f"Estimated output: {out[-1] / 10**IMT_DECIMALS} IMT,"
+                f"min_out={min_out / 10**IMT_DECIMALS}"
+            )
+            deadline = int(time.time()) + 180
 
             # Dry run simulation
             try:
@@ -1150,11 +1173,11 @@ class Immortality(Stockexchange):
             )
 
             # Record results
-            decimals = self.token.functions.decimals().call()  # IMT decimals (8)
-            real_amount = out[-1] / (10**decimals)  # Estimated IMT received
+            decimals = self.token.functions.decimals().call()
+            real_amount = out[-1] / (10**decimals)
             self._last_buy_amount = real_amount
-            cost = required_bnb  # Actual BNB spent
-            fee = {"cost": 0.0, "currency": "BNB"}  # Gas fee (could be refined from receipt)
+            cost = required_bnb
+            fee = {"cost": 0.0, "currency": "BNB"}
 
             return {
                 "id": tx_hash,
@@ -1162,7 +1185,7 @@ class Immortality(Stockexchange):
                 "symbol": pair,
                 "type": "market",
                 "side": "buy",
-                "price": rate,
+                "price": actual_rate,
                 "amount": real_amount,
                 "filled": real_amount,
                 "remaining": 0.0,
