@@ -5,7 +5,7 @@
     "stake_amount": 0.004,
     "fiat_display_currency": "USD",
     "dry_run": false,
-    "slippage_tolerance": 0.03,
+    "slippage_tolerance": 0.15,
     "db_url": "sqlite:///tradesv3.immortality.dryrun.sqlite",
     "dry_run_wallet": 1.5,
     "timeframe": "5m",
@@ -22,9 +22,9 @@
         }
     },
     "exit_pricing": {
-    "price_side": "bid",
-    "use_order_book": false,
-    "order_book_top": 1,
+        "price_side": "bid",
+        "use_order_book": false,
+        "order_book_top": 1,
         "check_depth_of_market": {
           "bids": 1,
           "asks": 1
