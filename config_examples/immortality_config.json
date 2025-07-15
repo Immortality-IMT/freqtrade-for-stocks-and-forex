@@ -4,8 +4,8 @@
     "stake_currency": "BNB",
     "stake_amount": 0.004,
     "fiat_display_currency": "USD",
-    "dry_run": true,
-    "slippage_tolerance": 0.03,  // 3% slippage tolerance
+    "dry_run": false,
+    "slippage_tolerance": 0.03,
     "db_url": "sqlite:///tradesv3.immortality.dryrun.sqlite",
     "dry_run_wallet": 1.5,
     "timeframe": "5m",

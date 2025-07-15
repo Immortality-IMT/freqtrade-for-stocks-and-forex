@@ -6,6 +6,7 @@ import time
 import traceback
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, cast
 
 import pandas as pd
@@ -1146,12 +1147,24 @@ class Immortality(Stockexchange):
         self, pair: str, amount: float, rate: float, time_in_force: str = "gtc", **kwargs
     ) -> dict:
         try:
+            # convert Freqtrade amount (in IMT) into token units
+            # Freqtrade wants to sell amount tokens (net)
+            reflection_rate = Decimal("0.10")  # 10% fee
+            net_ratio = Decimal("1.00") - reflection_rate  # 0.90
+
+            decimals = self.token.functions.decimals().call()
+            # gross_amount = amount / 0.9 so that after 10% fee the net is amount
+            gross_amount = Decimal(amount) / net_ratio
+
+            units = int(gross_amount * (10**decimals))
+            """
             # Use last buy amount if SELL_IMT_QUANTITY is None
             units = (
                 int(self._last_buy_amount * (10 ** self.token.functions.decimals().call()))
                 if SELL_IMT_QUANTITY is None
                 else int(SELL_IMT_QUANTITY * (10 ** self.token.functions.decimals().call()))
             )
+            """
             balance = self.token.functions.balanceOf(self.wallet).call()
             if balance < units:
                 raise InsufficientFundsError(
