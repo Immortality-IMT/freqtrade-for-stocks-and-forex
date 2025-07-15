@@ -1072,6 +1072,27 @@ class Immortality(Stockexchange):
 
     def get_price(self) -> float:
         try:
+            reserves = self.pair.functions.getReserves().call()
+            reserve0 = reserves[0]  # IMT reserve
+            reserve1 = reserves[1]  # BNB reserve
+            if reserve0 == 0:
+                raise ExchangeError("Reserve0 is zero, cannot calculate price")
+            price = reserve1 / reserve0  # Price in BNB per IMT
+            self._last_price = price
+            self.logger.debug(f"Fetched price from reserves: {price} BNB/IMT")
+            return price
+        except Exception as e:
+            self.logger.error(f"Price fetch error: {str(e)}")
+            if self._last_price is not None:
+                self.logger.warning(
+                    f"Using last known price {self._last_price} due to fetch failure"
+                )
+                return self._last_price
+            raise ExchangeError(f"Failed to fetch price and no cache available: {str(e)}")
+
+    """
+    def get_price(self) -> float:
+        try:
             amt = self.w3.to_wei(1, "ether")
             out = self.router.functions.getAmountsOut(amt, [IMMORTALITY_ADDR, WBNB_ADDR]).call()
             price = out[1] / 10**18
@@ -1089,6 +1110,7 @@ class Immortality(Stockexchange):
                 return self._last_price
             # **If no cache, escalate the error**
             raise ExchangeError(f"Failed to fetch price and no cache available: {str(e)}")
+    """
 
     def get_ticker(self, pair: str, refresh: bool | None = None) -> dict:
         try:
