@@ -4,7 +4,7 @@ This fork of [Freqtrade](https://www.freqtrade.io/) adds support for:
 
 - ✅ **Stocks**
 - 🌍 **Forex**
-- 🪙 **Immortality Coin** (a custom cryptocurrency)
+- 🪙 **Immortality Coin** (trade our coin)
 
 It stays in sync with upstream Freqtrade and allows **all your existing strategies to run without modification** on these new markets.
 
