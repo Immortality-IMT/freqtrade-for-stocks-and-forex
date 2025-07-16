@@ -1,118 +1,171 @@
-This fork aims to stay in sync with Freqtrade except it adds stocks and forex. 
-You can use your freqtrade strategies without alteration on stocks and foreign exchange. 
-Currently stocks work for backtesting strategies and dry run mode. Forex works only in dry run mode. 
-Both stocks and forex connect to the exchanges and open and close trades.
+# 🧠 Freqtrade Fork: Stocks, Forex, and Immortality Coin Support
 
-Never tested in live mode.
+This fork of [Freqtrade](https://www.freqtrade.io/) adds support for:
 
-Installation is identical to freqtrade, including generating the user_data directory.
-Examples are provided in config_examples folder to move to the user_data directory.
+- ✅ **Stocks**
+- 🌍 **Forex**
+- 🪙 **Immortality Coin** (a custom cryptocurrency)
 
-Notes:
+It stays in sync with upstream Freqtrade and allows **all your existing strategies to run without modification** on these new markets.
 
-For Alpacastocks
+---
 
-- Get paper trading API keys, regardless.
-- Open config_examples folder and copy paste stocks_config.json and TestAlpaca.py to user dir and strategy folder
-- Run with test commands
-- Note: in config: Use USD instead of USDT, so it is TSLA/USD and stake_currency: USD
-- The custom exchange for stocks is named alpacastocks
+## ✅ Current Status
+
+| Market                  | Backtesting      | Dry Run      | Live Trading       |
+|-------------------------|------------------|--------------|--------------------|
+| **Crypto**              | ✅               | ✅           | ✅                 |
+| **Stocks**              | ✅               | ✅           | ❌ *(Untested)*    |
+| **Forex**               | ❌ *(Limited)*   | ✅           | ❌ *(Untested)*    |
+| **Immortality coin**    | ❌ *(Untested)*  | ✅           | ✅                 |
+
+> ⚠️ **Live trading for Stocks and Forex has not been tested. Proceed with caution.**
+
+---
+
+## 🔧 Installation
+
+Installation is identical to [Freqtrade](https://www.freqtrade.io/en/stable/installation/):
+
+./setup.sh -i
+freqtrade create-userdir --userdir user_data
+
+Sample configs and strategies are provided in the config_examples/ folder. Copy them to your user_data/ directory and run the test commands below.
+
+### 📈 Stock Trading (via alpacastocks)
+
+Setup
+
+- Sign up at Alpaca
+- Get your Paper Trading API keys
+- Copy:
+  - stocks_config.json → user_data/
+  - TestAlpaca.py → user_data/strategies/
+- Edit stocks_config.json to include your Alpaca API keys
+- ✅ Use "USD" instead of "USDT" in your config. Example: "TSLA/USD"
 
 ```
-    "db_url": "sqlite:///tradesv3.stocks.dryrun.sqlite",
-    "stake_currency": "USD",
-    "fiat_display_currency": "USD",
-    "exchange": {
-        "name": "alpacastocks",
-        "key": "must have an api key",
-        "secret": "must have an api key",
-        "pair_whitelist": ["TSLA/USD"],
-        "pair_blacklist": []
-    },
-    "pairlists": [
-            {
-            "method": "StaticPairList",
-            "pairs": ["TSLA/USD"]
-            }
-    ],
+Example Config Snippet
+
+{
+  "db_url": "sqlite:///tradesv3.stocks.dryrun.sqlite",
+  "stake_currency": "USD",
+  "fiat_display_currency": "USD",
+  "exchange": {
+    "name": "alpacastocks",
+    "key": "your-api-key",
+    "secret": "your-secret-key",
+    "pair_whitelist": ["TSLA/USD"],
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList",
+      "pairs": ["TSLA/USD"]
+    }
+  ]
+}
 ```
 
-Test with commands...
+Run Commands
 
-```
+```plain
 freqtrade download-data --config user_data/stocks_config.json --timeframes 5m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
 freqtrade trade -c user_data/stocks_config.json -s TestAlpaca
 ```
 
-For Interactivebrokers, Forex
+### 🌍 Forex Trading (via interactivebrokers)
 
-- Download TWS - https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
-- cd ~/Downloads
-- chmod u+x tws-latest-linux-x64.sh
-- ./tws-latest-linux-x64.sh
+Setup
 
-In the TWS application go to Settings... 
+- Sign up at Interactive Brokers
+- Download and install Trader Workstation (TWS):
 
-- Set the port to paper trade 4002 or live 7497
-- Check Enable ActiveX and socket clients
-- Uncheck read only API
-- Check allow connection from localhost only or set up a trusted IP.
-- The base currency is USD, you need to get USD by making a trade in TWS.
+  cd ~/Downloads
+  chmod u+x tws-latest-linux-x64.sh
+  ./tws-latest-linux-x64.sh
 
-- Open config_examples folder and copy paste forex_config.json and TestIB.py to user dir and strategy folder
-- Run with test commands
+- In TWS settings:
+  - Port: 4002 (paper) or 7497 (live)
+  - Enable:
+    - ActiveX & socket clients
+    - Connections from localhost
+  - Disable: Read-only API
+- Ensure your base currency is USD
+- Copy:
+  - forex_config.json → user_data/
+  - TestIB.py → user_data/strategies/
 
-```    
-    "db_url": "sqlite:///tradesv3.forex.dryrun.sqlite",
-    "exchange": {
-        "name": "interactivebrokers",
-        "key": "",
-        "secret": "",
-        "pair_whitelist": [
-            "EUR/USD", "GBP/USD", "JPY/USD", "AUD/USD", "CAD/USD",
-            "CHF/USD", "NZD/USD", "EUR/GBP", "CNH/USD", "MXN/USD"
-        ],
-        "pair_blacklist": []
-    },
-    "pairlists": [
-        {
-            "method": "StaticPairList",
-            "pairs": [
-                "EUR/USD", "GBP/USD", "JPY/USD", "AUD/USD", "CAD/USD",
-                "CHF/USD", "NZD/USD", "EUR/GBP", "CNH/USD", "MXN/USD"
-            ]
-        }
+```
+Example Config Snippet
+
+{
+  "db_url": "sqlite:///tradesv3.forex.dryrun.sqlite",
+  "exchange": {
+    "name": "interactivebrokers",
+    "key": "",
+    "secret": "",
+    "pair_whitelist": [
+      "EUR/USD", "GBP/USD", "JPY/USD", "AUD/USD", "CAD/USD",
+      "CHF/USD", "NZD/USD", "EUR/GBP", "CNH/USD", "MXN/USD"
     ],
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList",
+      "pairs": [
+        "EUR/USD", "GBP/USD", "JPY/USD", "AUD/USD", "CAD/USD",
+        "CHF/USD", "NZD/USD", "EUR/GBP", "CNH/USD", "MXN/USD"
+      ]
+    }
+  ]
+}
 ```
 
-Test with commands...
+Run Commands
 
-```
+```plain
 freqtrade download-data --config user_data/forex_config.json --timeframes 5m --timerange 20240101-20240201
 freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timerange=20240101-20240201
 freqtrade trade -c user_data/forex_config.json -s TestIB
 ```
 
-For Immortality coin,
+### 🪙 Immortality Coin (Crypto Wallet Trading)
 
-You can trade Immortality coin direct from your wallet using Freqtrade strategies.
+Trade Immortality Coin directly from your wallet using any Freqtrade-compatible strategy.
 
-- Get a nodereal.io API key
-- Copy your public and private key pair from your crypto wallet
-- Open config_examples folder and add the public and private key and API key.
-- Copy TestIMT.py to the strategy folder
+Setup
 
-```
+- Sign up at NodeReal.io
+- Obtain an API key
+- Edit immortality_config.json in config_examples/:
+  - Add your public key, private key, and NodeReal API key
+- Copy:
+  - immortality_config.json → user_data/
+  - TestIMT.py → user_data/strategies/
+
+Run Command
+
+```plain
 freqtrade trade -c user_data/immortality_config.json -s TestIMT
 ```
 
-- Discrepancy between a crypto backtest and a stock and forex backtest is decimal places. Crypto uses 8 decimal places, while stocks generally round to 2 decimal places.
-- Exchanges limit trade history data to paid subscriptions, and this is where the backtest fails for forex.
-- While crypto is 24/7, stockmarkets and forex close, during this time the exchanges go into sleep mode and awaken prior to opening.
-- Initialize user folder - freqtrade create-userdir --userdir user_data
+### ⚠️ Notes and Differences
 
-...and check out the stock and forex display in FreqUI.
+- Decimal precision:
+  - Crypto uses 8 decimals
+  - Stocks & Forex typically use 2 decimals
+- Exchange data limits:
+  - Historical data may require paid subscriptions (especially for Forex)
+- Market hours:
+  - Stocks & Forex markets are not 24/7
+  - Exchanges “sleep” during off-hours and resume before open
+
+### 🧪 FreqUI Integration
+
+Check out the stock and forex display in FreqUI — all additional markets integrate seamlessly with the UI!
 
 =======
 
