@@ -27,8 +27,12 @@ It stays in sync with upstream Freqtrade and allows **all your existing strategi
 
 Installation is identical to [Freqtrade](https://www.freqtrade.io/en/stable/installation/):
 
+```plain
 ./setup.sh -i
+```
+```plain
 freqtrade create-userdir --userdir user_data
+```
 
 Sample configs and strategies are provided in the config_examples/ folder. Copy them to your user_data/ directory and run the test commands below.
 
@@ -71,7 +75,11 @@ Run Commands
 
 ```plain
 freqtrade download-data --config user_data/stocks_config.json --timeframes 5m --timerange 20240101-20240201
+```
+```plain
 freqtrade backtesting -c user_data/stocks_config.json -s SampleStrategy --timerange=20240101-20240201
+```
+```plain
 freqtrade trade -c user_data/stocks_config.json -s TestAlpaca
 ```
 
@@ -128,7 +136,11 @@ Run Commands
 
 ```plain
 freqtrade download-data --config user_data/forex_config.json --timeframes 5m --timerange 20240101-20240201
+```
+```plain
 freqtrade backtesting -c user_data/forex_config.json -s SampleStrategy --timerange=20240101-20240201
+```
+```plain
 freqtrade trade -c user_data/forex_config.json -s TestIB
 ```
 
