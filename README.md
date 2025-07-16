@@ -1,4 +1,4 @@
-# 🧠 Freqtrade Fork: Stocks, Forex, and Immortality Coin Support
+# 🧠 Freqtrade for Stocks, Forex, and Immortality Coin
 
 This fork of [Freqtrade](https://www.freqtrade.io/) adds support for:
 
