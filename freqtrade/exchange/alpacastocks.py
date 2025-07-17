@@ -31,6 +31,18 @@ from freqtrade.exchange.stockexchange import Stockexchange
 
 logger = logging.getLogger(__name__)
 
+_min_interval = 2.0  # throttle it by 1 call every 2 sec to avoid time bans
+_last_request_ts = 0.0
+
+
+def throttle():
+    global _last_request_ts
+    now = time.time()
+    elapsed = now - _last_request_ts
+    if elapsed < _min_interval:
+        time.sleep(_min_interval - elapsed)
+    _last_request_ts = time.time()
+
 
 class Alpacastocks(Stockexchange):
     """
@@ -124,6 +136,10 @@ class Alpacastocks(Stockexchange):
         self._last_market_state = None
         if self._ft_has_default["ws_enabled"]:
             self.setup_websocket()
+
+        if "candle_type_def" not in self.config:
+            self.config["candle_type_def"] = "spot"
+            logger.info("Set default candle_type_def to 'spot' for alpacastocks")
 
     @property
     def name(self):
@@ -642,6 +658,7 @@ class Alpacastocks(Stockexchange):
             if page_token:
                 params["page_token"] = page_token
 
+            throttle()
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             try:
                 resp.raise_for_status()
@@ -788,8 +805,8 @@ class Alpacastocks(Stockexchange):
                 sleep_time = time_until_open - 300
                 logger.info(
                     f"Market is closed, sleeping for {sleep_time:.1f} seconds "
-                    "until 5 minutes before market opens."
-                    "Reminder that JPX (Japan) opens at 8:00 PM "
+                    "until 5 minutes before market opens. "
+                    "Reminder, JPX (Japan) opens at 8:00 PM "
                     "and the SSE (China) and HKEX open at 9:30 PM"
                 )
                 time.sleep(sleep_time)
@@ -838,6 +855,7 @@ class Alpacastocks(Stockexchange):
 
     def fetch_positions(self, symbols=None, params=None):
         try:
+            throttle()
             positions = self.trading_client.get_all_positions()
             return [self._format_position(pos) for pos in positions]
         except Exception as e:
@@ -1028,6 +1046,7 @@ class Alpacastocks(Stockexchange):
         logger.info("Refreshing market pairs from Alpaca API.")
         try:
             search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
+            throttle()
             assets = self.trading_client.get_all_assets(search_params)
             assets_dict = [dict(item) for item in assets]
             self._markets = self._process_assets(assets_dict, tradable_only, active_only)
@@ -1132,11 +1151,13 @@ class Alpacastocks(Stockexchange):
 
         try:
             # 1) Fetch quote and trade
+            throttle()
             quote_obj, qdata = normalize(
                 self.data_client.get_stock_latest_quote(
                     StockLatestQuoteRequest(symbol_or_symbols=symbol)
                 )
             )
+            throttle()
             trade_obj, tdata = normalize(
                 self.data_client.get_stock_latest_trade(
                     StockLatestTradeRequest(symbol_or_symbols=symbol)
@@ -1316,6 +1337,7 @@ class Alpacastocks(Stockexchange):
         max_trades = limit or 1000
 
         # Fetch trades (Alpaca returns a .data list of Trade objects)
+        throttle()
         api_resp = data_client.get_stock_trades(
             symbol_or_symbols=symbol, start=start, limit=max_trades, **(params or {})
         )
