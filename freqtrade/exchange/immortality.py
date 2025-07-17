@@ -16,6 +16,7 @@ from web3 import Web3
 from web3.exceptions import ContractLogicError
 
 from freqtrade.data.converter import ohlcv_to_dataframe
+from freqtrade.enums import CandleType
 from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.exchange.common import retrier
 from freqtrade.exchange.stockexchange import Stockexchange
@@ -556,17 +557,19 @@ class Immortality(Stockexchange):
                 await asyncio.sleep(5)
 
     def refresh_latest_ohlcv(self, pairs: list[str]) -> None:
-        """Refreshes the latest OHLCV data, including real-time candles."""
         for item in pairs:
             try:
-                pair = item[0] if isinstance(item, tuple) else item
-                timeframe = (
-                    item[1] if isinstance(item, tuple) else self.config.get("timeframe", "1h")
-                )
-                candle_type = item[2] if isinstance(item, tuple) and len(item) > 2 else "spot"
+                if isinstance(item, tuple):
+                    pair = item[0]
+                    timeframe = item[1] if len(item) > 1 else self.config.get("timeframe", "1h")
+                    candle_type = item[2] if len(item) > 2 else CandleType.SPOT
+                else:
+                    pair = item
+                    timeframe = self.config.get("timeframe", "1h")
+                    candle_type = CandleType.SPOT
 
-                ohlcv = self.get_ohlcv(pair, timeframe, limit=200)
-                key = (pair, timeframe, candle_type)
+                ohlcv = self.get_ohlcv(pair, timeframe, limit=200, candle_type=candle_type)
+                key = (pair, timeframe, candle_type.value)
 
                 if key in self.candle_builders:
                     current = self.candle_builders[(pair, timeframe)].get_current()
@@ -590,7 +593,6 @@ class Immortality(Stockexchange):
                         )
                         ohlcv = ohlcv.drop_duplicates(subset="date").sort_values("date")
 
-                # Prune cache to keep only the latest 200 candles
                 if not ohlcv.empty:
                     ohlcv = ohlcv.tail(200)
                     self.latest_ohlcv[key] = ohlcv
@@ -819,60 +821,50 @@ class Immortality(Stockexchange):
         return synthetic
 
     def prepare_cache_and_throttle(
-        self, pair: str | tuple, timeframe: str, since_ms: int
+        self,
+        pair: str,
+        timeframe: str,
+        since_ms: int,
+        candle_type: CandleType,
     ) -> tuple[str, int, pd.DataFrame | None]:
-        if isinstance(pair, tuple):
-            pair_str = pair[0]
-            self.logger.debug(f"Received tuple pair {pair}, using pair_str={pair_str}")
-        else:
-            pair_str = pair
-
-        self.logger.debug(
-            "Fetching OHLCV: pair=%s, timeframe=%s, since_ms=%s",
-            pair_str,
-            timeframe,
-            since_ms,
-        )
-
-        if pair_str != "IMT/BNB":
-            raise OperationalException(f"Pair {pair_str} not supported")
-
-        if not self.api_key:
-            self.logger.error("NodeReal API key not provided in config.")
-            raise OperationalException("NodeReal API key is required for OHLCV data retrieval.")
-
-        cache_key = (pair_str, timeframe, "spot")
-        cached_df = self.latest_ohlcv.get(cache_key)
+        pair_str = pair
+        key = (pair_str, timeframe, candle_type.value)
+        cached_df = self.latest_ohlcv.get(key)
 
         if cached_df is not None and not cached_df.empty:
-            latest_ts_ms = int(cached_df["date"].iloc[-1].timestamp() * 1000)
-            if since_ms < latest_ts_ms:
-                since_ms = latest_ts_ms
-                self.logger.debug(
-                    f"Using cached latest timestamp: {since_ms} for {pair_str}/{timeframe}"
-                )
+            if not pd.api.types.is_datetime64_any_dtype(cached_df["date"]):
+                self.logger.warning("cached_df['date'] is not datetime, converting...")
+                cached_df["date"] = pd.to_datetime(cached_df["date"], errors="coerce")
+                before = len(cached_df)
+                cached_df = cached_df.dropna(subset=["date"])
+                dropped = before - len(cached_df)
+                if dropped:
+                    self.logger.warning(f"Dropped {dropped} malformed date rows from cache")
 
-        now_s = time.time()
-        if now_s - self._last_call_time < self._min_interval:
-            to_sleep = self._min_interval - (now_s - self._last_call_time)
-            self.logger.info("Throttling NodeReal call; sleeping %.1fs", to_sleep)
-            time.sleep(to_sleep)
-        self._last_call_time = time.time()
+            if not cached_df.empty:
+                latest_ts_ms = int(cached_df["date"].iloc[-1].timestamp() * 1000)
+                if since_ms < latest_ts_ms:
+                    since_ms = latest_ts_ms
+                    self.logger.debug(
+                        f"Using cached latest timestamp: {since_ms} for {pair_str}/{timeframe}"
+                    )
+            else:
+                self.logger.warning("All cached dates were invalid. No valid timestamps found.")
 
         return pair_str, since_ms, cached_df
 
     def get_ohlcv(
-        self, pair: str | tuple, timeframe: str, since_ms: int = 0, limit: int = 200
+        self,
+        pair: str,
+        timeframe: str,
+        since_ms: int = 0,
+        limit: int = 200,
+        candle_type: CandleType = CandleType.SPOT,
     ) -> pd.DataFrame:
-        """Fetches historical OHLCV data, merges with cache, generates synthetic candles on failure,
-        and persists the latest 200 candles to disk."""
         try:
-            # Prepare cache and throttle timing
             pair_str, since_ms, cached_df = self.prepare_cache_and_throttle(
-                pair, timeframe, since_ms
+                pair, timeframe, since_ms, candle_type
             )
-
-            # Determine fetch limit: full or incremental
             fetch_limit = 10 if since_ms > 0 else limit
             candles = fetch_ohlcv_nodereal(self.api_key, PAIR_ADDRESS, fetch_limit)
 
@@ -908,26 +900,21 @@ class Immortality(Stockexchange):
                             pair_str,
                             timeframe,
                         )
-                        # Persist and return
                         return self._persist_and_return(df, pair_str, timeframe)
                 return self._get_fallback_candle(timeframe, pair_str)
 
-            # Interpolate if timeframe < 1h
             if self.timeframe_to_seconds(timeframe) < 3600:
                 raw_cap = 50 if since_ms == 0 else 10
                 recent = candles[-raw_cap:]
                 candles = self.interpolate_ohlcv(recent, timeframe)
                 self.logger.debug("Interpolated to %d candles for %s", len(candles), timeframe)
 
-            # Build DataFrame
             df = ohlcv_to_dataframe(
                 candles, timeframe, pair_str, fill_missing=True, drop_incomplete=True
             )
 
-            # Merge, filter, validate, append synthetic, trim to 200
             df = self.process_and_filter_dataframe(df, cached_df, since_ms, pair_str, timeframe)
 
-            # Persist to disk and return final DataFrame
             return self._persist_and_return(df, pair_str, timeframe)
 
         except requests.HTTPError as e:
@@ -968,41 +955,30 @@ class Immortality(Stockexchange):
         limit: int | None = None,
         **kwargs,
     ) -> pd.DataFrame:
-        """
-        Fetches OHLCV data for a given pair and timeframe.
-
-        Args:
-            pair (str or tuple): Trading pair
-            (e.g., "IMT/BNB" or ("IMT/BNB", timeframe, candle_type)).
-            timeframe (str, optional): Timeframe for the candles (e.g., "1m", "5m", "1h").
-            Defaults to config timeframe.
-            since (int, optional): Start time in milliseconds since epoch. Defaults to None.
-            limit (int, optional): Maximum number of candles to fetch. Defaults to None.
-
-        Returns:
-            pd.DataFrame: A pandas DataFrame containing OHLCV data.
-        """
-        # Handle tuple input from DataProvider
         if isinstance(pair, tuple):
-            pair_str = pair[0]  # Extract pair (e.g., "IMT/BNB")
-            if len(pair) > 1 and pair[1] and timeframe is None:
-                timeframe = pair[1]  # Use timeframe from tuple if provided
+            pair_str = pair[0]
+            timeframe_from_tuple = pair[1] if len(pair) > 1 and pair[1] else None
+            candle_type = pair[2] if len(pair) > 2 else CandleType.SPOT
+            if timeframe_from_tuple and timeframe is None:
+                timeframe = timeframe_from_tuple
                 self.logger.debug(f"Using timeframe {timeframe} from tuple {pair}")
         else:
             pair_str = pair
+            candle_type = CandleType.SPOT
         if timeframe is None:
             timeframe = self.config.get("timeframe", "1h")
             self.logger.info(
                 f"No timeframe provided for {pair_str}, using default from config: {timeframe}"
             )
         self.logger.debug(
-            f"Calling klines: pair={pair_str}, timeframe={timeframe}, since={since}, limit={limit}"
+            f"Calling klines: pair={pair_str}, timeframe={timeframe}, "
+            f"since={since}, limit={limit}, candle_type={candle_type}"
         )
         try:
             self.validate_timeframes(timeframe)
             since_ms = since if since is not None else 0
             limit = min(limit or cast(int, self._ft_has_default["ohlcv_candle_limit"]), 200)
-            return self.get_ohlcv(pair_str, timeframe, since_ms, limit)
+            return self.get_ohlcv(pair_str, timeframe, since_ms, limit, candle_type)
         except Exception as e:
             self.logger.error(f"Error in klines for {pair_str}/{timeframe}: {str(e)}")
             self.logger.error(f"Traceback: {traceback.format_exc()}")
