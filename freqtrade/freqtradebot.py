@@ -176,16 +176,15 @@ class FreqtradeBot(LoggingMixin):
         self.strategy.ft_bot_start()
         # Initialize protections AFTER bot start - otherwise parameters are not loaded.
         self.protections = ProtectionManager(self.config, self.strategy.protections)
+        self._measure_execution = MeasureTime(self.log_took_too_long, timeframe_secs * 0.25)
 
-        def log_took_too_long(duration: float, time_limit: float):
-            logger.warning(
-                f"Strategy analysis took {duration:.2f}s, more than 25% of the timeframe ",
-                f"({time_limit:.2f}s). This can lead to delayed orders and missed signals.",
-                "Consider either reducing the amount of work your strategy performs ",
-                "or reduce the amount of pairs in the Pairlist.",
-            )
-
-        self._measure_execution = MeasureTime(log_took_too_long, timeframe_secs * 0.25)
+    def log_took_too_long(self, duration: float, time_limit: float):
+        logger.warning(
+            f"Strategy analysis took {duration:.2f}s, more than 25% of the timeframe "
+            f"({time_limit:.2f}s). This can lead to delayed orders and missed signals. "
+            f"Consider either reducing the amount of work your strategy performs "
+            f"or reducing the number of pairs in the Pairlist."
+        )
 
     def notify_status(self, msg: str, msg_type=RPCMessageType.STATUS) -> None:
         """
