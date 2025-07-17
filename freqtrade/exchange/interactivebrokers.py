@@ -136,6 +136,10 @@ class Interactivebrokers(Foreignexchange):
             logger.error("Failed to establish connection to Interactive Brokers")
             raise ConnectionError("WebSocket connection failed")
 
+        if "candle_type_def" not in self.config:
+            self.config["candle_type_def"] = "spot"
+            logger.info("Set default candle_type_def to 'spot' for interactivebrokers")
+
     def _connect_to_ib(self) -> None:
         max_retries = 3
         retry_count = 0
