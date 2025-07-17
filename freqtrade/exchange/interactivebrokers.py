@@ -1,10 +1,20 @@
-# pip install ib_insync
+"""
+# pip uninstall ib_insync
+# pip install --no-cache-dir -U ib_insync
 # Interactive Brokers exchange forex integration for FreqTrade
+Interactive Brokers API has pacing limitations to manage
+the volume of requests and maintain system stability.
+The main limit is 50 requests per second.
+Additionally, there are limitations on historical data
+requests (50 simultaneous requests, pacing for small bars)
+and order submissions.
+"""
 
 import asyncio
 import logging
 import math
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 from threading import Event, Lock, Thread
@@ -19,6 +29,21 @@ from freqtrade.exchange.foreignexchange import Foreignexchange
 
 logger = logging.getLogger(__name__)
 
+_min_interval = 2.0  # throttle it by 2 sec or IB time bans
+_last_request_ts = 0.0
+
+
+def throttle():
+    global _last_request_ts
+    now = time.time()
+    elapsed = now - _last_request_ts
+    if elapsed < _min_interval:
+        time.sleep(_min_interval - elapsed)
+    _last_request_ts = time.time()
+
+
+HEARTBEAT_INTERVAL = 1 * 60  # 1 minutes
+
 
 class Interactivebrokers(Foreignexchange):
     """
@@ -32,6 +57,9 @@ class Interactivebrokers(Foreignexchange):
     MAX_DATA_DELAY = pd.Timedelta(minutes=5)
     MIN_LOT_SIZE = 25_000
     RECONNECT_TIMEOUT = 30
+
+    _min_interval = 0.1
+    _last_request_ts = 0.0
 
     _cache_lock: Lock
     _entry_rate_cache: dict[str, float]
@@ -99,6 +127,7 @@ class Interactivebrokers(Foreignexchange):
         self.ib = IB()
         self.dry_run = config.get("dry_run", False)
         self.latest_ohlcv: dict = {}
+        self._shutting_down = False
         self._running = True
         self._reconnect_event = Event()
         self._connection_thread: Thread | None = None
@@ -131,6 +160,8 @@ class Interactivebrokers(Foreignexchange):
         # Start WebSocket connection
         self.ws_start()
 
+        self._start_heartbeat()
+
         # Verify connection is established
         if not self.ib.isConnected():
             logger.error("Failed to establish connection to Interactive Brokers")
@@ -139,9 +170,9 @@ class Interactivebrokers(Foreignexchange):
     def _connect_to_ib(self) -> None:
         max_retries = 3
         retry_count = 0
-        retry_delay = 5
+        retry_delay = 60  # Total delay in seconds
 
-        while retry_count < max_retries:
+        while retry_count < max_retries and not self._shutting_down:
             try:
                 if self.ib.isConnected():
                     self.ib.disconnect()
@@ -167,16 +198,24 @@ class Interactivebrokers(Foreignexchange):
                 logger.error(f"Unexpected error while connecting to IBKR: {e}")
                 retry_count += 1
 
-            if retry_count < max_retries:
+            if retry_count < max_retries and not self._shutting_down:
                 logger.info(
-                    f"Retrying connection in {retry_delay} seconds..."
+                    f"Retrying connection in {retry_delay} seconds... "
                     f"(Attempt {retry_count + 1}/{max_retries})"
                 )
-                time.sleep(retry_delay)
+                # Use 1-second intervals to check shutdown flag
+                for _ in range(retry_delay):
+                    if self._shutting_down:
+                        logger.info("Shutting down, aborting connection attempts.")
+                        return
+                    time.sleep(1)
 
-        logger.error("Failed to connect to IBKR after multiple attempts")
-        logger.error("Please ensure TWS or IB Gateway is running with API connections enabled")
-        raise ConnectionError("Could not connect to Interactive Brokers")
+        if self._shutting_down:
+            logger.info("Shutting down, aborted connection attempts.")
+        else:
+            logger.error("Failed to connect to IBKR after multiple attempts")
+            logger.error("Please ensure TWS or IB Gateway is running with API connections enabled")
+            raise ConnectionError("Could not connect to Interactive Brokers")
 
     def _setup_event_loop(self) -> None:
         if self._connection_thread is not None and self._connection_thread.is_alive():
@@ -346,6 +385,8 @@ class Interactivebrokers(Foreignexchange):
         Try to fetch a live price; on failure due to stale/nan data or disconnect,
         trigger a reconnect and retry once before falling back to historical.
         """
+        if self._shutting_down:
+            raise RuntimeError("Cannot fetch rate during shutdown")
         pair = pair[0] if isinstance(pair, tuple) else pair
         # First attempt
         try:
@@ -373,6 +414,7 @@ class Interactivebrokers(Foreignexchange):
             symbol=symbol.strip().upper(), currency=currency.strip().upper(), exchange="IDEALPRO"
         )
 
+        throttle()
         ticker = self.ib.reqMktData(contract)
 
         # Wait up to 2 seconds for valid bid/ask
@@ -582,6 +624,7 @@ class Interactivebrokers(Foreignexchange):
 
     async def fetch_historical_data(self, contract, durationStr, ib_timeframe):
         try:
+            throttle()
             bars = await self.ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime="",  # Current time
@@ -745,20 +788,22 @@ class Interactivebrokers(Foreignexchange):
         return balances
 
     def close(self) -> None:
+        self._shutting_down = True  # Signal shutdown
+        self._running = False  # Stop event loop
         try:
             if self.ib.isConnected():
                 self.ib.disconnect()
                 logger.info("Disconnected from IBKR.")
             # Ensure the socket is fully closed
-            self.ib.client._sock = None  # Clear the socket reference
+            self.ib.client._sock = None
         except Exception as e:
             logger.error(f"Error during IBKR disconnection: {e}")
         finally:
-            # Attempt to release the port
+            # Attempt to release the port (optional, but keep for completeness)
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
-                sock.bind((self.host, self.port))  # Try binding to the port
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.host, self.port))
                 sock.close()
                 logger.info(f"Port {self.port} released successfully.")
             except OSError as e:
@@ -1039,6 +1084,7 @@ class Interactivebrokers(Foreignexchange):
 
     def fetch_open_orders(self, symbol: str | None = None) -> list[dict]:
         """Fetch all open orders from IBKR and ensure complete order data."""
+        throttle()
         self.ib.reqOpenOrders()  # Request open orders from IBKR
         orders: list[dict] = []
         for o in self.ib.openOrders():
@@ -1186,6 +1232,7 @@ class Interactivebrokers(Foreignexchange):
         symbols = symbols or [p["symbol"] for p in self.fetch_positions()]
         for sym in symbols:
             contract = self._get_contract(sym)
+            throttle()
             data = self.ib.reqMktData(contract, "", False, False)
             # Wait briefly for IB to populate data (you may need a small sleep here)
             last = (data.bid + data.ask) / 2 if data.bid and data.ask else data.last
@@ -1258,3 +1305,17 @@ class Interactivebrokers(Foreignexchange):
 
         # Mid market rate = (bid + ask) / 2
         return (ticker["bid"] + ticker["ask"]) / 2
+
+    def _start_heartbeat(self):
+        def _hb_loop():
+            while self.ib.isConnected() and not self._shutting_down:
+                try:
+                    # A cheap call that resets IBs idle timer
+                    self.ib.reqCurrentTime()
+                except Exception as e:
+                    if not self._shutting_down:
+                        logger.error(f"Heartbeat error in reqCurrentTime: {e}")
+                time.sleep(self.HEARTBEAT_INTERVAL)
+
+        t = threading.Thread(target=_hb_loop, daemon=True)
+        t.start()
