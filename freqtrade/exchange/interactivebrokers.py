@@ -6,7 +6,7 @@ import logging
 import math
 import socket
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -15,6 +15,7 @@ from ib_insync import IB, Contract, Forex, Order, util
 
 from freqtrade.enums import MarginMode
 from freqtrade.exchange.foreignexchange import Foreignexchange
+from freqtrade.persistence import Trade
 
 
 util.patchAsyncio()
@@ -169,26 +170,50 @@ class Interactivebrokers(Foreignexchange):
             logger.info("Set default candle_type_def to 'spot' for interactivebrokers")
 
     def _connect_to_ib(self) -> None:
-        with _request_lock:  # Thread-safe connection
-            try:
-                if self.ib.isConnected():
-                    return
+        """
+        Establishes connection to Interactive Brokers.
+        Handles refusal cleanly without full traceback spam.
+        """
+        with _request_lock:
+            if self.ib.isConnected():
+                logger.info("IBKR already connected.")
+                self._ws_connected = True
+                self.connected = True
+                return
 
-                logger.info(f"Connecting to {self.host}:{self.port}")
-                self.ib.connect(self.host, self.port, clientId=self.client_id)
+            logger.info(f"Connecting to IBKR paper trading (IB Gateway) on port {self.port}.")
+            logger.info(
+                f"Connecting to IBKR (host={self.host}, "
+                f"port={self.port}, clientId={self.client_id})"
+            )
+
+            try:
+                self.ib.connect(self.host, self.port, clientId=self.client_id, timeout=5)
 
                 if not self.ib.isConnected():
-                    raise ConnectionError("Connection failed without exception")
+                    logger.error("❌ IBKR connection failed silently.")
+                    self._ws_connected = False
+                    self.connected = False
+                    raise SystemExit("❌ Could not establish connection to IBKR.")
 
-                logger.info("Connection established")
+                logger.info("✅ IBKR connection established.")
                 self._ws_connected = True
+                self.connected = True
 
-            except (ConnectionError, ConnectionRefusedError) as e:
-                logger.error(f"Connection error: {e}")
-                raise
+            except ConnectionRefusedError:
+                logger.error(
+                    "❌ Connection refused: IB Gateway or TWS not running on "
+                    f"{self.host}:{self.port}"
+                )
+                self._ws_connected = False
+                self.connected = False
+                raise SystemExit("❌ Could not connect to IBKR. Is IB Gateway running?")
+
             except Exception as e:
-                logger.error(f"Unexpected connection error: {e}")
-                raise ConnectionError(f"Connection failed: {e}")
+                logger.error(f"❌ Unexpected error during IBKR connection: {e}")
+                self._ws_connected = False
+                self.connected = False
+                raise SystemExit("❌ Unexpected failure connecting to IBKR.")
 
     def _setup_event_loop(self) -> None:
         if self._connection_thread and self._connection_thread.is_alive():
@@ -485,65 +510,6 @@ class Interactivebrokers(Foreignexchange):
             "info": info,
         }
 
-    def fetch_order(
-        self,
-        order_id: str,
-        pair: str | None = None,
-    ) -> dict:
-        # Handle None or invalid order_id
-        if order_id is None:
-            logger.error("Cannot fetch order with order_id=None")
-            return {"status": "not_found"}
-
-        try:
-            oid = int(order_id)
-        except (ValueError, TypeError):
-            logger.error(f"Invalid order ID format: {order_id}")
-            return {"status": "not_found"}
-
-        try:
-            for trade in self.ib.trades():
-                if trade.order.orderId == oid:
-                    filled = float(trade.orderStatus.filled)
-                    total = float(trade.order.totalQuantity)
-                    remaining = total - filled
-
-                    if hasattr(trade.contract, "symbol") and hasattr(trade.contract, "currency"):
-                        symbol = f"{trade.contract.symbol}/{trade.contract.currency}"
-                    else:
-                        symbol = pair if pair else "UNKNOWN/UNKNOWN"
-
-                    price: float | None = None
-
-                    if trade.order.orderType == "LMT":
-                        price = float(trade.order.lmtPrice)
-                    elif hasattr(trade, "fills") and trade.fills:
-                        total_cost = sum(
-                            fill.execution.price * fill.execution.shares for fill in trade.fills
-                        )
-                        total_shares = sum(fill.execution.shares for fill in trade.fills)
-                        price = total_cost / total_shares if total_shares > 0 else None
-
-                    return {
-                        "id": order_id,
-                        "symbol": symbol,
-                        "type": trade.order.orderType.lower(),
-                        "side": trade.order.action.lower(),
-                        "amount": total,
-                        "price": price,
-                        "filled": filled,
-                        "remaining": remaining,
-                        "status": self._parse_order_status(trade.orderStatus.status),
-                        "info": trade,
-                    }
-
-            logger.debug(f"fetch_order: no trade with orderId={order_id}")
-            return {"status": "not_found"}
-
-        except Exception as e:
-            logger.error(f"Error in fetch_order for {order_id}: {e}")
-            return {"status": "not_found"}
-
     def _parse_order_status(self, ib_status: str) -> str:
         status_mapping = {
             "ApiPending": "open",
@@ -726,7 +692,7 @@ class Interactivebrokers(Foreignexchange):
             df = df.sort_values(by="date", ascending=True).reset_index(drop=True)
 
             if not df.empty:
-                current_time = datetime.now(timezone.utc)  # noqa: UP017
+                current_time = datetime.now(UTC)
                 last_candle = df["date"].iloc[-1]
                 first_candle = df["date"].iloc[0]
                 num_candles = len(df)
@@ -806,65 +772,6 @@ class Interactivebrokers(Foreignexchange):
                     "total": float(item.value),
                 }
         return balances
-
-    def close(self) -> None:
-        """
-        Aggressively shut down IBKR connection and subscriptions,
-        without long waits, so CTRL+C returns immediately.
-        """
-        self._running = False
-        self._cancel_data_subscriptions()
-        self._disconnect_ibkr()
-        self._release_ibkr_port()
-        self._join_connection_thread()
-        logger.info("Brutal close(): all IBKR subscriptions canceled, disconnected.")
-
-    def _cancel_data_subscriptions(self) -> None:
-        """Cancel all market and historical data subscriptions."""
-        try:
-            self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
-            self.ib.client.reqCancelHistoricalData(0)
-        except Exception as e:
-            logger.warning(f"Exception while cancelling data subscriptions: {e}")
-
-        if getattr(self, "_ib_loop_started", False):
-            try:
-                self.ib.stopLoop()
-            except Exception as e:
-                logger.warning(f"Exception stopping ib_insync loop: {e}")
-
-    def _disconnect_ibkr(self) -> None:
-        """Force disconnect and clean up socket."""
-        try:
-            if self.ib.isConnected():
-                self.ib.disconnect()
-        except Exception as e:
-            logger.warning(f"Exception during disconnect: {e}")
-
-        try:
-            self.ib.client._sock = None
-        except Exception as e:
-            logger.warning(f"Exception clearing socket reference: {e}")
-
-    def _release_ibkr_port(self) -> None:
-        """Attempt to free the port used by IBKR connection (non-blocking)."""
-
-        def _release():
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((self.host, self.port))
-                s.close()
-            except Exception as e:
-                logger.warning(f"Exception releasing port {self.port}: {e}")
-
-        Thread(target=_release, daemon=True).start()
-
-    def _join_connection_thread(self) -> None:
-        """Join the reconnect thread if active."""
-        thr = getattr(self, "_connection_thread", None)
-        if thr and thr.is_alive():
-            thr.join(timeout=0.1)
 
     def market_is_tradable(self, market: dict) -> bool:
         return market.get("active", False) and market.get("tradable", True)
@@ -1062,7 +969,7 @@ class Interactivebrokers(Foreignexchange):
         }
 
     def is_market_open(self):
-        now = datetime.now(timezone.utc)  # noqa: UP017
+        now = datetime.now(UTC)
         if now.weekday() == 4 and now.hour >= 22:
             return False
         if now.weekday() >= 5:
@@ -1148,41 +1055,189 @@ class Interactivebrokers(Foreignexchange):
             raise
 
     def fetch_open_orders(self, symbol: str | None = None) -> list[dict]:
-        """Fetch all open orders from IBKR and ensure complete order data."""
-        self.ib.reqOpenOrders()  # Request open orders from IBKR
+        """
+        Fetch open orders from Interactive Brokers and normalize them for Freqtrade.
+        Ensures all returned orders include a valid 'side' field to prevent bot crashes.
+        Adds "orphaned": True to orders not associated with known trades.
+        """
         orders: list[dict] = []
+
         for o in self.ib.openOrders():
-            sym = f"{o.contract.symbol}/{o.contract.currency}"
-            if symbol and sym != symbol:  # Filter by symbol if provided
-                continue
+            try:
+                sym = f"{o.contract.symbol}/{o.contract.currency}"
+                if symbol and sym != symbol:
+                    continue
 
-            # Safely extract order attributes with defaults
-            filled = float(o.orderStatus.filled) if o.orderStatus.filled else 0.0
-            total = float(o.order.totalQuantity) if o.order.totalQuantity else 0.0
-            side = o.order.action.lower() if o.order.action else "unknown"  # Default to 'unknown'
-
-            # Log a warning if critical data is missing
-            if side == "unknown":
-                logger.warning(
-                    f"Order {o.order.orderId} has no action set. Incomplete data detected."
+                filled = float(o.orderStatus.filled) if hasattr(o.orderStatus, "filled") else 0.0
+                total = float(o.order.totalQuantity) if hasattr(o.order, "totalQuantity") else 0.0
+                # Ensure side is 'buy' or 'sell', default to 'buy' if invalid
+                side = (
+                    o.order.action.lower()
+                    if hasattr(o.order, "action") and o.order.action in ("BUY", "SELL")
+                    else "buy"
                 )
+                order_id = str(o.order.orderId) if hasattr(o.order, "orderId") else None
 
-            # Build a complete order dictionary
-            orders.append(
-                {
-                    "id": str(o.order.orderId),
+                if not order_id:
+                    logger.warning("Skipping order with missing orderId")
+                    continue
+
+                # Build the order dictionary
+                order = {
+                    "id": order_id,
                     "symbol": sym,
-                    "type": o.order.orderType.lower() if o.order.orderType else "unknown",
+                    "type": (
+                        o.order.orderType.lower()
+                        if hasattr(o.order, "orderType") and o.order.orderType
+                        else "unknown"
+                    ),
                     "side": side,
                     "amount": total,
-                    "price": getattr(o.order, "lmtPrice", None),  # Limit price if available
-                    "filled": float(filled),
-                    "remaining": float(total - filled),
-                    "status": self._parse_order_status(o.orderStatus.status),
-                    "info": {},  # Additional info can be added
+                    "price": getattr(o.order, "lmtPrice", None),
+                    "filled": filled,
+                    "remaining": total - filled,
+                    "status": self._parse_order_status(
+                        o.orderStatus.status if hasattr(o.orderStatus, "status") else "unknown"
+                    ),
+                    "info": {"orphaned": True},  # Freqtrade will filter its own trades
                 }
-            )
+
+                orders.append(order)
+
+            except Exception as e:
+                logger.warning(f"Failed to parse open order: {e}")
+
+        logger.info(f"Fetched {len(orders)} open orders from IBKR")
         return orders
+
+    def fetch_order(self, order_id: str, pair: str | None = None) -> dict:
+        # Handle None or invalid order_id
+        if order_id is None:
+            logger.error("Cannot fetch order with order_id=None")
+            return {
+                "status": "not_found",
+                "id": None,
+                "symbol": pair or "unknown",
+                "side": "unknown",
+                "amount": 0.0,
+                "filled": 0.0,
+                "remaining": 0.0,
+            }
+
+        try:
+            oid = int(order_id)
+        except (ValueError, TypeError):
+            logger.error(f"Invalid order ID format: {order_id}")
+            return {
+                "status": "not_found",
+                "id": order_id,
+                "symbol": pair or "unknown",
+                "side": "unknown",
+                "amount": 0.0,
+                "filled": 0.0,
+                "remaining": 0.0,
+            }
+
+        try:
+            for trade in self.ib.trades():
+                if trade.order.orderId == oid:
+                    filled = (
+                        float(trade.orderStatus.filled)
+                        if hasattr(trade.orderStatus, "filled")
+                        else 0.0
+                    )
+                    total = (
+                        float(trade.order.totalQuantity)
+                        if hasattr(trade.order, "totalQuantity")
+                        else 0.0
+                    )
+                    symbol = (
+                        f"{trade.contract.symbol}/{trade.contract.currency}"
+                        if (
+                            hasattr(trade.contract, "symbol")
+                            and hasattr(trade.contract, "currency")
+                        )
+                        else (pair or "unknown")
+                    )
+                    side = (
+                        trade.order.action.lower()
+                        if hasattr(trade.order, "action") and trade.order.action
+                        else "buy"
+                    )
+
+                    price: float | None = None
+                    if trade.order.orderType == "LMT":
+                        price = (
+                            float(trade.order.lmtPrice)
+                            if hasattr(trade.order, "lmtPrice")
+                            else None
+                        )
+                    elif hasattr(trade, "fills") and trade.fills:
+                        total_cost = sum(
+                            fill.execution.price * fill.execution.shares
+                            for fill in trade.fills
+                            if hasattr(fill.execution, "price")
+                            and hasattr(fill.execution, "shares")
+                        )
+                        total_shares = sum(
+                            fill.execution.shares
+                            for fill in trade.fills
+                            if hasattr(fill.execution, "shares")
+                        )
+                        price = total_cost / total_shares if total_shares > 0 else None
+
+                    return {
+                        "id": order_id,
+                        "symbol": symbol,
+                        "type": trade.order.orderType.lower()
+                        if hasattr(trade.order, "orderType")
+                        else "unknown",
+                        "side": side,
+                        "amount": total,
+                        "price": price,
+                        "filled": filled,
+                        "remaining": total - filled,
+                        "status": self._parse_order_status(
+                            trade.orderStatus.status
+                            if hasattr(trade.orderStatus, "status")
+                            else "unknown"
+                        ),
+                        "info": trade,
+                    }
+
+            logger.debug(f"fetch_order: no trade with orderId={order_id}")
+            return {
+                "status": "not_found",
+                "id": order_id,
+                "symbol": pair or "unknown",
+                "side": "unknown",
+                "amount": 0.0,
+                "filled": 0.0,
+                "remaining": 0.0,
+            }
+
+        except Exception as e:
+            logger.error(f"Error in fetch_order for {order_id}: {e}")
+            return {
+                "status": "not_found",
+                "id": order_id,
+                "symbol": pair or "unknown",
+                "side": "unknown",
+                "amount": 0.0,
+                "filled": 0.0,
+                "remaining": 0.0,
+            }
+
+    def close_orphaned_orders(self) -> None:
+        for order in self.fetch_open_orders():
+            if order.get("info", {}).get("orphaned"):
+                logger.warning(
+                    f"Orphaned order found: {order['id']} {order['symbol']} — attempting cancel."
+                )
+                try:
+                    self.cancel_order(order["id"], order["symbol"])
+                except Exception as e:
+                    logger.error(f"Failed to cancel orphaned order {order['id']}: {e}")
 
     def sync_orders(self):
         """
@@ -1192,29 +1247,115 @@ class Interactivebrokers(Foreignexchange):
         # Fetch current open orders from IBKR
         open_orders = self.fetch_open_orders()
         open_order_ids = {order["id"] for order in open_orders}
+        logger.info(f"Found {len(open_order_ids)} open orders in IBKR.")
 
-        # Placeholder: Replace with Freqtrade actual method to get open orders
-        freqtrade_open_orders = self.get_freqtrade_open_orders()
+        # Fetch Freqtrade open trades
+        try:
+            freqtrade_open_orders = self.get_freqtrade_open_orders()
+        except Exception as e:
+            logger.error(f"Failed to fetch Freqtrade open trades: {e}")
+            return
 
         # Remove orders from Freqtrade that are not in IBKR
+        removed_count = 0
         for trade in freqtrade_open_orders:
-            if trade.order_id not in open_order_ids:
-                logger.warning(
-                    f"Order {trade.order_id} not found in IBKR. Removing from Freqtrade."
-                )
-                self.remove_order_from_freqtrade(trade.order_id)
+            try:
+                if trade.order_id not in open_order_ids:
+                    logger.warning(
+                        f"Order {trade.order_id} not found in IBKR. Removing from Freqtrade."
+                    )
+                    self.remove_order_from_freqtrade(trade.order_id)
+                    removed_count += 1
+            except Exception as e:
+                logger.error(f"Failed to process trade {trade.order_id}: {e}")
+
+        logger.info(
+            f"Synchronization complete. Removed {removed_count} orphaned trades from Freqtrade."
+        )
 
     def get_freqtrade_open_orders(self):
         """Retrieve open orders from Freqtrade internal state."""
-        # Placeholder: Implement based on your Freqtrade setup
-        # Example: return self.freqtrade.trades or similar
-        raise NotImplementedError("Implement this to fetch Freqtrade open orders.")
+        try:
+            return Trade.get_open_trades()
+        except Exception as e:
+            logger.error(f"Failed to fetch Freqtrade open trades: {e}")
+            return []
 
     def remove_order_from_freqtrade(self, order_id):
         """Remove an order from Freqtrade internal state."""
-        # Placeholder: Implement based on your Freqtrade setup
-        # Example: self.freqtrade.trades.remove(order_id) or similar
-        raise NotImplementedError("Implement this to remove an order from Freqtrade.")
+        try:
+            trade = Trade.get_trades(trade_filter=[Trade.order_id == order_id]).first()
+            if trade and trade.is_open:
+                trade.is_open = False
+                trade.close_date = datetime.now(UTC)
+                trade.status = "closed"
+                Trade.session.commit()
+                logger.info(f"Removed orphaned trade with order_id {order_id} from Freqtrade.")
+            else:
+                logger.warning(
+                    f"No trade found with order_id {order_id} in Freqtrade or already closed."
+                )
+        except Exception as e:
+            logger.error(f"Failed to remove trade with order_id {order_id}: {e}")
+
+    def close(self) -> None:
+        """
+        Aggressively shut down IBKR connection and subscriptions,
+        without long waits, so CTRL+C returns immediately.
+        """
+        self._running = False
+        self._cancel_subscriptions_and_loop()
+        self._disconnect_and_clear()
+        self._release_port_and_stop_threads()
+        logger.info("IBKR connection closed.")
+
+    def _cancel_subscriptions_and_loop(self) -> None:
+        try:
+            self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
+            self.ib.cancelMktData(0)
+        except Exception as e:
+            logger.warning(f"Exception while cancelling market data subscriptions: {e}")
+
+        if getattr(self, "_ib_loop_started", False):
+            try:
+                self.ib.stopLoop()
+            except Exception as e:
+                logger.warning(f"Exception stopping ib_insync loop: {e}")
+
+    def _disconnect_and_clear(self) -> None:
+        try:
+            if self.ib.isConnected():
+                self.ib.disconnect()
+        except Exception as e:
+            logger.warning(f"Exception during disconnect: {e}")
+
+        try:
+            self.ib.client._sock = None
+        except Exception as e:
+            logger.warning(f"Exception clearing socket reference: {e}")
+
+    def _release_port_and_stop_threads(self) -> None:
+        def _release_port():
+            for attempt in range(3):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind((self.host, self.port))
+                    s.close()
+                    logger.info(f"Port {self.port} released successfully on attempt {attempt + 1}.")
+                    return
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to release port {self.port} on attempt {attempt + 1}: {e}"
+                    )
+                    time.sleep(1)
+            logger.error(f"Could not release port {self.port} after 3 attempts.")
+
+        Thread(target=_release_port, daemon=True).start()
+
+        thr = getattr(self, "_connection_thread", None)
+        if thr and thr.is_alive():
+            thr.join(timeout=0.1)
 
     def fetch_closed_orders(self, symbol: str | None = None) -> list[dict]:
         closed = []
