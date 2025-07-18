@@ -123,6 +123,7 @@ class Interactivebrokers(Foreignexchange):
 
         self.dry_run = config.get("dry_run", False)
         self.latest_ohlcv: dict = {}
+        self._active_tickers: list = []
         self._running = True
         self._reconnect_event = Event()
         self._connection_thread: Thread | None = None
@@ -432,6 +433,13 @@ class Interactivebrokers(Foreignexchange):
         try:
             # 2) Snapshot request: get one tick then unsubscribe
             ticker = self.ib.reqMktData(contract, "", True, False)
+
+            # Initialize active tickers list if it doesn't exist
+            if not hasattr(self, "_active_tickers"):
+                self._active_tickers = []
+
+            self._active_tickers.append(ticker)
+
             # Give IB up to 2 seconds to reply with whatever it has
             self.ib.sleep(2)
 
@@ -1312,7 +1320,14 @@ class Interactivebrokers(Foreignexchange):
     def _cancel_subscriptions_and_loop(self) -> None:
         try:
             self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
-            self.ib.cancelMktData(0)
+
+            # Cancel any active market data subscriptions
+            tickers = getattr(self, "_active_tickers", [])
+            for ticker in tickers:
+                try:
+                    self.ib.cancelMktData(ticker)
+                except Exception as e:
+                    logger.debug(f"Failed to cancel market data for {ticker}: {e}")
         except Exception as e:
             logger.warning(f"Exception while cancelling market data subscriptions: {e}")
 
