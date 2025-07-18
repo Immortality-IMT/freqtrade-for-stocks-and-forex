@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -31,7 +32,7 @@ from freqtrade.exchange.stockexchange import Stockexchange
 
 logger = logging.getLogger(__name__)
 
-_min_interval = 2.0  # throttle it by 1 call every 2 sec to avoid time bans
+_min_interval = 3.0  # throttle it by 1 call every 2 sec to avoid time bans
 _last_request_ts = 0.0
 
 
@@ -165,10 +166,8 @@ class Alpacastocks(Stockexchange):
         symbol = pair.split("/", 1)[0]
         params = params or {}
         try:
-            # Map Freqtrade side to Alpaca OrderSide enum
             side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
-            # MARKET
             if ordertype == "market":
                 notional = round(amount, 2)
                 if notional < 1.0:
@@ -180,7 +179,7 @@ class Alpacastocks(Stockexchange):
                     side=side_enum,
                     time_in_force=TimeInForce.DAY,
                 )
-            # LIMIT
+
             elif ordertype == "limit":
                 if price is None:
                     price = self.get_rate(f"{symbol}/USD")
@@ -188,24 +187,22 @@ class Alpacastocks(Stockexchange):
                         f"No limit price supplied; using current market price {price:.2f}"
                     )
 
-                if amount > self._get_available_qty(symbol):
+                available = self._get_available_qty(symbol)
+                if amount > available:
                     logger.warning(
-                        f"Requested {amount} exceeds available qty. Adjusting to available."
+                        f"Requested {amount} exceeds available qty ({available}). "
+                        "Adjusting to available."
                     )
-                    amount = self._get_available_qty(symbol)
+                # Floor to 6 decimal places to ensure qty <= available
+                raw_qty = min(amount, available)
+                precision = 6
+                qty = math.floor(raw_qty * (10**precision)) / (10**precision)
+                if qty <= 0:
+                    raise OperationalException(f"Available quantity too small ({available}).")
 
                 limit_price = round(price, 2)
-                if limit_price != price:
-                    logger.debug(f"Rounded limit price from {price} to {limit_price}")
-
-                qty = round(amount, 6)
-                # Check if qty is fractional with a small epsilon for floating-point precision
-                if abs(qty - int(qty)) > 1e-6:
-                    time_in_force = TimeInForce.DAY
-                    logger.info(f"Using time_in_force=DAY for fractional order of {qty} shares.")
-                else:
-                    time_in_force = TimeInForce.GTC
-                    logger.info(f"Using time_in_force=GTC for whole share order of {qty} shares.")
+                time_in_force = TimeInForce.DAY if abs(qty - int(qty)) > 1e-6 else TimeInForce.GTC
+                logger.info(f"Using time_in_force={time_in_force} for order of {qty} shares.")
 
                 order_req = LimitOrderRequest(
                     symbol=symbol,
@@ -216,12 +213,14 @@ class Alpacastocks(Stockexchange):
                 )
             else:
                 raise OperationalException(f"Unsupported order type: {ordertype}")
+
             alpaca_order = self.trading_client.submit_order(order_req)
             raw_qty = alpaca_order.qty
             raw_filled = alpaca_order.filled_qty
-            qty = float(raw_qty) if raw_qty is not None else float(raw_filled or 0)
             filled = float(raw_filled or 0)
+            qty = float(raw_qty) if raw_qty is not None else filled
             remaining = qty - filled
+
             return {
                 "id": str(alpaca_order.id),
                 "symbol": f"{symbol}/USD",
