@@ -1,7 +1,7 @@
 # pip install ib_insync
 # Interactive Brokers exchange forex integration for FreqTrade
 
-import asyncio
+import atexit
 import logging
 import math
 import socket
@@ -17,7 +17,24 @@ from freqtrade.enums import MarginMode
 from freqtrade.exchange.foreignexchange import Foreignexchange
 
 
+util.patchAsyncio()
+
 logger = logging.getLogger(__name__)
+
+_min_interval = 0.5  # One request every 2 seconds
+_last_request_ts = 0.0
+
+_request_lock = Lock()
+
+
+def throttle():
+    global _last_request_ts
+    with _request_lock:
+        now = time.time()
+        elapsed = now - _last_request_ts
+        if elapsed < _min_interval:
+            time.sleep(_min_interval - elapsed)
+        _last_request_ts = time.time()
 
 
 class Interactivebrokers(Foreignexchange):
@@ -97,6 +114,12 @@ class Interactivebrokers(Foreignexchange):
         )
 
         self.ib = IB()
+        try:
+            self.ib.startLoop()
+            self._ib_loop_started = True
+        except Exception as e:
+            logger.debug(f"ib.startLoop() failed — already running or unsupported: {e}")
+
         self.dry_run = config.get("dry_run", False)
         self.latest_ohlcv: dict = {}
         self._running = True
@@ -104,10 +127,15 @@ class Interactivebrokers(Foreignexchange):
         self._connection_thread: Thread | None = None
         self._ws_connected = False
         self._markets_cache: dict[str, Any] | None = None
+        self._live_price_cache: dict[str, tuple[float, float]] = {}
 
         self._cache_lock = Lock()
         self._entry_rate_cache = {}
         self._exit_rate_cache = {}
+
+        self._connection_lock = Lock()
+        self._last_connection_ts = 0
+        atexit.register(self.close)
 
         # Set ports based on live/paper trading
         if self.dry_run:
@@ -141,78 +169,64 @@ class Interactivebrokers(Foreignexchange):
             logger.info("Set default candle_type_def to 'spot' for interactivebrokers")
 
     def _connect_to_ib(self) -> None:
-        max_retries = 3
-        retry_count = 0
-        retry_delay = 5
-
-        while retry_count < max_retries:
+        with _request_lock:  # Thread-safe connection
             try:
                 if self.ib.isConnected():
-                    self.ib.disconnect()
+                    return
 
-                logger.info(
-                    f"Connecting to IBKR on {self.host}:{self.port} (clientId={self.client_id})"
-                )
+                logger.info(f"Connecting to {self.host}:{self.port}")
                 self.ib.connect(self.host, self.port, clientId=self.client_id)
 
-                if self.ib.isConnected():
-                    logger.info(f"Successfully connected to IBKR on port {self.port}.")
-                    util.startLoop()
-                    self._setup_event_loop()
-                    self._ws_connected = True
-                    return
-                else:
-                    logger.warning("Connection attempt returned without error but not connected")
-                    retry_count += 1
-            except ConnectionRefusedError as e:
-                logger.error(f"Connection refused while connecting to IBKR: {e}")
-                retry_count += 1
+                if not self.ib.isConnected():
+                    raise ConnectionError("Connection failed without exception")
+
+                logger.info("Connection established")
+                self._ws_connected = True
+
+            except (ConnectionError, ConnectionRefusedError) as e:
+                logger.error(f"Connection error: {e}")
+                raise
             except Exception as e:
-                logger.error(f"Unexpected error while connecting to IBKR: {e}")
-                retry_count += 1
-
-            if retry_count < max_retries:
-                logger.info(
-                    f"Retrying connection in {retry_delay} seconds..."
-                    f"(Attempt {retry_count + 1}/{max_retries})"
-                )
-                time.sleep(retry_delay)
-
-        logger.error("Failed to connect to IBKR after multiple attempts")
-        logger.error("Please ensure TWS or IB Gateway is running with API connections enabled")
-        raise ConnectionError("Could not connect to Interactive Brokers")
+                logger.error(f"Unexpected connection error: {e}")
+                raise ConnectionError(f"Connection failed: {e}")
 
     def _setup_event_loop(self) -> None:
-        if self._connection_thread is not None and self._connection_thread.is_alive():
-            logger.info("Event loop thread is already running")
+        if self._connection_thread and self._connection_thread.is_alive():
             return
 
-        self._loop = asyncio.new_event_loop()
+        self._reconnect_attempts = 0
+        self._max_reconnect_attempts = 5
+        self._reconnect_base_delay = 5
 
         def _start_ib_loop():
-            asyncio.set_event_loop(self._loop)
             logger.info("Starting IBKR event loop")
-
             while self._running:
                 try:
-                    if self.ib.isConnected():
-                        self.ib.sleep(1)
+                    if not self.ib.isConnected():
+                        self._reconnect_attempts += 1
+                        delay = min(
+                            self._reconnect_base_delay * 2**self._reconnect_attempts,
+                            60,  # Max 60 seconds
+                        )
+                        logger.warning(
+                            f"Connection lost. Reconnecting in {delay}s "
+                            f"(attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
+                        )
+                        time.sleep(delay)
+                        self._connect_to_ib()
                     else:
-                        if self._reconnect_event.wait(timeout=5):
-                            self._reconnect_event.clear()
-                            try:
-                                self._connect_to_ib()
-                            except Exception as e:
-                                logger.error(f"Error during reconnection: {e}")
+                        self._reconnect_attempts = 0
+                        self.ib.sleep(1)
+                except ConnectionError as e:
+                    logger.error(f"IB connection error: {e}")
                 except Exception as e:
-                    logger.error(f"Error in IBKR event loop: {e}")
-                    time.sleep(1)
+                    logger.error(f"Unexpected error in event loop: {e}", exc_info=True)
+                    time.sleep(5)
 
             logger.info("IBKR event loop stopped")
 
         self._connection_thread = Thread(target=_start_ib_loop, daemon=True)
         self._connection_thread.start()
-        logger.info("Started IBKR event loop in background thread.")
 
     @property
     def id(self) -> str:
@@ -356,69 +370,106 @@ class Interactivebrokers(Foreignexchange):
             return self._fetch_live_price(pair, side)
         except Exception as e:
             logger.error(f"Failed to request market data for {pair} (live): {e}")
-            # Trigger IBKR reconnect on data farm or stale data errors
-            try:
-                logger.info("Attempting to reconnect to IBKR and retry price fetch")
-                self._reconnect_event.set()
-                self._connect_to_ib()
-                # brief pause to re-establish streams
-                time.sleep(1)
-                price = self._fetch_live_price(pair, side)
-                logger.info(f"Price fetch after reconnect succeeded for {pair}: {price}")
-                return price
-            except Exception as e2:
-                logger.error(f"Retry after reconnect failed for {pair}: {e2}")
         # Final fallback
         return self._fallback_to_historical_rate(pair)
 
     def _fetch_live_price(self, pair: str, side: str | None) -> float:
-        symbol, currency = pair.split("/")
-        contract = Forex(
-            symbol=symbol.strip().upper(), currency=currency.strip().upper(), exchange="IDEALPRO"
-        )
+        """
+        Fetch live price from IBKR with caching, snapshot requests,
+        and silent fallback to historical data.
 
-        ticker = self.ib.reqMktData(contract)
+        Args:
+            pair: Currency pair in format 'BASE/QUOTE'
+            side: 'buy', 'sell', or None for mid price
 
-        # Wait up to 2 seconds for valid bid/ask
-        start = time.time()
-        while time.time() - start < 2:
-            self.ib.sleep(0.1)
-            if ticker.bid > 0.00001 and ticker.ask > 0.00001:
-                break
+        Returns:
+            Current price as float (live if possible, else historical)
+        """
+        now = time.time()
+        # 1) Return cached price if within 1 second
+        cached = self._live_price_cache.get(pair)
+        if cached and (now - cached[0] < 1.0):
+            price = cached[1]
+            logger.info(f"Cached price for {pair} ({side}): {price}")
+            return price
 
-        if not (ticker and ticker.bid > 0.00001 and ticker.ask > 0.00001):
-            raise ValueError(f"Invalid market data for {pair}: bid={ticker.bid}, ask={ticker.ask}")
+        # Connection check
+        if not self.ib.isConnected():
+            raise ConnectionError("Not connected to IBKR")
 
-        if side is None:
-            price = (ticker.bid + ticker.ask) / 2
-        elif side.lower() == "buy":
-            price = ticker.ask
-        elif side.lower() == "sell":
-            price = ticker.bid
-        else:
-            price = (ticker.bid + ticker.ask) / 2
+        # Build contract
+        symbol, currency = self._extract_currencies_from_pair(pair)
+        contract = Forex(symbol=symbol, currency=currency, exchange="IDEALPRO")
 
-        if not (0.00001 <= price <= 1000.0):
-            raise ValueError(f"Price out of valid forex range: {price}")
+        # Rate limit before request
+        throttle()
 
-        logger.info(f"Returning price for {pair} ({side}): {price}")
-        return price
+        try:
+            # 2) Snapshot request: get one tick then unsubscribe
+            ticker = self.ib.reqMktData(contract, "", True, False)
+            # Give IB up to 2 seconds to reply with whatever it has
+            self.ib.sleep(2)
+
+            bid = getattr(ticker, "bid", None)
+            ask = getattr(ticker, "ask", None)
+            if bid is None or ask is None or math.isnan(bid) or math.isnan(ask):
+                raise ValueError("No valid live tick")
+
+            # Choose price based on side
+            if side is None:
+                price = (bid + ask) / 2
+            elif side.lower() == "buy":
+                price = ask
+            elif side.lower() == "sell":
+                price = bid
+            else:
+                price = (bid + ask) / 2
+
+            # 3) Cache and log live price
+            self._live_price_cache[pair] = (now, price)
+            logger.info(f"Returning price for {pair} ({side}): {price}")
+            return price
+
+        except Exception:
+            # 4) On any failure, fallback to historical close
+            price = self._fallback_to_historical_rate(pair)
+            logger.info(f"Historical fallback price for {pair}: {price}")
+            return price
 
     def _fallback_to_historical_rate(self, pair: str) -> float:
+        """
+        Fallback to historical data when live price fails.
+
+        Args:
+            pair: Currency pair in format 'BASE/QUOTE'
+
+        Returns:
+            Most recent historical close price
+
+        Raises:
+            ValueError: If no valid historical data available
+        """
         try:
             timeframe = self.config.get("timeframe", "5m")
             ohlcv = self.get_historic_ohlcv(pair, timeframe=timeframe, limit=1)
-            if not ohlcv.empty:
-                close_price = ohlcv.iloc[0]["close"]
-                if pd.notna(close_price) and close_price > 0.00001:
-                    if not (0.00001 <= close_price <= 1000.0):
-                        raise ValueError(f"Invalid historical close price: {close_price}")
-                    logger.info(f"Returning historical close price for {pair}: {close_price}")
-                    return close_price
-                logger.warning(f"Invalid historical close price for {pair}: {close_price}")
+
+            if ohlcv.empty:
+                raise ValueError(f"No historical data available for {pair}")
+
+            close_price = ohlcv.iloc[0]["close"]
+
+            if pd.isna(close_price):
+                raise ValueError(f"NaN value in historical data for {pair}")
+
+            if not (0.00001 <= close_price <= 1000.0):
+                raise ValueError(f"Historical price {close_price} out of valid range for {pair}")
+
+            logger.info(f"Using historical close price for {pair}: {close_price}")
+            return close_price
+
         except Exception as e:
-            logger.error(f"Failed to fetch historical data for {pair}: {e}")
-        raise ValueError(f"Could not fetch valid rate for {pair}")
+            logger.error(f"Historical data fallback failed for {pair}: {str(e)}")
+            raise ValueError(f"Could not fetch valid rate for {pair} from any source")
 
     def _failed_response(self, pair, ordertype, side, amount, price, info):
         return {
@@ -585,26 +636,34 @@ class Interactivebrokers(Foreignexchange):
         return maker_fee if taker_or_maker == "maker" else taker_fee
 
     async def fetch_historical_data(self, contract, durationStr, ib_timeframe):
+        """
+        Request historical price data from IBKR (one shot only).
+
+        Args:
+            contract: IBKR Contract object.
+            durationStr: How far back to go (e.g. '1 D', '2 W').
+            ib_timeframe: Bar size (e.g. '1 min', '5 mins').
+
+        Returns:
+            List of bars, or empty list if unavailable.
+        """
         try:
             bars = await self.ib.reqHistoricalDataAsync(
                 contract,
-                endDateTime="",  # Current time
+                endDateTime="",  # Now
                 durationStr=durationStr,
                 barSizeSetting=ib_timeframe,
                 whatToShow="MIDPOINT",
                 useRTH=False,
-                keepUpToDate=True,
+                keepUpToDate=False,  # ONE SHOT (no streaming)
             )
             if not bars:
-                logger.warning(
-                    f"No historical data returned for contract:"
-                    f"{contract.symbol}/{contract.currency}"
-                )
-                return []
+                logger.warning(f"No historical data returned for contract: {contract}")
             return bars
+
         except Exception as e:
-            logger.error(f"Error fetching historical data: {e}")
-            raise
+            logger.warning(f"Historical data error for {contract}: {e}")
+            return []
 
     def get_historic_ohlcv(
         self,
@@ -634,8 +693,9 @@ class Interactivebrokers(Foreignexchange):
         durationStr = self._calculate_duration(timeframe, limit)
 
         try:
+            throttle()
             bars = self.ib.run(self.fetch_historical_data(contract, durationStr, ib_timeframe))
-
+            throttle()
             if not bars:
                 logger.warning(f"No bars returned for {pair} with timeframe {timeframe}")
                 return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
@@ -676,7 +736,6 @@ class Interactivebrokers(Foreignexchange):
                     f"from {first_candle} to {last_candle} "
                     f"(Last candle age: {age_minutes:.2f} minutes)"
                 )
-
             return df
 
         except Exception as e:
@@ -749,24 +808,63 @@ class Interactivebrokers(Foreignexchange):
         return balances
 
     def close(self) -> None:
+        """
+        Aggressively shut down IBKR connection and subscriptions,
+        without long waits, so CTRL+C returns immediately.
+        """
+        self._running = False
+        self._cancel_data_subscriptions()
+        self._disconnect_ibkr()
+        self._release_ibkr_port()
+        self._join_connection_thread()
+        logger.info("Brutal close(): all IBKR subscriptions canceled, disconnected.")
+
+    def _cancel_data_subscriptions(self) -> None:
+        """Cancel all market and historical data subscriptions."""
+        try:
+            self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
+            self.ib.client.reqCancelHistoricalData(0)
+        except Exception as e:
+            logger.warning(f"Exception while cancelling data subscriptions: {e}")
+
+        if getattr(self, "_ib_loop_started", False):
+            try:
+                self.ib.stopLoop()
+            except Exception as e:
+                logger.warning(f"Exception stopping ib_insync loop: {e}")
+
+    def _disconnect_ibkr(self) -> None:
+        """Force disconnect and clean up socket."""
         try:
             if self.ib.isConnected():
                 self.ib.disconnect()
-                logger.info("Disconnected from IBKR.")
-            # Ensure the socket is fully closed
-            self.ib.client._sock = None  # Clear the socket reference
         except Exception as e:
-            logger.error(f"Error during IBKR disconnection: {e}")
-        finally:
-            # Attempt to release the port
+            logger.warning(f"Exception during disconnect: {e}")
+
+        try:
+            self.ib.client._sock = None
+        except Exception as e:
+            logger.warning(f"Exception clearing socket reference: {e}")
+
+    def _release_ibkr_port(self) -> None:
+        """Attempt to free the port used by IBKR connection (non-blocking)."""
+
+        def _release():
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Allow port reuse
-                sock.bind((self.host, self.port))  # Try binding to the port
-                sock.close()
-                logger.info(f"Port {self.port} released successfully.")
-            except OSError as e:
-                logger.warning(f"Failed to release port {self.port}: {e}")
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((self.host, self.port))
+                s.close()
+            except Exception as e:
+                logger.warning(f"Exception releasing port {self.port}: {e}")
+
+        Thread(target=_release, daemon=True).start()
+
+    def _join_connection_thread(self) -> None:
+        """Join the reconnect thread if active."""
+        thr = getattr(self, "_connection_thread", None)
+        if thr and thr.is_alive():
+            thr.join(timeout=0.1)
 
     def market_is_tradable(self, market: dict) -> bool:
         return market.get("active", False) and market.get("tradable", True)
@@ -811,7 +909,15 @@ class Interactivebrokers(Foreignexchange):
         logger.info("WebSocket stopped")
 
     def ws_health_check(self) -> bool:
-        return self.ib.isConnected() and self._ws_connected
+        if not self.ib.isConnected():
+            return False
+
+        try:
+            # Verify actual data flow
+            self.ib.reqCurrentTime()
+            return True
+        except Exception:
+            return False
 
     def _convert_timeframe(self, timeframe: str) -> str:
         mapping = {
@@ -1185,18 +1291,21 @@ class Interactivebrokers(Foreignexchange):
         return self.fetch_tickers([symbol])[symbol]
 
     def fetch_tickers(self, symbols: list[str] | None = None) -> dict[str, dict]:
-        tickers = {}
-        # Default to all open positions if no list given
-        symbols = symbols or [p["symbol"] for p in self.fetch_positions()]
+        tickers: dict[str, dict] = {}
+        # Default to all configured market pairs if no list given
+        symbols = symbols or list(self.markets.keys())
         for sym in symbols:
             contract = self._get_contract(sym)
-            data = self.ib.reqMktData(contract, "", False, False)
-            # Wait briefly for IB to populate data (you may need a small sleep here)
-            last = (data.bid + data.ask) / 2 if data.bid and data.ask else data.last
+            # snapshot=True for one off quote, or reuse existing subscription
+            data = self.ib.reqMktData(contract, "", True, False)
+            self.ib.sleep(0.5)
+            bid = getattr(data, "bid", None) or 0.0
+            ask = getattr(data, "ask", None) or 0.0
+            last = (bid + ask) / 2 if bid and ask else getattr(data, "last", 0.0)
             tickers[sym] = {
                 "symbol": sym,
-                "bid": data.bid,
-                "ask": data.ask,
+                "bid": bid,
+                "ask": ask,
                 "last": last,
                 "info": {},
             }
