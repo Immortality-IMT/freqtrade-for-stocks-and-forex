@@ -4,9 +4,10 @@
 import atexit
 import logging
 import math
+import signal
 import socket
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -26,6 +27,12 @@ _min_interval = 0.5  # One request every 2 seconds
 _last_request_ts = 0.0
 
 _request_lock = Lock()
+
+# Define forex market open and close times in UTC
+MARKET_OPEN_TIME_UTC = datetime.strptime("22:00", "%H:%M").time()  # Sunday 10:00 PM UTC
+MARKET_CLOSE_TIME_UTC = datetime.strptime("22:00", "%H:%M").time()  # Friday 10:00 PM UTC
+MARKET_OPEN_DAY = 6  # Sunday (0 = Monday, 6 = Sunday)
+MARKET_CLOSE_DAY = 4  # Friday
 
 
 def throttle():
@@ -126,6 +133,7 @@ class Interactivebrokers(Foreignexchange):
         self._active_tickers: list = []
         self._running = True
         self._reconnect_event = Event()
+        self.shutdown_event = Event()
         self._connection_thread: Thread | None = None
         self._ws_connected = False
         self._markets_cache: dict[str, Any] | None = None
@@ -135,7 +143,6 @@ class Interactivebrokers(Foreignexchange):
         self._entry_rate_cache = {}
         self._exit_rate_cache = {}
 
-        self._connection_lock = Lock()
         self._last_connection_ts = 0
         atexit.register(self.close)
 
@@ -169,6 +176,14 @@ class Interactivebrokers(Foreignexchange):
         if "candle_type_def" not in self.config:
             self.config["candle_type_def"] = "spot"
             logger.info("Set default candle_type_def to 'spot' for interactivebrokers")
+
+        # Register signal handler for SIGINT (Ctrl+C)
+        signal.signal(signal.SIGINT, self._handle_sigint)
+
+    def _handle_sigint(self, signum, frame):
+        logger.info("Received Ctrl+C, forcing immediate shutdown...")
+        self.shutdown_event.set()
+        self.close()
 
     def _connect_to_ib(self) -> None:
         """
@@ -226,7 +241,7 @@ class Interactivebrokers(Foreignexchange):
 
         def _start_ib_loop():
             logger.info("Starting IBKR event loop")
-            while self._running:
+            while self._running and not self.shutdown_event.is_set():
                 try:
                     if not self.ib.isConnected():
                         self._reconnect_attempts += 1
@@ -264,6 +279,55 @@ class Interactivebrokers(Foreignexchange):
 
     def get_proxy_coin(self) -> str:
         return self.config.get("stake_currency", "USD")
+
+    def is_market_open(self) -> bool:
+        """
+        Check if the forex market is currently open based on UTC time.
+        - Open: Sunday 10:00 PM UTC to Friday 10:00 PM UTC
+        - Closed: Friday 10:00 PM UTC to Sunday 10:00 PM UTC
+        """
+        now = datetime.now(UTC)
+        day = now.weekday()
+        current_time = now.time()
+
+        if day == 5:  # Saturday
+            return False
+        elif day == 6:  # Sunday
+            return current_time >= MARKET_OPEN_TIME_UTC
+        elif day == 4:  # Friday
+            return current_time < MARKET_CLOSE_TIME_UTC
+        else:  # Monday to Thursday
+            return True
+
+    def wait_for_market_open(self) -> None:
+        """
+        Sleep until the forex market opens if it is currently closed.
+        """
+        if self.is_market_open():
+            return
+
+        now = datetime.now(UTC)
+        if now.weekday() == 5:  # Saturday
+            next_open = now.replace(hour=22, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        elif now.weekday() == 6:  # Sunday
+            next_open = now.replace(hour=22, minute=0, second=0, microsecond=0)
+        else:  # Friday after close
+            next_open = now.replace(hour=22, minute=0, second=0, microsecond=0) + timedelta(
+                days=(6 - now.weekday())
+            )
+
+        sleep_seconds = (next_open - now).total_seconds()
+        logger.info(
+            f"Market closed. Sleeping for {sleep_seconds:.2f} seconds until {next_open} UTC."
+        )
+
+        # Sleep in smaller intervals to check for shutdown event
+        while sleep_seconds > 0 and not self.shutdown_event.is_set():
+            time.sleep(min(1, sleep_seconds))
+            sleep_seconds -= 1
+
+        if self.shutdown_event.is_set():
+            logger.info("Shutdown signal received, exiting sleep.")
 
     def create_order(
         self,
@@ -316,12 +380,21 @@ class Interactivebrokers(Foreignexchange):
             return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
         deadline = time.time() + 30
-        while time.time() < deadline and trade.orderStatus.status in (
-            "ApiPending",
-            "PendingSubmit",
-            "Submitted",
+        while (
+            time.time() < deadline
+            and trade.orderStatus.status
+            in (
+                "ApiPending",
+                "PendingSubmit",
+                "Submitted",
+            )
+            and not self.shutdown_event.is_set()
         ):
             self.ib.waitOnUpdate(timeout=1)
+
+        if self.shutdown_event.is_set():
+            logger.info("Shutdown signal received, exiting order placement.")
+            return self._failed_response(pair, ordertype, side, amount, price, "Shutdown")
 
         return self._finalize_trade_status(trade, pair, ordertype, side, amount, price)
 
@@ -390,6 +463,9 @@ class Interactivebrokers(Foreignexchange):
         Try to fetch a live price; on failure due to stale/nan data or disconnect,
         trigger a reconnect and retry once before falling back to historical.
         """
+        if not self.is_market_open():
+            self.wait_for_market_open()
+
         pair = pair[0] if isinstance(pair, tuple) else pair
         # First attempt
         try:
@@ -402,7 +478,8 @@ class Interactivebrokers(Foreignexchange):
     def _fetch_live_price(self, pair: str, side: str | None) -> float:
         """
         Fetch live price from IBKR with caching, snapshot requests,
-        and silent fallback to historical data.
+        and silent fallback to historical data. This version is improved to be
+        more reliable and efficient.
 
         Args:
             pair: Currency pair in format 'BASE/QUOTE'
@@ -416,7 +493,7 @@ class Interactivebrokers(Foreignexchange):
         cached = self._live_price_cache.get(pair)
         if cached and (now - cached[0] < 1.0):
             price = cached[1]
-            logger.info(f"Cached price for {pair} ({side}): {price}")
+            logger.debug(f"Using cached price for {pair} ({side}): {price}")
             return price
 
         # Connection check
@@ -430,23 +507,30 @@ class Interactivebrokers(Foreignexchange):
         # Rate limit before request
         throttle()
 
+        ticker = None
         try:
             # 2) Snapshot request: get one tick then unsubscribe
             ticker = self.ib.reqMktData(contract, "", True, False)
 
-            # Initialize active tickers list if it doesn't exist
-            if not hasattr(self, "_active_tickers"):
-                self._active_tickers = []
+            # Wait for valid data with a timeout instead of a fixed sleep
+            deadline = time.time() + 5  # 5-second timeout
+            while time.time() < deadline:
+                bid = getattr(ticker, "bid", None)
+                ask = getattr(ticker, "ask", None)
+                if (
+                    bid is not None
+                    and ask is not None
+                    and not math.isnan(bid)
+                    and not math.isnan(ask)
+                ):
+                    break  # Data is valid
+                self.ib.sleep(0.1)  # Let ib_insync process events
+            else:
+                # Loop finished without break, indicates a timeout
+                raise ValueError(f"Timeout waiting for valid live tick for {pair}")
 
-            self._active_tickers.append(ticker)
-
-            # Give IB up to 2 seconds to reply with whatever it has
-            self.ib.sleep(2)
-
-            bid = getattr(ticker, "bid", None)
-            ask = getattr(ticker, "ask", None)
-            if bid is None or ask is None or math.isnan(bid) or math.isnan(ask):
-                raise ValueError("No valid live tick")
+            bid = ticker.bid
+            ask = ticker.ask
 
             # Choose price based on side
             if side is None:
@@ -463,11 +547,16 @@ class Interactivebrokers(Foreignexchange):
             logger.info(f"Returning price for {pair} ({side}): {price}")
             return price
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Live price fetch for {pair} failed: {e}. Falling back to historical.")
             # 4) On any failure, fallback to historical close
             price = self._fallback_to_historical_rate(pair)
             logger.info(f"Historical fallback price for {pair}: {price}")
             return price
+        finally:
+            # IMPORTANT: Cancel the market data subscription to prevent leaks
+            if ticker:
+                self.ib.cancelMktData(ticker.contract)
 
     def _fallback_to_historical_rate(self, pair: str) -> float:
         """
@@ -651,6 +740,9 @@ class Interactivebrokers(Foreignexchange):
         candle_type: str = "spot",
         until_ms: int | None = None,
     ) -> pd.DataFrame:
+        if not self.is_market_open():
+            self.wait_for_market_open()
+
         if isinstance(pair, tuple):
             pair = pair[0]
 
@@ -976,14 +1068,6 @@ class Interactivebrokers(Foreignexchange):
             "remaining": 0.0,
         }
 
-    def is_market_open(self):
-        now = datetime.now(UTC)
-        if now.weekday() == 4 and now.hour >= 22:
-            return False
-        if now.weekday() >= 5:
-            return False
-        return True
-
     def _extract_currencies_from_pair(self, pair: str) -> tuple[str, str]:
         if isinstance(pair, tuple):
             pair = pair[0]
@@ -1068,6 +1152,9 @@ class Interactivebrokers(Foreignexchange):
         Ensures all returned orders include a valid 'side' field to prevent bot crashes.
         Adds "orphaned": True to orders not associated with known trades.
         """
+
+        if not self.is_market_open():
+            self.wait_for_market_open()
         orders: list[dict] = []
 
         for o in self.ib.openOrders():
@@ -1194,6 +1281,24 @@ class Interactivebrokers(Foreignexchange):
                         )
                         price = total_cost / total_shares if total_shares > 0 else None
 
+                    status = self._parse_order_status(
+                        trade.orderStatus.status
+                        if hasattr(trade.orderStatus, "status")
+                        else "unknown"
+                    )
+
+                    if status in ("canceled", "rejected", "inactive"):
+                        logger.warning(f"Order {order_id} is {status}. Treating as not found.")
+                        return {
+                            "status": "not_found",
+                            "id": order_id,
+                            "symbol": symbol,
+                            "side": side,
+                            "amount": total,
+                            "filled": filled,
+                            "remaining": total - filled,
+                        }
+
                     return {
                         "id": order_id,
                         "symbol": symbol,
@@ -1205,11 +1310,7 @@ class Interactivebrokers(Foreignexchange):
                         "price": price,
                         "filled": filled,
                         "remaining": total - filled,
-                        "status": self._parse_order_status(
-                            trade.orderStatus.status
-                            if hasattr(trade.orderStatus, "status")
-                            else "unknown"
-                        ),
+                        "status": status,
                         "info": trade,
                     }
 
@@ -1247,12 +1348,32 @@ class Interactivebrokers(Foreignexchange):
                 except Exception as e:
                     logger.error(f"Failed to cancel orphaned order {order['id']}: {e}")
 
+    def cleanup_incomplete_trades(self):
+        """
+        Detect and remove incomplete trades from Freqtrade's database.
+        Incomplete trades are those with zero amount or invalid rates.
+        """
+        try:
+            open_trades = Trade.get_open_trades()
+            for trade in open_trades:
+                if trade.amount == 0 or trade.open_rate <= 0:
+                    logger.warning(f"Incomplete trade detected: ID {trade.id}, Pair {trade.pair}")
+                    trade.is_open = False
+                    trade.close_date = datetime.now(UTC)
+                    trade.status = "closed"
+                    Trade.session.commit()
+                    logger.info(f"Closed incomplete trade ID {trade.id}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup incomplete trades: {e}")
+
     def sync_orders(self):
         """
         Synchronize Freqtrade's internal orders with IBKR's open orders.
         Removes orders from Freqtrade if they no longer exist in IBKR.
+        Also cleans up incomplete trades.
         """
-        # Fetch current open orders from IBKR
+        self.cleanup_incomplete_trades()
+
         open_orders = self.fetch_open_orders()
         open_order_ids = {order["id"] for order in open_orders}
         logger.info(f"Found {len(open_order_ids)} open orders in IBKR.")
@@ -1312,25 +1433,25 @@ class Interactivebrokers(Foreignexchange):
         without long waits, so CTRL+C returns immediately.
         """
         self._running = False
-        self._cancel_subscriptions_and_loop()
-        self._disconnect_and_clear()
-        self._release_port_and_stop_threads()
-        logger.info("IBKR connection closed.")
+        self.shutdown_event.set()
 
-    def _cancel_subscriptions_and_loop(self) -> None:
+        # Forcefully cancel all subscriptions
         try:
-            self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
-
-            # Cancel any active market data subscriptions
-            tickers = getattr(self, "_active_tickers", [])
-            for ticker in tickers:
+            if hasattr(self.ib.client, "reqMarketDataType"):
+                self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
+            for ticker in getattr(self, "_active_tickers", []):
                 try:
-                    self.ib.cancelMktData(ticker)
+                    self.ib.cancelMktData(ticker.contract)  # Assuming ticker has .contract
                 except Exception as e:
-                    logger.debug(f"Failed to cancel market data for {ticker}: {e}")
+                    # Log the specific error but continue
+                    logger.warning(f"Ignoring error while canceling ticker during shutdown: {e}")
         except Exception as e:
-            logger.warning(f"Exception while cancelling market data subscriptions: {e}")
+            # Log the broader error but continue
+            logger.warning(f"Ignoring error during shutdown subscription cleanup: {e}")
 
+        self._disconnect_and_clear()
+
+        # Immediately terminate the event loop
         if getattr(self, "_ib_loop_started", False):
             try:
                 self.ib.stopLoop()
@@ -1341,11 +1462,16 @@ class Interactivebrokers(Foreignexchange):
         try:
             if self.ib.isConnected():
                 self.ib.disconnect()
+                self.ib.client._sock = None  # Nullify socket immediately
         except Exception as e:
             logger.warning(f"Exception during disconnect: {e}")
 
+        # Release port forcefully without retries
         try:
-            self.ib.client._sock = None
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, self.port))
+            s.close()
         except Exception as e:
             logger.warning(f"Exception clearing socket reference: {e}")
 
@@ -1454,7 +1580,7 @@ class Interactivebrokers(Foreignexchange):
             contract = self._get_contract(sym)
             # snapshot=True for one off quote, or reuse existing subscription
             data = self.ib.reqMktData(contract, "", True, False)
-            self.ib.sleep(0.5)
+            throttle()
             bid = getattr(data, "bid", None) or 0.0
             ask = getattr(data, "ask", None) or 0.0
             last = (bid + ask) / 2 if bid and ask else getattr(data, "last", 0.0)
