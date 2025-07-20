@@ -1,7 +1,5 @@
 import asyncio
-import json
 import logging
-import threading
 import time
 import traceback
 from collections.abc import AsyncGenerator
@@ -11,7 +9,6 @@ from typing import Any, cast
 
 import pandas as pd
 import requests
-import websocket
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
@@ -128,89 +125,69 @@ TOKEN_ABI = [
 ]
 
 
-def get_nodereal_graphql_url(api_key: str) -> str:
-    """Returns the NodeReal GraphQL URL with the provided API key."""
-    return NODEREAL_FREE_URL.format(api_key=api_key)
-
-
-def init_websocket(self):
-    """Initializes WebSocket connection using NodeReal URL."""
-    max_retries = 5
-    ws_url = BSC_WS_URL.format(ws_api_key=self.ws_api_key)
-    for attempt in range(max_retries):
-        try:
-            self.logger.info(
-                f"Attempting WebSocket connection (attempt {attempt + 1}/{max_retries}) to {ws_url}"
-            )
-            self.ws = websocket.WebSocket()
-            self.ws.connect(ws_url)
-            self.logger.info(f"WebSocket connection established to {ws_url}")
-            break
-        except Exception as e:
-            self.logger.error(f"WebSocket connection failed: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(2**attempt)  # Exponential backoff
-            else:
-                self.logger.error("Max retries reached, giving up on WebSocket connection")
-
-
-def fetch_ohlcv_nodereal(api_key: str, pair_address: str, limit: int) -> list[list]:
-    """Fetches OHLCV data from NodeReal's PancakeSwap GraphQL API."""
-    query = f"""
-    {{
-      pairHourDatas(
-        first: {limit},
-        orderBy: hourStartUnix,
-        orderDirection: desc,
-        where: {{ pair: "{pair_address.lower()}" }}
-      ) {{
-        hourStartUnix
-        reserve0
-        reserve1
-        hourlyVolumeToken0
-      }}
-    }}
+def fetch_nodereal_ohlcv(pair_address: str, since: int, url: str) -> list[list]:
     """
-    url = NODEREAL_FREE_URL.format(api_key=api_key)
-    headers = {"Content-Type": "application/json"}
+    Fetch OHLCV data from NodeReal JSON cache, filter by timestamp, and return candles.
+    Shape: {"data": { "<pair>": [ {hourStartUnix,…}, … ] } }
+    """
     try:
-        resp = requests.post(url, json={"query": query}, headers=headers, timeout=10)
+        resp = requests.get(url, timeout=5)
         resp.raise_for_status()
-        data = resp.json().get("data", {}).get("pairHourDatas", [])
-        logging.debug(f"NodeReal API raw response: {data}")
-    except (requests.RequestException, ValueError) as e:
-        logging.error(f"Failed to fetch OHLCV from NodeReal: {str(e)}")
+        raw = resp.json().get("data", {})
+        buckets = raw.get(pair_address.lower(), [])
+    except Exception as e:
+        logging.error(f"Failed to load NodeReal OHLCV JSON from {url}: {e}")
         return []
 
-    candles: list[list] = []
-    prev_price = None
-    for entry in reversed(data):  # Reverse to chronological order
-        try:
-            ts = int(entry["hourStartUnix"]) * 1000
-            r0 = float(entry["reserve0"]) / 10**IMT_DECIMALS  # IMT, adjusted for decimals
-            r1 = float(entry["reserve1"]) / 10**18  # BNB, adjusted for decimals
-            if r0 <= 0 or r1 <= 0:
-                logging.warning(
-                    "Invalid reserves: "
-                    f"{pair_address} at {ts}: reserve0={r0}, reserve1={r1}, skipping"
-                )
-                continue
-            price = r1 / r0  # BNB/IMT
-            open_p = prev_price if prev_price is not None else price
-            close_p = price
-            high_p = max(open_p, close_p) * 1.001
-            low_p = min(open_p, close_p) * 0.999
-            volume = (
-                float(entry["hourlyVolumeToken0"]) / 10**IMT_DECIMALS
-                if entry["hourlyVolumeToken0"]
-                else 0.0
-            )
-            candles.append([ts, open_p, high_p, low_p, close_p, volume])
-            prev_price = price
-            logging.debug(f"OHLCV entry for {pair_address} at {ts}: price={price}, volume={volume}")
-        except (KeyError, ValueError) as e:
-            logging.warning(f"Skipping invalid OHLCV entry: {str(e)}")
+    candles = []
+    for b in buckets:
+        ts_ms = b["hourStartUnix"] * 1000
+        if ts_ms <= since:
             continue
+        try:
+            reserve0 = float(b["reserve0"])
+            reserve1 = float(b["reserve1"])
+            volume = float(b["hourlyVolumeToken0"])
+            if reserve0 == 0:
+                continue
+            price = reserve1 / reserve0
+            candles.append([ts_ms, price, price, price, price, volume])
+        except Exception as e:
+            logging.warning(f"Malformed NodeReal bucket: {b} ({e})")
+    return candles
+
+
+def fetch_geckoterminal_ohlcv(pair_address: str, since: int, url: str) -> list[list]:
+    """
+    Fetch OHLCV data from Geckoterminal JSON cache, filter by timestamp, and return candles.
+    Shape: { "data": [ {timestamp, open, high, low, close, volume}, … ] }
+    """
+    try:
+        resp = requests.get(url, timeout=5)
+        resp.raise_for_status()
+        raw = resp.json().get("data", [])
+    except Exception as e:
+        logging.error(f"Failed to load Geckoterminal OHLCV JSON from {url}: {e}")
+        return []
+
+    candles = []
+    for b in raw:
+        ts_ms = int(b["timestamp"]) * 1000
+        if ts_ms <= since:
+            continue
+        try:
+            candles.append(
+                [
+                    ts_ms,
+                    float(b["open"]),
+                    float(b["high"]),
+                    float(b["low"]),
+                    float(b["close"]),
+                    float(b["volume"]),
+                ]
+            )
+        except Exception as e:
+            logging.warning(f"Malformed Gecko bucket: {b} ({e})")
     return candles
 
 
@@ -314,8 +291,11 @@ class Immortality(Stockexchange):
         self.logger.debug(f"Full configuration: {config}")  # Debug config loading
         self.dry_run = config.get("dry_run", False)
         self.slippage_tolerance = config.get("slippage_tolerance", 0.15)  # Default 15%
+
+        self.server_ohlcv_url = self.config.get("ohlcv_url", "http://14.174.10.114/ohlcv.json")
+        self.pair_address = "0xfa56e9abcaa45207be5e43cf475ee061768ca915"  # IMT/WBNB, lowercase
+
         self.api_key_value = None  # Cache HTTP API key
-        self.ws_api_key_value = None  # Cache WebSocket API key
         self.w3 = Web3(Web3.HTTPProvider(BSC_RPC_URL.format(api_key=self.api_key)))
         if not self.w3.is_connected():
             raise OperationalException("Cannot connect to BSC RPC")
@@ -331,43 +311,10 @@ class Immortality(Stockexchange):
             self.logger.info(f"Loaded OHLCV cache from {cache_path}, {len(df)} rows")
         except FileNotFoundError:
             self.logger.info(f"No cache file found at {cache_path}, starting empty")
-        try:
-            self._configure_ws()
-            self.logger.info("Immortality exchange initialized")
-        except Exception as e:
-            self.logger.error(f"Failed to initialize WebSocket: {str(e)}")
-            raise OperationalException(f"Immortality initialization failed: {str(e)}")
 
     @property
     def name(self):
         return "immortality"
-
-    def _configure_ws(self, websocket_url: str | None = None):
-        """Configures the WebSocket connection for real-time data."""
-        ws_url = websocket_url or BSC_WS_URL.format(ws_api_key=self.ws_api_key)
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                self.logger.info(
-                    f"Attempt WebSocket connect (attempt {attempt + 1}/{max_retries}) to {ws_url}"
-                )
-                self._exchange_ws = websocket.WebSocketApp(
-                    ws_url,
-                    on_open=self._on_ws_open,
-                    on_message=self._on_ws_message,
-                    on_error=self._on_ws_error,
-                    on_close=self._on_ws_close,
-                )
-                self._ws_thread = threading.Thread(target=self._run_ws_forever, daemon=True)
-                self._ws_thread.start()
-                self.logger.info(f"WebSocket connection initialized to {ws_url}")
-                break
-            except Exception as e:
-                self.logger.error(f"WebSocket connection failed: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(2**attempt)  # Exponential backoff: 1s, 2s, 4s, etc.
-                else:
-                    self.logger.error("Max retries reached, giving up on WebSocket connection")
 
     @property
     def api_key(self) -> str:
@@ -389,11 +336,6 @@ class Immortality(Stockexchange):
         self.logger.debug(f"Using NodeReal HTTP API key: {key}")
         self.api_key_value = key
         return key
-
-    @property
-    def ws_api_key(self) -> str:
-        """Retrieve NodeReal WebSocket API key from configuration, falling back to HTTP key."""
-        return self.api_key
 
     @property
     def wallet(self) -> str:
@@ -434,82 +376,8 @@ class Immortality(Stockexchange):
         )  # DO NOT OUTPUT PRIVATE KEY
         return secret
 
-    def _on_ws_open(self, ws):
-        """Handles WebSocket connection opening."""
-        swap_topic = (
-            "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"  # Swap event
-        )
-        subscription = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_subscribe",
-            "params": ["logs", {"address": PAIR_ADDRESS, "topics": [swap_topic]}],
-        }
-        try:
-            ws.send(json.dumps(subscription))
-            self.logger.info(f"Subscribed to Swap events for pair {PAIR_ADDRESS}")
-        except Exception as e:
-            self.logger.error(f"WebSocket subscription failed: {str(e)}")
-
-    def _on_ws_message(self, ws, message):
-        """Processes incoming WebSocket messages (Swap events)."""
-        try:
-            data = json.loads(message)
-            if "params" not in data or "result" not in data["params"]:
-                return
-            log = data["params"]["result"]
-            topics = log.get("topics", [])
-            if topics[0] != "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822":
-                return
-
-            data_hex = log["data"]
-            amount0In = int(data_hex[2:66], 16) / 10**8  # IMT
-            amount1Out = int(data_hex[130:194], 16) / 10**18  # BNB
-            # Handle both IMT->BNB and BNB->IMT swaps
-            if amount0In > 0 and amount1Out > 0:
-                price = amount1Out / amount0In  # BNB/IMT
-                volume = amount0In
-            elif amount0In == 0 and amount1Out == 0:
-                amount0Out = int(data_hex[66:130], 16) / 10**8
-                amount1In = int(data_hex[194:258], 16) / 10**18
-                if amount0Out == 0 or amount1In == 0:
-                    return
-                price = amount1In / amount0Out
-                volume = amount0Out
-            else:
-                return
-
-            timestamp_ms = int(time.time() * 1000)
-            pair = "IMT/BNB"
-            supported_timeframes = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
-            for tf in supported_timeframes:
-                key = (pair, tf)
-                if key not in self.candle_builders:
-                    self.candle_builders[key] = CandleBuilder(tf)
-                builder = self.candle_builders[key]
-                finalized_candle = builder.update(price, volume, timestamp_ms)
-                if finalized_candle:
-                    self.logger.debug(f"Finalized candle for {pair}/{tf}: {finalized_candle}")
-        except Exception as e:
-            self.logger.error(f"Error processing WebSocket message: {str(e)}")
-
-    def _on_ws_error(self, ws, error):
-        """Handles WebSocket errors."""
-        self.logger.error(f"WebSocket error: {error}")
-        self.ws_connection_reset()
-
-    def _on_ws_close(self, ws, close_status_code, close_msg):
-        """Handles WebSocket closure."""
-        self.logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
-        self.ws_connection_reset()
-
-    def _run_ws_forever(self):
-        """Runs the WebSocket connection in a separate thread."""
-        try:
-            self._exchange_ws.run_forever()
-        except Exception as e:
-            self.logger.error(f"WebSocket thread crashed: {str(e)}")
-            self.ws_connection_reset()
+    def ws_connection_reset(self):
+        pass
 
     async def watch_ohlcv(
         self,
@@ -820,6 +688,17 @@ class Immortality(Stockexchange):
             current_ts += pd.Timedelta(seconds=interval_seconds)
         return synthetic
 
+    def _handle_empty(
+        self, cached_df: pd.DataFrame | None, timeframe: str, pair_str: str, interval_s: int
+    ) -> pd.DataFrame:
+        """Handle case when no OHLCV data is fetched."""
+        self.logger.warning("No OHLCV data fetched for %s/%s, checking cache", pair_str, timeframe)
+        if cached_df is not None and not cached_df.empty:
+            self.logger.info("Using cached OHLCV data")
+            return cached_df.tail(200)
+        self.logger.warning("No cached data available, using fallback candle")
+        return self._get_fallback_candle(timeframe, pair_str)
+
     def prepare_cache_and_throttle(
         self,
         pair: str,
@@ -862,58 +741,68 @@ class Immortality(Stockexchange):
         candle_type: CandleType = CandleType.SPOT,
     ) -> pd.DataFrame:
         try:
-            pair_str, since_ms, cached_df = self.prepare_cache_and_throttle(
+            pair_str, orig_since_ms, cached_df = self.prepare_cache_and_throttle(
                 pair, timeframe, since_ms, candle_type
             )
-            fetch_limit = 10 if since_ms > 0 else limit
-            candles = fetch_ohlcv_nodereal(self.api_key, PAIR_ADDRESS, fetch_limit)
+            interval_s = self.timeframe_to_seconds(timeframe)
 
-            if not candles:
-                self.logger.warning(
-                    "No OHLCV data fetched for %s/%s, checking cache", pair_str, timeframe
-                )
-                if cached_df is not None and not cached_df.empty:
-                    last_candle = cached_df.iloc[-1]
-                    interval_seconds = self.timeframe_to_seconds(timeframe)
-                    synthetic_candles = self.create_synthetic_candles(
-                        last_candle,
-                        last_candle["date"] + pd.Timedelta(seconds=interval_seconds),
-                        pd.Timestamp.utcnow(),
-                        interval_seconds,
-                    )
-                    if synthetic_candles:
-                        df = ohlcv_to_dataframe(
-                            synthetic_candles,
-                            timeframe,
-                            pair_str,
-                            fill_missing=True,
-                            drop_incomplete=True,
-                        )
-                        df = (
-                            pd.concat([cached_df, df])
-                            .drop_duplicates(subset="date")
-                            .sort_values("date")
-                        )
-                        self.logger.info(
-                            "Generated %d synthetic candles for %s/%s",
-                            len(synthetic_candles),
-                            pair_str,
-                            timeframe,
-                        )
-                        return self._persist_and_return(df, pair_str, timeframe)
-                return self._get_fallback_candle(timeframe, pair_str)
+            # Try NodeReal first, then Geckoterminal
+            raw = fetch_nodereal_ohlcv(self.pair_address, 0, self.server_ohlcv_url)
+            if not raw:
+                self.logger.info("NodeReal data empty, trying Geckoterminal")
+                raw = fetch_geckoterminal_ohlcv(self.pair_address, 0, self.server_ohlcv_url)
 
-            if self.timeframe_to_seconds(timeframe) < 3600:
-                raw_cap = 50 if since_ms == 0 else 10
-                recent = candles[-raw_cap:]
-                candles = self.interpolate_ohlcv(recent, timeframe)
-                self.logger.debug("Interpolated to %d candles for %s", len(candles), timeframe)
+            # If both sources fail, fallback to cache
+            if not raw:
+                return self._handle_empty(cached_df, timeframe, pair_str, interval_s)
 
+            # Filter only candles newer than last cache
+            raw = [c for c in raw if c[0] > orig_since_ms]
+
+            # If timeframe is sub-hourly, interpolate
+            if interval_s < 3600:
+                cap = 50 if orig_since_ms == 0 else 10
+                recent = raw[-cap:]
+                raw = self.interpolate_ohlcv(recent, timeframe)
+                self.logger.debug("Interpolated to %d candles for %s", len(raw), timeframe)
+
+            # Convert to DataFrame
             df = ohlcv_to_dataframe(
-                candles, timeframe, pair_str, fill_missing=True, drop_incomplete=True
+                raw, timeframe, pair_str, fill_missing=True, drop_incomplete=True
             )
 
-            df = self.process_and_filter_dataframe(df, cached_df, since_ms, pair_str, timeframe)
+            df = self.process_and_filter_dataframe(
+                df, cached_df, orig_since_ms, pair_str, timeframe
+            )
+
+            # Generate synthetic candles forward to 'now' if stale
+            if not df.empty:
+                last_ts = df["date"].iloc[-1]
+                now = pd.Timestamp.utcnow().floor(f"{interval_s}s")
+                if now > last_ts:
+                    dummy = pd.Series(df.iloc[-1])
+                    synth2 = self.create_synthetic_candles(
+                        dummy, last_ts + pd.Timedelta(seconds=interval_s), now, interval_s
+                    )
+                    if synth2:
+                        df2 = ohlcv_to_dataframe(
+                            synth2, timeframe, pair_str, fill_missing=True, drop_incomplete=True
+                        )
+                        df = pd.concat([df, df2]).drop_duplicates(subset="date").sort_values("date")
+                        self.logger.info(
+                            "Appended %d post-raw synthetic candles for %s/%s",
+                            len(synth2),
+                            pair_str,
+                            timeframe,
+                        )
+
+            # Floor all dates to timeframe interval
+            df["date"] = pd.to_datetime(df["date"]).dt.floor(f"{interval_s}s")
+
+            # Log latest price before persisting
+            if not df.empty:
+                latest_price = df["close"].iloc[-1]
+                self.logger.info(f"Latest price for {pair_str} ({timeframe}): {latest_price:.18f}")
 
             return self._persist_and_return(df, pair_str, timeframe)
 
@@ -924,9 +813,11 @@ class Immortality(Stockexchange):
                 "HTTP error fetching OHLCV for %s/%s: %s", pair_str, timeframe, str(e)
             )
             return self._get_fallback_candle(timeframe, pair_str)
-        except Exception as e:
-            self.logger.error("Error fetching OHLCV for %s/%s: %s", pair_str, timeframe, str(e))
-            self.logger.error("Traceback: %s", traceback.format_exc())
+
+        except Exception:
+            self.logger.error(
+                "Error fetching OHLCV for %s/%s:\n%s", pair_str, timeframe, traceback.format_exc()
+            )
             return pd.DataFrame()
 
     def _persist_and_return(self, df: pd.DataFrame, pair_str: str, timeframe: str) -> pd.DataFrame:
@@ -997,20 +888,6 @@ class Immortality(Stockexchange):
         num = int(timeframe[:-1])
         unit = timeframe[-1]
         return num * units[unit]
-
-    def ws_connection_reset(self) -> None:
-        """Resets the WebSocket connection."""
-        self.logger.info("WebSocket reset requested")
-        if self._exchange_ws:
-            try:
-                self._exchange_ws.close()
-            except Exception as e:
-                self.logger.error(f"Error closing WebSocket: {str(e)}")
-            self._exchange_ws = None
-        try:
-            self._configure_ws()
-        except Exception as e:
-            self.logger.error(f"Failed to reset WebSocket: {str(e)}")
 
     def get_pairs(self) -> list[str]:
         return ["IMT/BNB"]
@@ -1572,3 +1449,19 @@ class Immortality(Stockexchange):
         wallet_balance=None,
     ):
         return None
+
+    # Assuming you have access to the latest candle data per pair
+    def log_latest_prices(self, all_pairs: list[str], timeframe: str):
+        """
+        Logs the latest close price for each trading pair.
+        """
+        for pair in all_pairs:
+            try:
+                df = self.latest_ohlcv.get((pair, timeframe, "spot"))
+                if df is not None and not df.empty:
+                    latest_price = df.iloc[-1]["close"]
+                    self.logger.info(f"Current price for {pair}: {latest_price:.8f}")
+                else:
+                    self.logger.warning(f"No OHLCV data for {pair}")
+            except Exception as e:
+                self.logger.error(f"Failed to log price for {pair}: {e}")
