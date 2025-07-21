@@ -16,6 +16,7 @@ import pandas as pd
 from ib_insync import IB, Contract, Forex, Order, util
 
 from freqtrade.enums import MarginMode
+from freqtrade.exceptions import ExchangeError
 from freqtrade.exchange.foreignexchange import Foreignexchange
 from freqtrade.persistence import Trade
 from freqtrade.rpc.rpc_manager import RPCManager
@@ -428,28 +429,28 @@ class Interactivebrokers(Foreignexchange):
             logger.warning(
                 f"Order for {pair} was rejected: INACTIVE. Reason: {trade.orderStatus.whyHeld}"
             )
-            return self._failed_response(pair, ordertype, side, amount, price, trade.orderStatus)
+            Trade.session.rollback()
+            raise ExchangeError(f"Order for {pair} rejected as INACTIVE.")
 
         if status not in ("PreSubmitted", "Submitted", "Filled"):
             logger.warning(
-                f"Order for {pair} failed with status: {status}.Reason: {trade.orderStatus.whyHeld}"
+                f"Order for {pair} failed with status: {status}. "
+                f"Reason: {trade.orderStatus.whyHeld}"
             )
-            return self._failed_response(pair, ordertype, side, amount, price, trade.orderStatus)
+            Trade.session.rollback()
+            raise ExchangeError(f"Order for {pair} failed with status: {status}.")
 
         oid = str(trade.order.orderId)
         filled = float(trade.orderStatus.filled)
         remaining = amount - filled
 
-        # --- NEW: if nothing actually filled, treat as a failure ---
         if filled <= 0:
             logger.warning(
                 f"Order {oid} for {pair} had no fills (status={status}); raising ExchangeError."
             )
-            from freqtrade.exceptions import ExchangeError
+            Trade.session.rollback()
+            raise ExchangeError(f"No fills for IBKR order {oid} (status: {status}).")
 
-            raise ExchangeError(f"No fills for IBKR order {oid}")
-
-        # only if we have a positive fill do we return a “real” order to FreqTrade
         logger.info(f"Order {oid} for {pair} filled {filled} / {amount}")
         return {
             "id": oid,
