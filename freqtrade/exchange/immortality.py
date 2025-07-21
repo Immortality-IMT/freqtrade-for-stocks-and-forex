@@ -125,41 +125,9 @@ TOKEN_ABI = [
 ]
 
 
-def fetch_nodereal_ohlcv(pair_address: str, since: int, url: str) -> list[list]:
+def fetch_ohlcv_from_server(pair_address: str, since: int, url: str) -> list[list]:
     """
-    Fetch OHLCV data from NodeReal JSON cache, filter by timestamp, and return candles.
-    Shape: {"data": { "<pair>": [ {hourStartUnix,…}, … ] } }
-    """
-    try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        raw = resp.json().get("data", {})
-        buckets = raw.get(pair_address.lower(), [])
-    except Exception as e:
-        logging.error(f"Failed to load NodeReal OHLCV JSON from {url}: {e}")
-        return []
-
-    candles = []
-    for b in buckets:
-        ts_ms = b["hourStartUnix"] * 1000
-        if ts_ms <= since:
-            continue
-        try:
-            reserve0 = float(b["reserve0"])
-            reserve1 = float(b["reserve1"])
-            volume = float(b["hourlyVolumeToken0"])
-            if reserve0 == 0:
-                continue
-            price = reserve1 / reserve0
-            candles.append([ts_ms, price, price, price, price, volume])
-        except Exception as e:
-            logging.warning(f"Malformed NodeReal bucket: {b} ({e})")
-    return candles
-
-
-def fetch_geckoterminal_ohlcv(pair_address: str, since: int, url: str) -> list[list]:
-    """
-    Fetch OHLCV data from Geckoterminal JSON cache, filter by timestamp, and return candles.
+    Fetch OHLCV data from JSON cache at the specified URL, filter by timestamp, and return candles.
     Shape: { "data": [ {timestamp, open, high, low, close, volume}, … ] }
     """
     try:
@@ -167,7 +135,7 @@ def fetch_geckoterminal_ohlcv(pair_address: str, since: int, url: str) -> list[l
         resp.raise_for_status()
         raw = resp.json().get("data", [])
     except Exception as e:
-        logging.error(f"Failed to load Geckoterminal OHLCV JSON from {url}: {e}")
+        logging.error(f"Failed to load OHLCV JSON from {url}: {e}")
         return []
 
     candles = []
@@ -187,8 +155,8 @@ def fetch_geckoterminal_ohlcv(pair_address: str, since: int, url: str) -> list[l
                 ]
             )
         except Exception as e:
-            logging.warning(f"Malformed Gecko bucket: {b} ({e})")
-    return candles
+            logging.warning(f"Malformed OHLCV bucket: {b} ({e})")
+    return sorted(candles, key=lambda x: x[0])  # Sort oldest to newest
 
 
 def send_tx(w3, fn, wallet_address: str, private_key: str, value: int = 0) -> str:
@@ -746,13 +714,10 @@ class Immortality(Stockexchange):
             )
             interval_s = self.timeframe_to_seconds(timeframe)
 
-            # Try NodeReal first, then Geckoterminal
-            raw = fetch_nodereal_ohlcv(self.pair_address, 0, self.server_ohlcv_url)
-            if not raw:
-                self.logger.info("NodeReal data empty, trying Geckoterminal")
-                raw = fetch_geckoterminal_ohlcv(self.pair_address, 0, self.server_ohlcv_url)
+            # Fetch OHLCV data
+            raw = fetch_ohlcv_from_server(self.pair_address, 0, self.server_ohlcv_url)
 
-            # If both sources fail, fallback to cache
+            # If no data fetched, fallback to cache
             if not raw:
                 return self._handle_empty(cached_df, timeframe, pair_str, interval_s)
 
