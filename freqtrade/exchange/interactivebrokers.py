@@ -438,12 +438,19 @@ class Interactivebrokers(Foreignexchange):
 
         oid = str(trade.order.orderId)
         filled = float(trade.orderStatus.filled)
-        remaining = float(amount - filled)
+        remaining = amount - filled
 
-        logger.info(
-            f"Order {oid} for {pair} placed successfully. Status: {status}, filled: {filled}"
-        )
+        # --- NEW: if nothing actually filled, treat as a failure ---
+        if filled <= 0:
+            logger.warning(
+                f"Order {oid} for {pair} had no fills (status={status}); raising ExchangeError."
+            )
+            from freqtrade.exceptions import ExchangeError
 
+            raise ExchangeError(f"No fills for IBKR order {oid}")
+
+        # only if we have a positive fill do we return a “real” order to FreqTrade
+        logger.info(f"Order {oid} for {pair} filled {filled} / {amount}")
         return {
             "id": oid,
             "symbol": pair,
