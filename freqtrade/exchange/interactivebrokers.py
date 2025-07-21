@@ -6,6 +6,7 @@ import logging
 import math
 import signal
 import socket
+import sys
 import time
 from datetime import UTC, datetime, timedelta
 from threading import Event, Lock, Thread
@@ -17,6 +18,7 @@ from ib_insync import IB, Contract, Forex, Order, util
 from freqtrade.enums import MarginMode
 from freqtrade.exchange.foreignexchange import Foreignexchange
 from freqtrade.persistence import Trade
+from freqtrade.rpc.rpc_manager import RPCManager
 
 
 util.patchAsyncio()
@@ -134,6 +136,7 @@ class Interactivebrokers(Foreignexchange):
         self._running = True
         self._reconnect_event = Event()
         self.shutdown_event = Event()
+        self.is_shutting_down = False
         self._connection_thread: Thread | None = None
         self._ws_connected = False
         self._markets_cache: dict[str, Any] | None = None
@@ -182,8 +185,9 @@ class Interactivebrokers(Foreignexchange):
 
     def _handle_sigint(self, signum, frame):
         logger.info("Received Ctrl+C, forcing immediate shutdown...")
-        self.shutdown_event.set()
+        self.is_shutting_down = True
         self.close()
+        sys.exit(0)  # Ensure the program exits
 
     def _connect_to_ib(self) -> None:
         """
@@ -463,6 +467,10 @@ class Interactivebrokers(Foreignexchange):
         Try to fetch a live price; on failure due to stale/nan data or disconnect,
         trigger a reconnect and retry once before falling back to historical.
         """
+        if self.is_shutting_down:
+            logger.info("Shutdown in progress terminating now.")
+            sys.exit(0)
+
         if not self.is_market_open():
             self.wait_for_market_open()
 
@@ -488,6 +496,9 @@ class Interactivebrokers(Foreignexchange):
         Returns:
             Current price as float (live if possible, else historical)
         """
+        if self.is_shutting_down:
+            raise ConnectionError("Shutdown in progress")
+
         now = time.time()
         # 1) Return cached price if within 1 second
         cached = self._live_price_cache.get(pair)
@@ -510,7 +521,10 @@ class Interactivebrokers(Foreignexchange):
         ticker = None
         try:
             # 2) Snapshot request: get one tick then unsubscribe
-            ticker = self.ib.reqMktData(contract, "", True, False)
+            logger.debug(f"Requesting live price for {contract.symbol}, reqId pending")
+            ticker = self.ib.reqMktData(contract, snapshot=True)
+            # ticker = self.ib.reqMktData(contract, "", True, False)
+            logger.debug(f"Received ticker for {contract.symbol}, reqId processed")
 
             # Wait for valid data with a timeout instead of a fixed sleep
             deadline = time.time() + 5  # 5-second timeout
@@ -555,8 +569,7 @@ class Interactivebrokers(Foreignexchange):
             return price
         finally:
             # IMPORTANT: Cancel the market data subscription to prevent leaks
-            if ticker:
-                self.ib.cancelMktData(ticker.contract)
+            pass
 
     def _fallback_to_historical_rate(self, pair: str) -> float:
         """
@@ -571,6 +584,9 @@ class Interactivebrokers(Foreignexchange):
         Raises:
             ValueError: If no valid historical data available
         """
+        if self.is_shutting_down:
+            raise ConnectionError("Shutdown in progress")
+
         try:
             timeframe = self.config.get("timeframe", "5m")
             ohlcv = self.get_historic_ohlcv(pair, timeframe=timeframe, limit=1)
@@ -624,15 +640,22 @@ class Interactivebrokers(Foreignexchange):
 
     def cancel_order(self, order_id: str, pair: str | None = None) -> dict:
         try:
-            self.ib.client.cancelOrder(int(order_id))
+            ib_order_id = int(order_id)
+            self.ib.client.cancelOrder(ib_order_id)
             logger.info(f"Order {order_id} cancel request sent successfully.")
-            return {"status": "canceled", "id": order_id}
-        except ValueError as e:
-            logger.error(f"Invalid order ID format when canceling {order_id}: {e}")
-            return {"status": "error", "message": str(e)}
+            # *** CRUCIAL: tell Freqtrade that this order is gone ***
+            self.remove_order_from_freqtrade(order_id)
+            return {
+                "status": "canceled",
+                "id": order_id,
+                "message": "Cancelled on IBKR and removed from Freqtrade",
+            }
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid order ID format when canceling '{order_id}': {e}")
+            return {"status": "error", "id": order_id, "message": f"Invalid order ID format: {e}"}
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "id": order_id, "message": str(e)}
 
     def get_markets(
         self,
@@ -1040,11 +1063,14 @@ class Interactivebrokers(Foreignexchange):
             if isinstance(arg, str) and arg.isdigit():
                 order_id = arg
                 break
+            if isinstance(arg, int):
+                order_id = str(arg)
+                break
             if isinstance(arg, dict) and "id" in arg:
-                order_id = arg["id"]
+                order_id = str(arg["id"])
                 break
             if hasattr(arg, "order_id"):
-                order_id = arg.order_id
+                order_id = str(arg.order_id)
                 break
 
         if not order_id:
@@ -1052,13 +1078,16 @@ class Interactivebrokers(Foreignexchange):
             return None
 
         try:
-            self.cancel_order(order_id)
+            result = self.cancel_order(order_id)
         except Exception as e:
             logger.error(f"cancel_order_with_result: error canceling {order_id}: {e}")
+            return None
+
+        if result.get("status") == "canceled":
+            self.remove_order_from_freqtrade(order_id)
 
         updated = self.fetch_order(order_id)
         if updated:
-            updated["status"] = updated.get("status", "canceled")
             return updated
 
         return {
@@ -1206,7 +1235,6 @@ class Interactivebrokers(Foreignexchange):
         return orders
 
     def fetch_order(self, order_id: str, pair: str | None = None) -> dict:
-        # Handle None or invalid order_id
         if order_id is None:
             logger.error("Cannot fetch order with order_id=None")
             return {
@@ -1259,28 +1287,11 @@ class Interactivebrokers(Foreignexchange):
                         if hasattr(trade.order, "action") and trade.order.action
                         else "buy"
                     )
-
-                    price: float | None = None
-                    if trade.order.orderType == "LMT":
-                        price = (
-                            float(trade.order.lmtPrice)
-                            if hasattr(trade.order, "lmtPrice")
-                            else None
-                        )
-                    elif hasattr(trade, "fills") and trade.fills:
-                        total_cost = sum(
-                            fill.execution.price * fill.execution.shares
-                            for fill in trade.fills
-                            if hasattr(fill.execution, "price")
-                            and hasattr(fill.execution, "shares")
-                        )
-                        total_shares = sum(
-                            fill.execution.shares
-                            for fill in trade.fills
-                            if hasattr(fill.execution, "shares")
-                        )
-                        price = total_cost / total_shares if total_shares > 0 else None
-
+                    price = (
+                        float(trade.order.lmtPrice)
+                        if trade.order.orderType == "LMT" and hasattr(trade.order, "lmtPrice")
+                        else None
+                    )
                     status = self._parse_order_status(
                         trade.orderStatus.status
                         if hasattr(trade.orderStatus, "status")
@@ -1288,9 +1299,9 @@ class Interactivebrokers(Foreignexchange):
                     )
 
                     if status in ("canceled", "rejected", "inactive"):
-                        logger.warning(f"Order {order_id} is {status}. Treating as not found.")
+                        logger.warning(f"Order {order_id} is {status}. Marking as canceled.")
                         return {
-                            "status": "not_found",
+                            "status": "canceled",  # Changed from "not_found" to "canceled"
                             "id": order_id,
                             "symbol": symbol,
                             "side": side,
@@ -1367,39 +1378,39 @@ class Interactivebrokers(Foreignexchange):
             logger.error(f"Failed to cleanup incomplete trades: {e}")
 
     def sync_orders(self):
-        """
-        Synchronize Freqtrade's internal orders with IBKR's open orders.
-        Removes orders from Freqtrade if they no longer exist in IBKR.
-        Also cleans up incomplete trades.
-        """
         self.cleanup_incomplete_trades()
-
         open_orders = self.fetch_open_orders()
         open_order_ids = {order["id"] for order in open_orders}
         logger.info(f"Found {len(open_order_ids)} open orders in IBKR.")
 
-        # Fetch Freqtrade open trades
         try:
             freqtrade_open_orders = self.get_freqtrade_open_orders()
         except Exception as e:
             logger.error(f"Failed to fetch Freqtrade open trades: {e}")
             return
 
-        # Remove orders from Freqtrade that are not in IBKR
         removed_count = 0
         for trade in freqtrade_open_orders:
             try:
                 if trade.order_id not in open_order_ids:
-                    logger.warning(
-                        f"Order {trade.order_id} not found in IBKR. Removing from Freqtrade."
-                    )
-                    self.remove_order_from_freqtrade(trade.order_id)
-                    removed_count += 1
+                    # Check the order status explicitly
+                    order = self.fetch_order(trade.order_id, trade.pair)
+                    if order["status"] in ("canceled", "not_found"):
+                        logger.warning(
+                            f"Removing Order {trade.order_id} ({trade.pair}) is {order['status']}."
+                        )
+                        self.remove_order_from_freqtrade(trade.order_id)
+                        removed_count += 1
+                    else:
+                        logger.info(
+                            f"Order {trade.order_id} ({trade.pair}) "
+                            f"is still active with status {order['status']}."
+                        )
             except Exception as e:
                 logger.error(f"Failed to process trade {trade.order_id}: {e}")
 
         logger.info(
-            f"Synchronization complete. Removed {removed_count} orphaned trades from Freqtrade."
+            f"Synchronization complete. Removed {removed_count} orphaned or canceled trades."
         )
 
     def get_freqtrade_open_orders(self):
@@ -1411,7 +1422,6 @@ class Interactivebrokers(Foreignexchange):
             return []
 
     def remove_order_from_freqtrade(self, order_id):
-        """Remove an order from Freqtrade internal state."""
         try:
             trade = Trade.get_trades(trade_filter=[Trade.order_id == order_id]).first()
             if trade and trade.is_open:
@@ -1419,7 +1429,15 @@ class Interactivebrokers(Foreignexchange):
                 trade.close_date = datetime.now(UTC)
                 trade.status = "closed"
                 Trade.session.commit()
-                logger.info(f"Removed orphaned trade with order_id {order_id} from Freqtrade.")
+                logger.info(
+                    f"Removed orphaned or canceled trade with order_id {order_id} from Freqtrade."
+                )
+                RPCManager.send_msg(
+                    {
+                        "type": "status",
+                        "status": f"Trade {order_id} ({trade.pair}) closed, cancelled in IBKR.",
+                    }
+                )
             else:
                 logger.warning(
                     f"No trade found with order_id {order_id} in Freqtrade or already closed."
@@ -1435,28 +1453,24 @@ class Interactivebrokers(Foreignexchange):
         self._running = False
         self.shutdown_event.set()
 
-        # Forcefully cancel all subscriptions
+        # Forcefully cancel all subscriptions, but quietly ignore connection failures
         try:
             if hasattr(self.ib.client, "reqMarketDataType"):
                 self.ib.client.reqMarketDataType(3)  # Switch to delayed feed
             for ticker in getattr(self, "_active_tickers", []):
                 try:
-                    self.ib.cancelMktData(ticker.contract)  # Assuming ticker has .contract
+                    self.ib.cancelMktData(ticker.contract)
+                except ConnectionError:
+                    # Already disconnected—no need to warn
+                    pass
                 except Exception as e:
-                    # Log the specific error but continue
-                    logger.warning(f"Ignoring error while canceling ticker during shutdown: {e}")
+                    logger.warning(f"Error canceling ticker during shutdown: {e}")
+            self._active_tickers.clear()
+        except ConnectionError:
+            # Ignore if the client is already disconnected
+            pass
         except Exception as e:
-            # Log the broader error but continue
-            logger.warning(f"Ignoring error during shutdown subscription cleanup: {e}")
-
-        self._disconnect_and_clear()
-
-        # Immediately terminate the event loop
-        if getattr(self, "_ib_loop_started", False):
-            try:
-                self.ib.stopLoop()
-            except Exception as e:
-                logger.warning(f"Exception stopping ib_insync loop: {e}")
+            logger.warning(f"Unexpected error during shutdown subscription cleanup: {e}")
 
     def _disconnect_and_clear(self) -> None:
         try:
@@ -1465,15 +1479,6 @@ class Interactivebrokers(Foreignexchange):
                 self.ib.client._sock = None  # Nullify socket immediately
         except Exception as e:
             logger.warning(f"Exception during disconnect: {e}")
-
-        # Release port forcefully without retries
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((self.host, self.port))
-            s.close()
-        except Exception as e:
-            logger.warning(f"Exception clearing socket reference: {e}")
 
     def _release_port_and_stop_threads(self) -> None:
         def _release_port():
@@ -1653,3 +1658,17 @@ class Interactivebrokers(Foreignexchange):
 
         # Mid market rate = (bid + ask) / 2
         return (ticker["bid"] + ticker["ask"]) / 2
+
+    def exit_positions(self, trades):
+        for trade in trades:
+            if trade.has_open_position and trade.is_open:
+                try:
+                    exit_rate = self.exchange.get_rate(trade.pair, side="sell")
+                    if exit_rate is None:
+                        logger.warning(
+                            f"Could not fetch exit rate for {trade.pair} during shutdown."
+                        )
+                        continue  # Skip this trade instead of crashing
+                    # Existing code to exit the trade with the rate
+                except Exception as e:
+                    logger.error(f"Error exiting position for {trade.pair}: {e}")
