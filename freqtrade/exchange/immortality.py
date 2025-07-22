@@ -260,7 +260,7 @@ class Immortality(Stockexchange):
         self.dry_run = config.get("dry_run", False)
         self.slippage_tolerance = config.get("slippage_tolerance", 0.15)  # Default 15%
 
-        self.server_ohlcv_url = self.config.get("ohlcv_url", "http://14.174.10.114/ohlcv.json")
+        self.server_ohlcv_url = self.config.get("ohlcv_url", "http://14.180.249.77/ohlcv.json")
         self.pair_address = "0xfa56e9abcaa45207be5e43cf475ee061768ca915"  # IMT/WBNB, lowercase
 
         self.api_key_value = None  # Cache HTTP API key
