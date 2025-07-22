@@ -1193,12 +1193,12 @@ class Interactivebrokers(Foreignexchange):
         rate: float | None = None,
         **kwargs,
     ) -> dict:
-        # ensure connectivity
+        # Ensure connectivity
         self.ensure_connected()
         params = params or {}
         pair = pair[0] if isinstance(pair, tuple) else pair
 
-        # guard duplicates
+        # Guard against duplicate orders
         self._duplicate_order_guard(pair, side)
 
         # Initialize contract, amount, price
@@ -1209,14 +1209,17 @@ class Interactivebrokers(Foreignexchange):
             rate,
         )
 
-        # build order
+        # Round amount to the nearest integer to comply with IBKR forex requirements
+        amount = round(amount)
+
+        # Build order
         try:
             order = self._build_ib_order(pair, side, amount, price, ordertype, params)
         except ValueError as e:
             logger.error(f"Failed to build order: {e}")
             return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
-        # place order
+        # Place order
         try:
             trade = self.ib.placeOrder(contract, order)
             logger.info(
@@ -1228,13 +1231,13 @@ class Interactivebrokers(Foreignexchange):
             logger.error(f"Error placing order: {e}")
             return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
-        # await ack or fail
+        # Await acknowledgment or fail
         try:
             self._await_order_ack(trade)
         except RuntimeError:
             return self._failed_response(pair, ordertype, side, amount, price, "Shutdown")
 
-        # Finalize trade status (ignore mypy—method is defined elsewhere)
+        # Finalize trade status
         return self._finalize_trade_status(trade, pair, ordertype, side, amount, price)
 
     def _parse_trade_order(
@@ -1672,26 +1675,33 @@ class Interactivebrokers(Foreignexchange):
 
     def ensure_connected(self):
         """
-        Ensure the IBKR client is connected. If not, retry with exponential backoff.
+        Ensure the IBKR client is connected and functional. If not, retry with exponential backoff.
         Raises ExchangeError if we exhaust retries.
         """
         if self.ib.isConnected():
-            return
+            try:
+                # Verify connection with a simple request
+                self.ib.reqCurrentTime()
+                return
+            except Exception as e:
+                logger.warning(f"Connection validation failed: {e}")
+                self.ib.disconnect()  # Force disconnect if validation fails
 
         backoff = self.RECONNECT_BASE_BACKOFF
         while backoff <= self.RECONNECT_MAX_BACKOFF:
-            logger.warning(f"TWS disconnected retrying connection in {backoff}s…")
+            logger.warning(f"TWS disconnected, retrying connection in {backoff}s…")
             time.sleep(backoff)
             try:
-                # adjust host/port/clientId to your settings
-                self.ib.connect(self.host, self.port, clientId=self.clientId)
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+                # Validate connection
+                self.ib.reqCurrentTime()
                 logger.info("Reconnected to TWS successfully.")
                 return
             except Exception as e:
                 logger.error(f"Reconnect attempt failed: {e}")
                 backoff *= 2
 
-        # final failure
+        # Final failure
         raise ExchangeError("Unable to reconnect to IBKR TWS after multiple attempts.")
 
     def _finalize_trade_status(
@@ -1703,59 +1713,59 @@ class Interactivebrokers(Foreignexchange):
         amount: float,
         price: float,
     ) -> dict[str, Any]:
-        """
-        Finalizes and interprets the trade result from IBKR.
-        """
+        # Extract order ID immediately
+        oid = str(trade.order.orderId)
         status = trade.orderStatus.status
 
-        if status == "Inactive":
+        # Handle failed or canceled orders
+        if status in ("Inactive", "Cancelled"):
             logger.warning(
-                "Order for %s was rejected: INACTIVE. Reason: %s",
+                "Order %s for %s was %s. Reason: %s",
+                oid,
                 pair,
-                trade.orderStatus.whyHeld,
+                status.lower(),
+                trade.orderStatus.whyHeld or "Unknown",
             )
-            return self._failed_response(
-                pair,
-                ordertype,
-                side,
-                amount,
-                price,
-                trade.orderStatus,
-            )
+            return {
+                "id": oid,
+                "symbol": pair,
+                "type": ordertype.lower(),
+                "side": side.lower(),
+                "amount": amount,
+                "price": price,
+                "filled": 0.0,
+                "remaining": amount,
+                "status": "failed",
+                "info": trade.orderStatus,
+            }
 
+        # Handle unexpected statuses
         if status not in ("PreSubmitted", "Submitted", "Filled"):
             logger.warning(
-                "Order for %s failed with status: %s. Reason: %s",
-                pair,
-                status,
-                trade.orderStatus.whyHeld,
-            )
-            return self._failed_response(
-                pair,
-                ordertype,
-                side,
-                amount,
-                price,
-                trade.orderStatus,
-            )
-
-        oid = str(trade.order.orderId)
-        filled = float(trade.orderStatus.filled)
-        remaining = amount - filled
-
-        if filled <= 0:
-            logger.warning(
-                "Order %s for %s had no fills (status=%s)",
+                "Order %s for %s has unexpected status: %s",
                 oid,
                 pair,
                 status,
             )
-            from freqtrade.exceptions import ExchangeError
+            return {
+                "id": oid,
+                "symbol": pair,
+                "type": ordertype.lower(),
+                "side": side.lower(),
+                "amount": amount,
+                "price": price,
+                "filled": 0.0,
+                "remaining": amount,
+                "status": "unknown",
+                "info": trade.orderStatus,
+            }
 
+        # Handle successful orders
+        filled = float(trade.orderStatus.filled)
+        remaining = amount - filled
+        if filled <= 0:
             raise ExchangeError(f"No fills for IBKR order {oid}")
-
         logger.info("Order %s for %s filled %.2f / %.2f", oid, pair, filled, amount)
-
         return {
             "id": oid,
             "symbol": pair,
@@ -1774,7 +1784,8 @@ class Interactivebrokers(Foreignexchange):
         Convert a Freqtrade-style pair (e.g., "AUD/USD") into an IBKR contract object.
         """
         base, quote = pair.split("/")
-        contract = Forex(base, currency=quote, exchange="IDEALPRO")
+        ib_pair = base + quote  # e.g., "AUDUSD"
+        contract = Forex(pair=ib_pair, exchange="IDEALPRO")
         return contract
 
     def _initialize_contract_amount_price(
