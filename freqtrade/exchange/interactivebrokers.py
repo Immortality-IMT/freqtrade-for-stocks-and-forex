@@ -464,46 +464,55 @@ class Interactivebrokers(Foreignexchange):
 
     def _finalize_trade_status(self, trade, pair, ordertype, side, amount, price):
         status = trade.orderStatus.status
-
-        if status == "Inactive":
-            logger.warning(
-                f"Order for {pair} was rejected: INACTIVE. Reason: {trade.orderStatus.whyHeld}"
-            )
-            Trade.session.rollback()
-            raise ExchangeError(f"Order for {pair} rejected as INACTIVE.")
-
-        if status not in ("PreSubmitted", "Submitted", "Filled"):
-            logger.warning(
-                f"Order for {pair} failed with status: {status}. "
-                f"Reason: {trade.orderStatus.whyHeld}"
-            )
-            Trade.session.rollback()
-            raise ExchangeError(f"Order for {pair} failed with status: {status}.")
-
         oid = str(trade.order.orderId)
         filled = float(trade.orderStatus.filled)
         remaining = amount - filled
 
-        if filled <= 0:
-            logger.warning(
-                f"Order {oid} for {pair} had no fills (status={status}); raising ExchangeError."
-            )
-            Trade.session.rollback()
-            raise ExchangeError(f"No fills for IBKR order {oid} (status: {status}).")
+        # Map to Freqtrade status
+        ft_status = self._parse_order_status(status)
 
-        logger.info(f"Order {oid} for {pair} filled {filled} / {amount}")
-        return {
-            "id": oid,
-            "symbol": pair,
-            "type": ordertype.lower(),
-            "side": side.lower(),
-            "amount": amount,
-            "price": price,
-            "filled": filled,
-            "remaining": remaining,
-            "status": self._parse_order_status(status),
-            "info": trade,
-        }
+        # Handle open orders (including partially filled ones)
+        if ft_status == "open":
+            logger.info(
+                f"Order {oid} for {pair} is open (status={status}), "
+                f"filled={filled}, remaining={remaining}"
+            )
+            return {
+                "id": oid,
+                "symbol": pair,
+                "type": ordertype.lower(),
+                "side": side.lower(),
+                "amount": amount,
+                "price": price,
+                "filled": filled,
+                "remaining": remaining,
+                "status": ft_status,
+                "info": trade,
+            }
+
+        # Handle filled orders
+        if ft_status == "closed":
+            logger.info(f"Order {oid} for {pair} filled {filled} / {amount}")
+            return {
+                "id": oid,
+                "symbol": pair,
+                "type": ordertype.lower(),
+                "side": side.lower(),
+                "amount": amount,
+                "price": price,
+                "filled": filled,
+                "remaining": remaining,
+                "status": ft_status,
+                "info": trade,
+            }
+
+        # Handle failed/canceled orders
+        logger.warning(
+            f"Order {oid} for {pair} failed with status: {status}. "
+            f"Reason: {trade.orderStatus.whyHeld}"
+        )
+        Trade.session.rollback()
+        raise ExchangeError(f"Order for {pair} failed with status: {status}.")
 
     def get_rate(
         self,
