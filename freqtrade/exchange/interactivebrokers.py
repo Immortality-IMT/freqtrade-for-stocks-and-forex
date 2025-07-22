@@ -18,6 +18,7 @@ from ib_insync import IB, Contract, Forex, Order, util
 from freqtrade.enums import MarginMode
 from freqtrade.exceptions import ExchangeError
 from freqtrade.exchange.foreignexchange import Foreignexchange
+from freqtrade.persistence import Order as FTOrder
 from freqtrade.persistence import Trade
 from freqtrade.rpc.rpc_manager import RPCManager
 
@@ -1479,7 +1480,14 @@ class Interactivebrokers(Foreignexchange):
 
     def remove_order_from_freqtrade(self, order_id):
         try:
-            trade = Trade.get_trades(trade_filter=[Trade.order_id == order_id]).first()
+            # Corrected: Use Trade.orders relationship to find the order
+            order = FTOrder.query.filter(FTOrder.id == order_id).first()
+
+            if not order:
+                logger.warning(f"No order found with id {order_id} in Freqtrade.")
+                return
+
+            trade = order.trade
             if trade and trade.is_open:
                 trade.is_open = False
                 trade.close_date = datetime.now(UTC)
@@ -1496,7 +1504,7 @@ class Interactivebrokers(Foreignexchange):
                 )
             else:
                 logger.warning(
-                    f"No trade found with order_id {order_id} in Freqtrade or already closed."
+                    f"No open trade found with order_id {order_id} in Freqtrade or already closed."
                 )
         except Exception as e:
             logger.error(f"Failed to remove trade with order_id {order_id}: {e}")
