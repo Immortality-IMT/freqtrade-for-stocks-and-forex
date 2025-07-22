@@ -337,6 +337,112 @@ class Interactivebrokers(Foreignexchange):
         if self.shutdown_event.is_set():
             logger.info("Shutdown signal received, exiting sleep.")
 
+    def create_order(
+        self,
+        pair: str | tuple,
+        ordertype: str,
+        side: str,
+        amount: float,
+        price: float | None = None,
+        params: dict[Any, Any] | None = None,
+        rate: float | None = None,
+        **kwargs,
+    ) -> dict:
+        # 1) Detect TWS down & back off before everything else
+        self.ensure_connected()
+
+        params = params or {}
+        pair = pair[0] if isinstance(pair, tuple) else pair
+
+        # ——— Prevent duplicate in-flight orders for the same pair+side ———
+        try:
+            open_orders = self.fetch_open_orders(pair)
+            # match on side and open status
+            dup = [
+                o
+                for o in open_orders
+                if o["side"].lower() == side.lower() and o["status"] == "open"
+            ]
+            if dup:
+                logger.warning(
+                    f"Skipping new {side.upper()} order for {pair}: "
+                    f"{len(dup)} existing open order(s) detected."
+                )
+                from freqtrade.exceptions import ExchangeError
+
+                raise ExchangeError(f"Duplicate in-flight {side} order for {pair}")
+        except ExchangeError:
+            # bubble up to FreqTrade so it won't persist anything
+            raise
+        except Exception as e:
+            logger.error(f"Error checking existing orders for {pair}: {e}")
+            # proceed anyway
+
+        # ——— initialize contract, amount, price ———
+        contract, amount, price = self._initialize_contract_amount_price(pair, amount, price, rate)
+
+        use_market = ordertype.lower() == "market" or (
+            side.lower() == "sell" and params.get("exit_as_market", False)
+        )
+
+        # ——— build IB order object ———
+        if use_market:
+            order = Order(action=side.upper(), totalQuantity=amount, orderType="MKT")
+        else:
+            try:
+                if price is None or price <= 0:
+                    price = self.get_rate(pair, side=side)
+                if not (0.00001 <= price <= 1000.0):
+                    raise ValueError(f"Invalid price for order: {price}")
+                order = Order(
+                    action=side.upper(),
+                    totalQuantity=amount,
+                    orderType="LMT",
+                    lmtPrice=round(price, self.SIGNIFICANT_DIGITS - 1),
+                )
+            except ValueError as e:
+                logger.error(f"Failed to get valid price for order: {e}")
+                return self._failed_response(pair, ordertype, side, amount, price, str(e))
+
+        return self._place_and_wait_for_order(contract, order, pair, ordertype, side, amount, price)
+
+    def _place_and_wait_for_order(
+        self,
+        contract: Any,
+        order: Any,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        price: float | None,
+    ) -> dict:
+        """Place order and wait for IB to acknowledge it."""
+        try:
+            trade = self.ib.placeOrder(contract, order)
+            logger.info(
+                f"Order placed: {order.action} {order.totalQuantity} "
+                f"{pair} at {getattr(order, 'lmtPrice', 'MARKET')}"
+            )
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return self._failed_response(pair, ordertype, side, amount, price, str(e))
+
+        # ——— wait for IB to ack/fill ———
+        deadline = time.time() + 30
+        while (
+            time.time() < deadline
+            and trade.orderStatus.status in ("ApiPending", "PendingSubmit", "Submitted")
+            and not self.shutdown_event.is_set()
+        ):
+            self.ib.waitOnUpdate(timeout=1)
+
+        if self.shutdown_event.is_set():
+            logger.info("Shutdown signal received, exiting order placement.")
+            return self._failed_response(pair, ordertype, side, amount, price, "Shutdown")
+
+        # ——— finalize or raise on failure ———
+        return self._finalize_trade_status(trade, pair, ordertype, side, amount, price)
+
     def _initialize_contract_amount_price(self, pair, amount, price, rate):
         if rate is not None and (price is None or price <= 0):
             price = rate
@@ -1176,9 +1282,6 @@ class Interactivebrokers(Foreignexchange):
         return orders
 
     def fetch_order(self, order_id: str, pair: str | None = None) -> dict:
-        """
-        Fetches an order from Interactive Brokers by order ID.
-        """
         if order_id is None:
             logger.error("Cannot fetch order with order_id=None")
             return {
@@ -1206,7 +1309,80 @@ class Interactivebrokers(Foreignexchange):
             }
 
         try:
-            return self._fetch_order_internal(oid, order_id, pair)
+            for trade in self.ib.trades():
+                if trade.order.orderId == oid:
+                    filled = (
+                        float(trade.orderStatus.filled)
+                        if hasattr(trade.orderStatus, "filled")
+                        else 0.0
+                    )
+                    total = (
+                        float(trade.order.totalQuantity)
+                        if hasattr(trade.order, "totalQuantity")
+                        else 0.0
+                    )
+                    symbol = (
+                        f"{trade.contract.symbol}/{trade.contract.currency}"
+                        if (
+                            hasattr(trade.contract, "symbol")
+                            and hasattr(trade.contract, "currency")
+                        )
+                        else (pair or "unknown")
+                    )
+                    side = (
+                        trade.order.action.lower()
+                        if hasattr(trade.order, "action") and trade.order.action
+                        else "buy"
+                    )
+                    price = (
+                        float(trade.order.lmtPrice)
+                        if trade.order.orderType == "LMT" and hasattr(trade.order, "lmtPrice")
+                        else None
+                    )
+                    status = self._parse_order_status(
+                        trade.orderStatus.status
+                        if hasattr(trade.orderStatus, "status")
+                        else "unknown"
+                    )
+
+                    if status in ("canceled", "rejected", "inactive"):
+                        logger.warning(f"Order {order_id} is {status}. Marking as canceled.")
+                        return {
+                            "status": "canceled",  # Changed from "not_found" to "canceled"
+                            "id": order_id,
+                            "symbol": symbol,
+                            "side": side,
+                            "amount": total,
+                            "filled": filled,
+                            "remaining": total - filled,
+                        }
+
+                    return {
+                        "id": order_id,
+                        "symbol": symbol,
+                        "type": trade.order.orderType.lower()
+                        if hasattr(trade.order, "orderType")
+                        else "unknown",
+                        "side": side,
+                        "amount": total,
+                        "price": price,
+                        "filled": filled,
+                        "remaining": total - filled,
+                        "status": status,
+                        "info": trade,
+                    }
+
+            logger.debug(f"fetch_order: no trade with orderId={order_id}")
+            return {
+                "status": "not_found",
+                "id": order_id,
+                "symbol": pair or "unknown",
+                "side": "unknown",
+                "amount": 0.0,
+                "filled": 0.0,
+                "remaining": 0.0,
+            }
+
         except Exception as e:
             logger.error(f"Error in fetch_order for {order_id}: {e}")
             return {
@@ -1218,197 +1394,6 @@ class Interactivebrokers(Foreignexchange):
                 "filled": 0.0,
                 "remaining": 0.0,
             }
-
-    def _fetch_order_internal(self, oid: int, order_id: str, pair: str | None) -> dict:
-        """
-        Internal helper to fetch and parse order details.
-        """
-        for trade in self.ib.trades():
-            if trade.order.orderId == oid:
-                filled = (
-                    float(trade.orderStatus.filled) if hasattr(trade.orderStatus, "filled") else 0.0
-                )
-                total = (
-                    float(trade.order.totalQuantity)
-                    if hasattr(trade.order, "totalQuantity")
-                    else 0.0
-                )
-                symbol = (
-                    f"{trade.contract.symbol}/{trade.contract.currency}"
-                    if (hasattr(trade.contract, "symbol") and hasattr(trade.contract, "currency"))
-                    else (pair or "unknown")
-                )
-                side = (
-                    trade.order.action.lower()
-                    if hasattr(trade.order, "action") and trade.order.action
-                    else "buy"
-                )
-                price = (
-                    float(trade.order.lmtPrice)
-                    if trade.order.orderType == "LMT" and hasattr(trade.order, "lmtPrice")
-                    else None
-                )
-                status = self._parse_order_status(
-                    trade.orderStatus.status if hasattr(trade.orderStatus, "status") else "unknown"
-                )
-
-                if status in ("canceled", "rejected", "inactive"):
-                    logger.warning(f"Order {order_id} is {status}. Marking as canceled.")
-                    return {
-                        "status": "canceled",
-                        "id": order_id,
-                        "symbol": symbol,
-                        "side": side,
-                        "amount": total,
-                        "filled": filled,
-                        "remaining": total - filled,
-                    }
-
-                return {
-                    "id": order_id,
-                    "symbol": symbol,
-                    "type": trade.order.orderType.lower()
-                    if hasattr(trade.order, "orderType")
-                    else "unknown",
-                    "side": side,
-                    "amount": total,
-                    "price": price,
-                    "filled": filled,
-                    "remaining": total - filled,
-                    "status": status,
-                    "info": trade,
-                }
-
-        logger.debug(f"fetch_order: no trade with orderId={order_id}")
-        return {
-            "status": "not_found",
-            "id": order_id,
-            "symbol": pair or "unknown",
-            "side": "unknown",
-            "amount": 0.0,
-            "filled": 0.0,
-            "remaining": 0.0,
-        }
-
-    def create_order(
-        self,
-        pair: str | tuple,
-        ordertype: str,
-        side: str,
-        amount: float,
-        price: float | None = None,
-        params: dict | None = None,
-        rate: float | None = None,
-        **kwargs,
-    ) -> dict:
-        """
-        Creates an order on Interactive Brokers.
-        """
-        self.ensure_connected()
-        params = params or {}
-        pair_str = pair[0] if isinstance(pair, str | tuple) else pair
-
-        # Check for duplicate in-flight orders
-        try:
-            open_orders = self.fetch_open_orders(pair_str)
-            dup = [
-                o
-                for o in open_orders
-                if o["side"].lower() == side.lower() and o["status"] == "open"
-            ]
-            if dup:
-                logger.warning(
-                    f"Skipping new {side.upper()} order for {pair_str}: "
-                    f"{len(dup)} existing open order(s) detected."
-                )
-                raise ExchangeError(f"Duplicate in-flight {side} order for {pair_str}")
-        except ExchangeError:
-            raise
-        except Exception as e:
-            logger.error(f"Error checking existing orders for {pair_str}: {e}")
-
-        # Delegate to internal method for order creation
-        return self._create_order_internal(pair_str, ordertype, side, amount, price, rate, params)
-
-    def _create_order_internal(
-        self,
-        pair: str,
-        ordertype: str,
-        side: str,
-        amount: float,
-        price: float | None,
-        rate: float | None,
-        params: dict,
-    ) -> dict:
-        """
-        Internal helper to create and place the order.
-        """
-        # Initialize contract, amount, price
-        contract, amount, price = self._initialize_contract_amount_price(pair, amount, price, rate)
-        use_market = ordertype.lower() == "market" or (
-            side.lower() == "sell" and params.get("exit_as_market", False)
-        )
-
-        # Build IB order object
-        try:
-            if use_market:
-                order = self._build_market_order(side, amount)
-            else:
-                if price is None or price <= 0:
-                    price = self.get_rate(pair, side=side)
-                if not (0.00001 <= price <= 1000.0):
-                    raise ValueError(f"Invalid price for order: {price}")
-                order = self._build_limit_order(side, amount, price)
-        except ValueError as e:
-            logger.error(f"Failed to get valid price for order: {e}")
-            return self._failed_response(pair, ordertype, side, amount, price, str(e))
-
-        # Place order
-        try:
-            trade = self.ib.placeOrder(contract, order)
-            logger.info(
-                f"Order placed: {order.action} {order.totalQuantity} "
-                f"{pair} at {getattr(order, 'lmtPrice', 'MARKET')}"
-            )
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return self._failed_response(pair, ordertype, side, amount, price, str(e))
-
-        # Wait for IB to acknowledge/fill
-        deadline = time.time() + 30
-        while (
-            time.time() < deadline
-            and trade.orderStatus.status in ("ApiPending", "PendingSubmit", "Submitted")
-            and not self.shutdown_event.is_set()
-        ):
-            self.ib.waitOnUpdate(timeout=1)
-
-        if self.shutdown_event.is_set():
-            logger.info("Shutdown signal received, exiting order placement.")
-            return self._failed_response(pair, ordertype, side, amount, price, "Shutdown")
-
-        return self._finalize_trade_status(trade, pair, ordertype, side, amount, price)
-
-    def _build_market_order(self, side: str, amount: float) -> Order:
-        """
-        Builds a market order for Interactive Brokers.
-        """
-        order = Order()
-        order.action = side.upper()
-        order.totalQuantity = amount
-        order.orderType = "MKT"
-        return order
-
-    def _build_limit_order(self, side: str, amount: float, price: float) -> Order:
-        """
-        Builds a limit order for Interactive Brokers.
-        """
-        order = Order()
-        order.action = side.upper()
-        order.totalQuantity = amount
-        order.orderType = "LMT"
-        order.lmtPrice = round(price, self.SIGNIFICANT_DIGITS - 1)
-        return order
 
     def close_orphaned_orders(self) -> None:
         for order in self.fetch_open_orders():
