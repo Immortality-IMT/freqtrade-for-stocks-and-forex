@@ -20,7 +20,6 @@ from freqtrade.exceptions import ExchangeError
 from freqtrade.exchange.foreignexchange import Foreignexchange
 from freqtrade.persistence import Order as FTOrder
 from freqtrade.persistence import Trade
-from freqtrade.rpc.rpc_manager import RPCManager
 
 
 util.patchAsyncio()
@@ -1478,36 +1477,27 @@ class Interactivebrokers(Foreignexchange):
             logger.error(f"Failed to fetch Freqtrade open trades: {e}")
             return []
 
-    def remove_order_from_freqtrade(self, order_id):
+    def remove_order_from_freqtrade(self, order_id: str):
         try:
-            # Corrected: Use Trade.orders relationship to find the order
-            order = FTOrder.query.filter(FTOrder.id == order_id).first()
-
+            order = Trade.session.query(FTOrder).filter_by(id=int(order_id)).first()
             if not order:
-                logger.warning(f"No order found with id {order_id} in Freqtrade.")
+                logger.warning(f"No order found with id {order_id}.")
                 return
 
             trade = order.trade
             if trade and trade.is_open:
                 trade.is_open = False
+                # Corrected attribute: 'average' instead of 'price_open'
+                trade.close_rate = order.average  # Previously order.price_open
                 trade.close_date = datetime.now(UTC)
-                trade.status = "closed"
                 Trade.session.commit()
-                logger.info(
-                    f"Removed orphaned or canceled trade with order_id {order_id} from Freqtrade."
-                )
-                RPCManager.send_msg(
-                    {
-                        "type": "status",
-                        "status": f"Trade {order_id} ({trade.pair}) closed, cancelled in IBKR.",
-                    }
-                )
-            else:
-                logger.warning(
-                    f"No open trade found with order_id {order_id} in Freqtrade or already closed."
-                )
+
+                logger.info(f"Closed orphaned trade from order {order_id}")
+                # Removed RPCManager call - requires freqtrade instance
+                # Consider alternative notification if needed
+
         except Exception as e:
-            logger.error(f"Failed to remove trade with order_id {order_id}: {e}")
+            logger.error(f"Failed to remove trade {order_id}: {e}")
 
     def close(self) -> None:
         """
