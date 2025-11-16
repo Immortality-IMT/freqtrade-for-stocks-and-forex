@@ -154,10 +154,26 @@ class Alpacastocks(Stockexchange):
         ):
             logger.debug("WebSocket client already running.")
             return
-        self.ws_client = TradingStream(self.key, self.secret, paper=self.dry_run)
-        self.ws_client.subscribe_trade_updates(self.handle_trade_update)
-        self._ws_thread = threading.Thread(target=self.ws_client.run, daemon=True)
-        self._ws_thread.start()
+
+        try:
+            self.ws_client = TradingStream(self.key, self.secret, paper=self.dry_run)
+            # Test authentication by trying to subscribe (this will fail if credentials are invalid)
+            self.ws_client.subscribe_trade_updates(self.handle_trade_update)
+            self._ws_thread = threading.Thread(target=self.ws_client.run, daemon=True)
+            self._ws_thread.start()
+        except Exception as e:
+            error_msg = str(e).lower()
+            if (
+                "authenticate" in error_msg
+                or "unauthorized" in error_msg
+                or "forbidden" in error_msg
+            ):
+                logger.error(
+                    "WebSocket authentication failed - Invalid API credentials. "
+                    "Please check your Alpaca API key and secret."
+                )
+                sys.exit(1)
+            logger.warning(f"WebSocket setup failed (non-auth error): {e}")
 
     async def handle_trade_update(self, trade_update):
         logger.info(f"Trade update received: {trade_update}")
@@ -783,7 +799,7 @@ class Alpacastocks(Stockexchange):
         try:
             pair_str = pair
             if isinstance(pair, tuple) and len(pair) == 3:
-                pair_str, timeframe, candle_type = pair
+                pair_str, timeframe, _candle_type = pair  # Prefix with underscore
             else:
                 if timeframe is None:
                     raise ValueError("timeframe must be provided if not using a tuple.")
@@ -1056,15 +1072,20 @@ class Alpacastocks(Stockexchange):
 
         except APIError as e:
             error_message = str(e).lower()
-            if "forbidden" in error_message:
+            # Handle both "forbidden" and "unauthorized" authentication errors
+            if "forbidden" in error_message or "unauthorized" in error_message:
                 logger.error(
                     "Authentication failed - Invalid API credentials. "
                     "Please check your Alpaca API key and secret."
                 )
                 sys.exit(1)
             logger.error(f"Error fetching market data from Alpaca: {e}")
+            # Re-raise other API errors so they bubble up
+            raise
         except Exception as e:
             logger.error(f"Unexpected error while fetching markets: {e}")
+            # Re-raise unexpected errors
+            raise
 
     def _process_assets(self, assets_dict: list, tradable_only: bool, active_only: bool):
         """
@@ -1566,6 +1587,49 @@ class Alpacastocks(Stockexchange):
         # yield trades as they arrive
         while True:
             yield await q.get()
+
+    def validate_config(self, config: dict) -> None:
+        """
+        Validate the exchange configuration.
+        This method is required by Freqtrade and called during bot initialization.
+        """
+        logger.info("Validating Alpaca configuration...")
+
+        # Check for required API credentials
+        if not self.key or not self.secret:
+            raise OperationalException(
+                "Alpaca API key and secret are required in the configuration."
+            )
+
+        # Test authentication by making a simple API call
+        try:
+            # This will fail immediately if credentials are invalid
+            self.trading_client.get_account()
+            logger.debug("Alpaca authentication successful")
+        except APIError as e:
+            error_message = str(e).lower()
+            if "forbidden" in error_message or "unauthorized" in error_message:
+                logger.error(
+                    "Authentication failed - Invalid API credentials. "
+                    "Please check your Alpaca API key and secret."
+                )
+                sys.exit(1)
+            # Re-raise other API errors
+            raise
+
+        # Validate dry_run mode compatibility
+        if not self.dry_run:
+            logger.warning(
+                "Live trading mode is enabled. "
+                "Ensure you have sufficient funds and understand the risks."
+            )
+
+        # Validate timeframes if specified in config
+        timeframes = config.get("timeframes", [])
+        if timeframes:
+            self.validate_timeframes(timeframes)
+
+        logger.info("Alpaca configuration validation completed successfully.")
 
     def _get_available_qty(self, symbol: str) -> float:
         try:
