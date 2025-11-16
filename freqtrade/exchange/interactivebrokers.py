@@ -16,7 +16,7 @@ import pandas as pd
 from ib_insync import IB, Contract, Forex, Order, util
 
 from freqtrade.enums import MarginMode
-from freqtrade.exceptions import ExchangeError
+from freqtrade.exceptions import ExchangeError, OperationalException
 from freqtrade.exchange.foreignexchange import Foreignexchange
 from freqtrade.persistence import Order as FTOrder
 from freqtrade.persistence import Trade
@@ -1750,3 +1750,46 @@ class Interactivebrokers(Foreignexchange):
 
         # final failure
         raise ExchangeError("Unable to reconnect to IBKR TWS after multiple attempts.")
+
+    def validate_config(self, config: dict) -> None:
+        """
+        Validate the exchange configuration.
+        This method is required by Freqtrade and called during bot initialization.
+        """
+        logger.info("Validating Interactive Brokers configuration...")
+
+        # Check for required connection parameters
+        if not hasattr(self, "host") or not hasattr(self, "port"):
+            raise OperationalException(
+                "Interactive Brokers host and port configuration are required."
+            )
+
+        # Test connection by making a simple API call
+        try:
+            # This will fail immediately if connection is invalid
+            self.ib.client.reqCurrentTime()
+            logger.debug("Interactive Brokers connection validated successfully")
+        except Exception as e:
+            error_message = str(e).lower()
+            if "connection" in error_message or "not connected" in error_message:
+                logger.error(
+                    "Connection failed - Cannot connect to Interactive Brokers. "
+                    "Please ensure TWS or IB Gateway is running and configured properly."
+                )
+                sys.exit(1)
+            # Re-raise other connection errors
+            raise
+
+        # Validate dry_run mode compatibility
+        if not self.dry_run:
+            logger.warning(
+                "Live trading mode is enabled with Interactive Brokers. "
+                "Ensure you have sufficient funds and understand the risks."
+            )
+
+        # Validate timeframes if specified in config
+        timeframes = config.get("timeframes", [])
+        if timeframes:
+            self.validate_timeframes(timeframes)
+
+        logger.info("Interactive Brokers configuration validation completed successfully.")
