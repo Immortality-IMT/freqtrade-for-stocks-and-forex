@@ -1640,3 +1640,31 @@ class Alpacastocks(Stockexchange):
         except Exception as e:
             logger.error(f"Failed to fetch available qty for {symbol}: {e}")
         return 0.0
+
+    def validate_trading_mode_and_margin_mode(
+        self, trading_mode, margin_mode, allow_none_margin_mode: bool = False, **kwargs
+    ) -> None:
+        """
+        Validate that the requested trading and margin modes are supported by the exchange.
+        Alpaca stocks implementation currently focuses on spot trading.
+        """
+        # The logic remains the same:
+        if trading_mode and str(trading_mode).lower() != "spot":
+            raise OperationalException(
+                f"Alpaca Stocks exchange does not support {trading_mode} trading mode."
+            )
+
+        # In Alpaca, margin is account-level rather than symbol-level in the crypto sense.
+        # Check against 'none' or 'cross'. The 'allow_none_margin_mode' is handled by the caller.
+        if margin_mode and str(margin_mode).lower() not in ("none", "cross"):
+            raise OperationalException(
+                f"Alpaca Stocks exchange does not support {margin_mode} margin mode."
+            )
+
+    def ohlcv_candle_limit(self, timeframe: str, candle_type: str = "trade") -> int:
+        """
+        Calculates the maximum number of candles that can be requested at once.
+        This limit is defined by the Alpaca API for historical data requests.
+        """
+        # 1000 is the common limit for Alpaca bar data requests.
+        return 1000
