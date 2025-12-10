@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import UTC, datetime, timedelta
 from threading import Event, Lock, Thread
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 from ib_insync import IB, Contract, Forex, Order, util
@@ -1793,3 +1793,36 @@ class Interactivebrokers(Foreignexchange):
             self.validate_timeframes(timeframes)
 
         logger.info("Interactive Brokers configuration validation completed successfully.")
+
+    def validate_trading_mode_and_margin_mode(
+        self, trading_mode: str, margin_mode: str, allow_none_margin_mode: bool = False, **kwargs
+    ) -> None:
+        """
+        Validate that the requested trading and margin modes are supported.
+        Interactive Brokers forex implementation currently uses 'spot' trading.
+        """
+        # Forex in this implementation is treated as spot trading
+        if trading_mode and str(trading_mode).lower() != "spot":
+            from freqtrade.exceptions import OperationalException
+
+            raise OperationalException(
+                f"Interactive Brokers forex exchange does not support {trading_mode} trading mode."
+            )
+
+        # In this implementation, margin mode is set to NONE
+        if margin_mode and str(margin_mode).lower() != "none":
+            from freqtrade.exceptions import OperationalException
+
+            raise OperationalException(
+                f"Interactive Brokers forex exchange does not support {margin_mode} margin mode."
+            )
+
+    def ohlcv_candle_limit(self, timeframe: str, candle_type: str = "spot") -> int:
+        """
+        Returns the maximum number of candles allowed in a single history request.
+        Uses typing.cast to satisfy mypy's strict type checking for dict lookups.
+        """
+        # Retrieve the value. We use typing.cast to explicitly tell mypy that the value
+        # we retrieve is an int, even though dict.get() returns a generic 'Any'.
+        limit = cast(int, self._ft_has_default.get("ohlcv_candle_limit", 1000))
+        return limit
