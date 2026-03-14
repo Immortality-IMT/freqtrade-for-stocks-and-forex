@@ -351,6 +351,10 @@ class Interactivebrokers(Foreignexchange):
         # 1) Detect TWS down & back off before everything else
         self.ensure_connected()
 
+        # 2) Wait for market open before placing orders (trading operation)
+        if not self.is_market_open():
+            self.wait_for_market_open()
+
         params = params or {}
         pair = pair[0] if isinstance(pair, tuple) else pair
 
@@ -523,13 +527,14 @@ class Interactivebrokers(Foreignexchange):
         """
         Try to fetch a live price; on failure due to stale/nan data or disconnect,
         trigger a reconnect and retry once before falling back to historical.
+
+        Note: Market open check is intentionally NOT performed here to allow
+        data downloading and backtesting to work when the market is closed.
+        The fallback to historical data handles closed-market scenarios gracefully.
         """
         if self.is_shutting_down:
             logger.info("Shutdown in progress terminating now.")
             sys.exit(0)
-
-        if not self.is_market_open():
-            self.wait_for_market_open()
 
         pair = pair[0] if isinstance(pair, tuple) else pair
         # First attempt
@@ -820,9 +825,9 @@ class Interactivebrokers(Foreignexchange):
         candle_type: str = "spot",
         until_ms: int | None = None,
     ) -> pd.DataFrame:
-        if not self.is_market_open():
-            self.wait_for_market_open()
-
+        # Historical data can be fetched regardless of market status
+        # The market open check is only needed for live trading operations,
+        # not for data downloading or backtesting
         if isinstance(pair, tuple):
             pair = pair[0]
 
@@ -1237,12 +1242,12 @@ class Interactivebrokers(Foreignexchange):
         Fetch open orders from Interactive Brokers and normalize them for Freqtrade.
         Ensures all returned orders include a valid 'side' field to prevent bot crashes.
         Adds "orphaned": True to orders not associated with known trades.
+
+        Note: Market open check is intentionally NOT performed here as orders can exist
+        and be queried even when the market is closed.
         """
 
         self.ensure_connected()
-
-        if not self.is_market_open():
-            self.wait_for_market_open()
 
         orders: list[dict] = []
         for o in self.ib.openOrders():
