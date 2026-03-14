@@ -28,6 +28,7 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     ] and not config.get("exchange", {}).get("name"):
         # Skip checking exchange in plot mode, since it requires no exchange
         return True
+
     logger.info("Checking exchange...")
 
     exchange = config.get("exchange", {}).get("name", "").lower()
@@ -42,33 +43,11 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     is_known_ccxt = is_exchange_known_ccxt(exchange)
     exchange_name = MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange)
 
-<<<<<<< HEAD
-    valid, reason, _ = validate_exchange(exchange)
-
-    if not valid:
-        if check_for_bad:
-            raise OperationalException(
-                f'Exchange "{exchange}"  will not work with Freqtrade. Reason: {reason}.'
-            )
-        else:
-            logger.warning(
-                f'Exchange "{exchange}"  will not work with Freqtrade. Reason: {reason}.'
-            )
-
-    if MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange) in SUPPORTED_EXCHANGES:
-        logger.info(
-            f'Exchange "{exchange}" is officially supported by the Freqtrade development team.'
-        )
-
-    if MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange) in SUPPORTED_EXCHANGES:
-        if is_exchange_known_ccxt(exchange):
-=======
     if exchange_name in SUPPORTED_EXCHANGES:
         if is_known_ccxt:
->>>>>>> 3080dea33 (Re added change that was previously made)
             logger.info(
                 f"The {exchange.capitalize()} exchange has been recognized "
-                f"and is compatible with ccxt."
+                f"and is compatible with ccxt. "
                 f"Exchange {exchange} is officially supported by the Freqtrade development team."
             )
         else:
@@ -94,15 +73,15 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
             )
 
     if is_known_ccxt:
-        valid, reason, _ = validate_exchange(exchange)
+        valid, reason, *_ = validate_exchange(exchange)
         if not valid:
             if check_for_bad:
                 raise OperationalException(
-                    f'Exchange "{exchange}"  will not work with Freqtrade. Reason: {reason}'
+                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}'
                 )
             else:
                 logger.warning(
-                    f'Exchange "{exchange}"  will not work with Freqtrade. Reason: {reason}'
+                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}'
                 )
 
     return True

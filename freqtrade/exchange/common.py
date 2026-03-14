@@ -64,17 +64,10 @@ SUPPORTED_EXCHANGES = [
     "hyperliquid",
     "kraken",
     "okx",
-<<<<<<< HEAD
-    "myokx",
-    "alpacastocks",
-    "interactivebrokers",
-    "immortality",
-=======
     "alpacastocks",
     "interactivebrokers",
     "immortality",
     "myokx",
->>>>>>> 8c13932cd (Fixed errors caused by upstream merge)
 ]
 
 # either the main, or replacement methods (array) is required
