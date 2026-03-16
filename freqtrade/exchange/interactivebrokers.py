@@ -154,11 +154,16 @@ class Interactivebrokers(Foreignexchange):
         atexit.register(self.close)
 
         # Set ports based on live/paper trading
+        # TWS Live: 7496
+        # TWS Paper: 7497
+        # IB Gateway Live: 4001
+        # IB Gateway Paper: 4002
+
         if self.dry_run:
             self.port = config.get("ib_paper_port", 4002)
             logger.info(f"Connecting to IBKR paper trading (IB Gateway) on port {self.port}.")
         else:
-            self.port = config.get("ib_live_port", 7497)
+            self.port = config.get("ib_live_port", 7496)
             logger.info(f"Connecting to IBKR live trading (TWS) on port {self.port}.")
 
         # Set up host
@@ -352,8 +357,11 @@ class Interactivebrokers(Foreignexchange):
         self.ensure_connected()
 
         # 2) Wait for market open before placing orders (trading operation)
+        # if not self.is_market_open():
+        #    self.wait_for_market_open()
+
         if not self.is_market_open():
-            self.wait_for_market_open()
+            raise OperationalException("Forex market is currently closed. Order rejected.")
 
         params = params or {}
         pair = pair[0] if isinstance(pair, tuple) else pair
@@ -630,7 +638,6 @@ class Interactivebrokers(Foreignexchange):
             logger.info(f"Historical fallback price for {pair}: {price}")
             return price
         finally:
-            # IMPORTANT: Cancel the market data subscription to prevent leaks
             pass
 
     def _fallback_to_historical_rate(self, pair: str) -> float:
@@ -783,115 +790,128 @@ class Interactivebrokers(Foreignexchange):
         taker_fee = 0.0002
         return maker_fee if taker_or_maker == "maker" else taker_fee
 
-    async def fetch_historical_data(self, contract, durationStr, ib_timeframe):
+    def timeframe_to_minutes(self, timeframe: str) -> int:
         """
-        Request historical price data from IBKR (one shot only).
-
-        Args:
-            contract: IBKR Contract object.
-            durationStr: How far back to go (e.g. '1 D', '2 W').
-            ib_timeframe: Bar size (e.g. '1 min', '5 mins').
-
-        Returns:
-            List of bars, or empty list if unavailable.
+        Helper to convert Freqtrade timeframe strings (1m, 5m, 1h) to integer minutes.
         """
-        try:
-            bars = await self.ib.reqHistoricalDataAsync(
-                contract,
-                endDateTime="",  # Now
-                durationStr=durationStr,
-                barSizeSetting=ib_timeframe,
-                whatToShow="MIDPOINT",
-                useRTH=False,
-                keepUpToDate=False,  # ONE SHOT (no streaming)
-            )
-            if not bars:
-                logger.warning(f"No historical data returned for contract: {contract}")
-            return bars
+        import re
 
-        except Exception as e:
-            logger.warning(f"Historical data error for {contract}: {e}")
-            return []
+        match = re.match(r"(\d+)([mhdwMY])", timeframe)
+        if not match:
+            return 60
+        val = int(match.group(1))
+        unit = match.group(2)
+        mapping = {"m": 1, "h": 60, "d": 1440, "w": 10080, "M": 43200, "Y": 525600}
+        return val * mapping.get(unit, 1)
 
-    def get_historic_ohlcv(
-        self,
-        pair: str,
-        since: int | None = None,
-        timeframe: str | None = None,
-        limit: int = 1000,
-        params: dict | None = None,
-        since_ms: int | None = None,
-        is_new_pair: bool = True,
-        candle_type: str = "spot",
-        until_ms: int | None = None,
+    def _format_ib_duration(self, seconds: int) -> str:
+        """
+        Converts seconds into a valid IBKR duration string (S, D, W, M, Y).
+        Mandatory: durations > 365 days MUST be sent as Years (Y).
+        """
+        if seconds <= 0:
+            return "3600 S"
+
+        # IBKR Rule: > 365 days must use Years
+        if seconds > 31536000:
+            years = math.ceil(seconds / 31536000)
+            return f"{years} Y"
+
+        # > 30 days -> Months
+        if seconds > 2592000:
+            months = math.ceil(seconds / 2592000)
+            return f"{months} M"
+
+        # > 7 days -> Weeks
+        if seconds > 604800:
+            weeks = math.ceil(seconds / 604800)
+            return f"{weeks} W"
+
+        # > 1 day -> Days
+        if seconds > 86400:
+            days = math.ceil(seconds / 86400)
+            return f"{days} D"
+
+        return f"{seconds} S"
+
+    async def fetch_historical_data(
+        self, pair: str, timeframe: str, since: int | None = None, limit: int = 1000
     ) -> pd.DataFrame:
-        # Historical data can be fetched regardless of market status
-        # The market open check is only needed for live trading operations,
-        # not for data downloading or backtesting
-        if isinstance(pair, tuple):
-            pair = pair[0]
-
-        symbol, currency = self._extract_currencies_from_pair(pair)
+        """
+        Optimized history fetcher for FreqUI and Strategy analysis.
+        """
+        # 1. Formatting for IBKR
+        symbol, currency = pair.split("/")
         contract = Contract()
         contract.symbol = symbol
         contract.secType = "CASH"
         contract.currency = currency
         contract.exchange = "IDEALPRO"
 
-        if timeframe is None:
-            timeframe = self.config.get("timeframe", "1h")
-        ib_timeframe = self._convert_timeframe(timeframe)
-        durationStr = self._calculate_duration(timeframe, limit)
+        _, ib_bar_size = self._map_timeframe_to_ib(timeframe)
+
+        # 2. Dynamic Duration Calculation
+        if since:
+            # Handle if 'since' comes in as a string or float from FreqUI
+            try:
+                since_ms = int(since)
+                now_ts = datetime.now(UTC).timestamp()
+                duration_seconds = int(now_ts - (since_ms / 1000))
+            except (ValueError, TypeError):
+                duration_seconds = self.timeframe_to_minutes(timeframe) * 60 * limit
+        else:
+            duration_seconds = self.timeframe_to_minutes(timeframe) * 60 * limit
+
+        duration_str = self._format_ib_duration(duration_seconds)
 
         try:
-            throttle()
-            bars = self.ib.run(self.fetch_historical_data(contract, durationStr, ib_timeframe))
-            throttle()
-            if not bars:
-                logger.warning(f"No bars returned for {pair} with timeframe {timeframe}")
-                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
-
-            df = util.df(bars)
-            if df is None or df.empty:
-                logger.warning(f"Empty DataFrame returned for {pair}")
-                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
-
-            df.rename(
-                columns={
-                    "date": "timestamp",
-                    "open": "open",
-                    "high": "high",
-                    "low": "low",
-                    "close": "close",
-                    "volume": "volume",
-                },
-                inplace=True,
+            bars = await self.ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime="",
+                durationStr=duration_str,
+                barSizeSetting=ib_bar_size,
+                whatToShow="MIDPOINT",
+                useRTH=False,  # Essential for 24/5 Forex charts
+                formatDate=1,
             )
 
-            if "timestamp" in df.columns:
-                df["date"] = pd.to_datetime(df["timestamp"], utc=True)
-            else:
-                logger.error(f"No timestamp column in DataFrame for {pair}")
-                raise ValueError("DataFrame must have a 'timestamp' column")
+            if not bars:
+                return pd.DataFrame()
 
-            df = df.sort_values(by="date", ascending=True).reset_index(drop=True)
+            df = util.df(bars)
+            df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+            df["date"] = pd.to_datetime(df["date"], utc=True)
+            df["volume"] = df["volume"].astype(float)
+            df.loc[df["volume"] < 0, "volume"] = 0.0
 
-            if not df.empty:
-                current_time = datetime.now(UTC)
-                last_candle = df["date"].iloc[-1]
-                first_candle = df["date"].iloc[0]
-                num_candles = len(df)
-                age_minutes = (current_time - last_candle).total_seconds() / 60
-                logger.info(
-                    f"Retrieved {num_candles} candles for {pair}"
-                    f"from {first_candle} to {last_candle} "
-                    f"(Last candle age: {age_minutes:.2f} minutes)"
-                )
-            return df
+            return df.sort_values("date").reset_index(drop=True)
 
         except Exception as e:
-            logger.error(f"Failed to fetch historical data for {pair}: {e}")
-            raise
+            logger.error(f"IBKR Error for {pair}: {e}")
+            return pd.DataFrame()
+
+    def get_historic_ohlcv(
+        self,
+        pair: str,
+        since: int | None = None,  # 'since' MUST be the 2nd positional argument
+        timeframe: str | None = None,  # 'timeframe' MUST be the 3rd positional argument
+        limit: int = 1000,
+        **kwargs,
+    ) -> pd.DataFrame:
+        """
+        Matches Freqtrade's expected signature: (pair, since, timeframe, limit)
+        """
+        if isinstance(pair, tuple):
+            pair = pair[0]
+
+        # Use config timeframe if none provided
+        tf = timeframe or self.config.get("timeframe", "1h")
+
+        # Run the async fetcher
+        df = self.ib.run(
+            self.fetch_historical_data(pair=pair, timeframe=tf, since=since, limit=limit)
+        )
+        return df
 
     def refresh_latest_ohlcv(self, pairs: list) -> None:
         """
@@ -1831,3 +1851,15 @@ class Interactivebrokers(Foreignexchange):
         # we retrieve is an int, even though dict.get() returns a generic 'Any'.
         limit = cast(int, self._ft_has_default.get("ohlcv_candle_limit", 1000))
         return limit
+
+    def _map_timeframe_to_ib(self, timeframe: str):
+        # Returns (IBKR_Duration_Unit, IBKR_Bar_Size)
+        mapping = {
+            "1m": ("D", "1 min"),
+            "5m": ("D", "5 mins"),
+            "15m": ("D", "15 mins"),
+            "1h": ("W", "1 hour"),
+            "4h": ("M", "4 hours"),
+            "1d": ("Y", "1 day"),
+        }
+        return mapping.get(timeframe, ("D", "1 hour"))
