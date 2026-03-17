@@ -1,3 +1,4 @@
+# Alpaca exchange stock integration for FreqTrade
 import asyncio
 import json
 import logging
@@ -5,7 +6,8 @@ import math
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+import warnings
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,8 @@ from dateutil.parser import isoparse
 from freqtrade.exceptions import OperationalException
 from freqtrade.exchange.stockexchange import Stockexchange
 
+
+warnings.filterwarnings("ignore", message="The HMAC key is 3 bytes long")
 
 logger = logging.getLogger(__name__)
 
@@ -181,80 +185,135 @@ class Alpacastocks(Stockexchange):
     def create_order(self, pair, ordertype, side, amount, price=None, params=None, **kwargs):
         symbol = pair.split("/", 1)[0]
         params = params or {}
+
         try:
             side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
 
             if ordertype == "market":
-                notional = round(amount, 2)
-                if notional < 1.0:
-                    notional = 1.0
-                    logger.warning(f"Adjusting notional to minimum: ${notional:.2f}")
+                qty = round(amount, 6)
+                if qty <= 0:
+                    raise OperationalException(f"Invalid quantity: {qty}")
+
                 order_req = MarketOrderRequest(
                     symbol=symbol,
-                    notional=notional,
+                    qty=qty,
                     side=side_enum,
                     time_in_force=TimeInForce.DAY,
                 )
 
             elif ordertype == "limit":
-                if price is None:
-                    price = self.get_rate(f"{symbol}/USD")
-                    logger.warning(
-                        f"No limit price supplied; using current market price {price:.2f}"
-                    )
-
-                available = self._get_available_qty(symbol)
-                if amount > available:
-                    logger.warning(
-                        f"Requested {amount} exceeds available qty ({available}). "
-                        "Adjusting to available."
-                    )
-                # Floor to 6 decimal places to ensure qty <= available
-                raw_qty = min(amount, available)
-                precision = 6
-                qty = math.floor(raw_qty * (10**precision)) / (10**precision)
-                if qty <= 0:
-                    raise OperationalException(f"Available quantity too small ({available}).")
-
-                limit_price = round(price, 2)
-                time_in_force = TimeInForce.DAY if abs(qty - int(qty)) > 1e-6 else TimeInForce.GTC
-                logger.info(f"Using time_in_force={time_in_force} for order of {qty} shares.")
-
-                order_req = LimitOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=side_enum,
-                    limit_price=limit_price,
-                    time_in_force=time_in_force,
+                order_req = self._limit_order(
+                    symbol, side, side_enum, amount, price, params, kwargs
                 )
+
             else:
                 raise OperationalException(f"Unsupported order type: {ordertype}")
 
-            alpaca_order = self.trading_client.submit_order(order_req)
-            raw_qty = alpaca_order.qty
-            raw_filled = alpaca_order.filled_qty
-            filled = float(raw_filled or 0)
-            qty = float(raw_qty) if raw_qty is not None else filled
-            remaining = qty - filled
+            return self._submit(order_req)
 
-            return {
-                "id": str(alpaca_order.id),
-                "symbol": f"{symbol}/USD",
-                "type": alpaca_order.order_type.value,
-                "side": "buy" if alpaca_order.side == OrderSide.BUY else "sell",
-                "price": float(alpaca_order.limit_price or 0),
-                "amount": qty,
-                "filled": filled,
-                "remaining": remaining,
-                "status": alpaca_order.status.lower(),
-                "cost": filled * float(alpaca_order.filled_avg_price or 0),
-                "info": dict(alpaca_order),
-            }
         except APIError as e:
             logger.error(f"Failed to create order: {e}")
             raise OperationalException(f"Order rejected by Alpaca: {e}")
 
-    def cancel_order(self, order_id: str):
+    def _limit_order(self, symbol, side, side_enum, amount, price, params, kwargs):
+        # ---- quantity ----
+        available = self._get_available_qty(symbol)
+        raw_qty = min(amount, available)
+
+        precision = int(params.get("precision_amount", 6))
+        qty = math.floor(raw_qty * (10**precision)) / (10**precision)
+
+        if qty <= 0:
+            raise OperationalException(f"Available quantity too small ({available})")
+
+        # ---- base price ----
+        base_price = None
+
+        if price is not None:
+            base_price = float(price)
+        else:
+            try:
+                t = self.fetch_ticker(f"{symbol}/USD")
+                bid = float(t.get("bid") or 0)
+                ask = float(t.get("ask") or 0)
+                close = float(t.get("close") or 0)
+                base_price = (ask or close or bid) if side == "buy" else (bid or close or ask)
+            except Exception as e:
+                logger.debug(f"fetch_ticker failed for {symbol}: {e}", exc_info=True)
+
+        # fallback 1: candle
+        if not base_price or base_price <= 0:
+            try:
+                now = int(time.time() * 1000)
+                bars = self.get_historic_ohlcv(
+                    pair=f"{symbol}/USD",
+                    timeframe="1m",
+                    since=now - 60000,
+                    limit=1,
+                    params={},
+                )
+                if not bars.empty:
+                    base_price = float(bars.iloc[-1]["close"])
+            except Exception as e:
+                logger.debug(f"candle fallback failed for {symbol}: {e}", exc_info=True)
+
+        # fallback 2: get_rate
+        if (not base_price or base_price <= 0) and hasattr(self, "get_rate"):
+            try:
+                r = self.get_rate(f"{symbol}/USD")
+                if r and r > 0:
+                    base_price = float(r)
+            except Exception as e:
+                logger.debug(f"get_rate fallback failed for {symbol}: {e}", exc_info=True)
+
+        # ---- fallback to market ----
+        allow_market = params.get("allow_market_if_no_price", True)
+        is_initial = kwargs.get("initial_order", True)
+
+        if not base_price or base_price <= 0:
+            if (not is_initial) or allow_market:
+                logger.warning(f"No price for {symbol}, fallback to market")
+                return MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=side_enum,
+                    time_in_force=TimeInForce.DAY,
+                )
+            raise OperationalException(f"Cannot derive price for {symbol}")
+
+        # ---- limit price ----
+        offset = float(params.get("limit_price_offset", 0.01))
+        final_price = base_price - offset if side == "buy" else base_price + offset
+
+        return LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side_enum,
+            limit_price=round(final_price, 2),
+            time_in_force=params.get("time_in_force", TimeInForce.DAY),
+        )
+
+    def _submit(self, order_req):
+        o = self.trading_client.submit_order(order_req)
+
+        filled = float(o.filled_qty or 0)
+        qty = float(o.qty) if o.qty is not None else filled
+
+        return {
+            "id": str(o.id),
+            "symbol": f"{o.symbol}/USD",
+            "type": o.order_type.value,
+            "side": "buy" if o.side == OrderSide.BUY else "sell",
+            "price": float(o.limit_price or 0),
+            "amount": qty,
+            "filled": filled,
+            "remaining": qty - filled,
+            "status": o.status.lower(),
+            "cost": filled * float(o.filled_avg_price or 0),
+            "info": o.dict() if hasattr(o, "dict") else str(o),
+        }
+
+    def cancel_order(self, order_id: str, pair: str = ""):
         try:
             self.trading_client.cancel_order_by_id(order_id)
             return {"id": order_id, "status": "canceled", "info": {}}
@@ -714,25 +773,38 @@ class Alpacastocks(Stockexchange):
         try:
             if params is None:
                 params = {}
-            logger.debug(f"Request parameters: {params}")
-            logger.debug(f"since_ms: {since_ms}, until_ms: {until_ms}")
             symbol = pair.split("/")[0]
-            if since_ms:
-                start = pd.to_datetime(since_ms, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # determine start / end ISO strings expected by Alpaca
+            actual_since = since or since_ms
+
+            if actual_since:
+                # actual_since is ms -> convert to UTC ISO
+                start = pd.to_datetime(int(actual_since), unit="ms", utc=True).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
             else:
+                # default to 1 day back
                 start = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
+
             if until_ms:
-                end = pd.to_datetime(until_ms, unit="ms", utc=True).strftime("%Y-%m-%dT%H:%M:%SZ")
+                end = pd.to_datetime(int(until_ms), unit="ms", utc=True).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
             else:
                 end = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            # pass limit to Alpaca (they accept up to ~1000 per page)
+            page_limit = min(1000, limit or 1000)
+
             bars = self.get_historical_bars(
                 [symbol],
                 timeframe,
                 start,
                 end,
-                limit,
+                page_limit,
                 params.get("adjustment", "raw"),
                 params.get("feed", "iex"),
                 params.get("currency", "USD"),
@@ -745,12 +817,18 @@ class Alpacastocks(Stockexchange):
             ):
                 logger.warning(f"No data available for {pair} {timeframe}")
                 return pd.DataFrame()
+
             data = []
             for bar in bars["bars"].get(symbol, []):
                 try:
+                    # Alpaca's bar['t'] is ISO string or timestamp; ensure we parse it
+                    tval = (
+                        bar.get("t") or bar.get("time") or bar.get("timestamp") or bar.get("start")
+                    )
+                    date = pd.to_datetime(tval, utc=True)
                     data.append(
                         {
-                            "date": pd.to_datetime(bar["t"], utc=True),
+                            "date": date,
                             "open": float(bar["o"]),
                             "high": float(bar["h"]),
                             "low": float(bar["l"]),
@@ -758,18 +836,18 @@ class Alpacastocks(Stockexchange):
                             "volume": float(bar["v"]),
                         }
                     )
-                except (KeyError, TypeError) as e:
+                except (KeyError, TypeError, ValueError) as e:
                     logger.warning(f"Invalid bar data for {symbol}: {e}")
                     continue
+
             df = pd.DataFrame(data)
             if df.empty:
                 logger.warning(f"No valid data retrieved for {pair} {timeframe}")
                 return pd.DataFrame()
-            df["date"] = pd.to_datetime(df["date"])
+
+            df["date"] = pd.to_datetime(df["date"], utc=True)
             df.sort_values(by="date", inplace=True)
             df.reset_index(drop=True, inplace=True)
-            logger.debug(f"DataFrame columns: {df.columns}")
-            logger.debug(f"First row: {df.head(1)}")
             return df
         except Exception as e:
             logger.error(f"An error occurred fetching OHLCV for {pair}: {e}")
@@ -921,14 +999,26 @@ class Alpacastocks(Stockexchange):
             return self._last_market_state if self._last_market_state is not None else False, 0.0
 
     def get_rate(self, pair: str, side: str | None = None, *args, **kwargs) -> float:
+        symbol = pair.split("/")[0]
         try:
+            # Use the latest trade endpoint instead of a 1m candle
+            # This is more efficient and avoids the 1m 'no data' gaps
+            request_params = StockLatestTradeRequest(symbol_or_symbols=symbol, feed="iex")
+            latest_trade = self.data_client.get_stock_latest_trade(request_params)
+
+            # RUF019 Fix: Use .get() to safely check existence and truthiness
+            if trade := latest_trade.get(symbol):
+                return float(trade.price)
+
+            # Fallback to klines only if latest_trade fails
             df = self.klines(pair, timeframe="1m", candle_type="spot")
-            if df.empty:
-                raise ValueError(f"No price data available for {pair}")
-            return float(df["close"].iat[-1])
+            if not df.empty:
+                return float(df["close"].iat[-1])
+
         except Exception as e:
             logger.error(f"Failed to fetch rate for {pair}: {e}")
-            return 0.0
+
+        return 0.0
 
     def get_funding_fees(self, pair: str, amount: float, **kwargs) -> float:
         return 0.0
@@ -1157,91 +1247,147 @@ class Alpacastocks(Stockexchange):
             return {}
 
     def fetch_ticker(self, pair: str, params: dict | None = None) -> dict:
-        """
-        Pulls latest quote + trade from Alpaca for `pair` (e.g. "MSFT/USD").
-        First tries to use any datetime attributes on the Pydantic models,
-        then ISO strings, then finally now() if all else fails.
-        """
         symbol = pair.split("/", 1)[0]
 
-        def normalize(obj):
-            # If it's a Pydantic model with attrs, keep both forms
-            data = obj.dict() if hasattr(obj, "dict") else obj
-            return obj, data.get("data", data) if isinstance(data, dict) else data
-
         try:
-            # 1) Fetch quote and trade
-            throttle()
-            quote_obj, qdata = normalize(
-                self.data_client.get_stock_latest_quote(
-                    StockLatestQuoteRequest(symbol_or_symbols=symbol)
-                )
+            quote_resp = self.data_client.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=symbol)
             )
-            throttle()
-            trade_obj, tdata = normalize(
-                self.data_client.get_stock_latest_trade(
-                    StockLatestTradeRequest(symbol_or_symbols=symbol)
-                )
+            trade_resp = self.data_client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol)
             )
 
-            # If wrapped in list, grab first
-            if isinstance(qdata, list):
-                qdata = qdata[0]
-            if isinstance(tdata, list):
-                tdata = tdata[0]
+            # ---- safe dict conversion ----
+            try:
+                qraw = quote_resp.dict() if hasattr(quote_resp, "dict") else quote_resp
+            except Exception as e:
+                logger.debug(f"quote dict() failed: {e}", exc_info=True)
+                qraw = quote_resp
 
-            # 2) Timestamp resolution
-            ts_dt = None
-            # a) Model attribute (datetime)
-            for attr in ("timestamp", "timestamp_utc"):
-                val = getattr(quote_obj, attr, None) or getattr(trade_obj, attr, None)
-                if isinstance(val, datetime):
-                    ts_dt = val
-                    break
+            try:
+                traw = trade_resp.dict() if hasattr(trade_resp, "dict") else trade_resp
+            except Exception as e:
+                logger.debug(f"trade dict() failed: {e}", exc_info=True)
+                traw = trade_resp
 
-            # b) ISO string in dict
-            if ts_dt is None:
-                ts_str = (
-                    qdata.get("timestamp")
-                    or qdata.get("timestamp_utc")
-                    or tdata.get("timestamp")
-                    or tdata.get("timestamp_utc")
-                )
-                if ts_str:
-                    ts_dt = isoparse(ts_str)
+            logger.debug(f"RAW QUOTE RESP: {qraw}")
+            logger.debug(f"RAW TRADE RESP: {traw}")
 
-            # c) Fallback to UTC now
-            if ts_dt is None:
-                ts_dt = datetime.now(timezone.utc)  # noqa: UP017
-                logger.warning(
-                    f"No timestamp in quote/trade for {symbol}; using now()={ts_dt.isoformat()}"
-                )
+            # ---- unwrap symbol map ----
+            if isinstance(qraw, dict) and len(qraw) == 1:
+                v = next(iter(qraw.values()))
+                if isinstance(v, dict):
+                    qraw = v
 
-            ts_ms = int(ts_dt.timestamp() * 1000)
+            if isinstance(traw, dict) and len(traw) == 1:
+                v = next(iter(traw.values()))
+                if isinstance(v, dict):
+                    traw = v
 
-            # 3) Assemble CCXT-style ticker
+            # ---- unwrap "data" wrapper ----
+            if isinstance(qraw, dict) and isinstance(qraw.get("data"), dict):
+                qraw = qraw["data"]
+
+            if isinstance(traw, dict) and isinstance(traw.get("data"), dict):
+                traw = traw["data"]
+
+            # ---- timestamp ----
+            ts_ms = self._extract_ts(traw) or self._extract_ts(qraw)
+
+            if not ts_ms:
+                ts_ms = int(datetime.now(UTC).timestamp() * 1000)
+                logger.debug(f"No timestamp for {symbol}, fallback to now()")
+
+            # ---- price ----
+            last_price = self._compute_last_price(qraw, traw, symbol)
+
             return {
                 "symbol": pair,
                 "timestamp": ts_ms,
-                "datetime": ts_dt.isoformat(),
+                "datetime": datetime.fromtimestamp(ts_ms / 1000, UTC).isoformat(),
                 "high": None,
                 "low": None,
                 "open": None,
-                "close": float(tdata.get("price", 0.0)),
-                "bid": float(qdata.get("bid_price", 0.0)),
-                "bidVolume": None,
-                "ask": float(qdata.get("ask_price", 0.0)),
-                "askVolume": None,
-                "info": {
-                    "quote": qdata,
-                    "trade": tdata,
-                },
+                "close": last_price,
+                "bid": float(qraw.get("bid_price") or qraw.get("bid") or 0)
+                if isinstance(qraw, dict)
+                else None,
+                "bidVolume": qraw.get("bid_size") if isinstance(qraw, dict) else None,
+                "ask": float(qraw.get("ask_price") or qraw.get("ask") or 0)
+                if isinstance(qraw, dict)
+                else None,
+                "askVolume": qraw.get("ask_size") if isinstance(qraw, dict) else None,
+                "info": {"quote": qraw, "trade": traw},
             }
 
         except Exception:
-            logger.exception(f"Error fetching ticker for {symbol} via Alpaca")
-            # bubble up real API/connectivity errors
+            logger.exception(f"Error fetching ticker for {symbol}")
             raise
+
+    # -----------------------
+    # HELPERS (minimal set)
+    # -----------------------
+
+    def _extract_ts(self, obj):
+        if not isinstance(obj, dict):
+            return None
+
+        for k in ("timestamp", "t", "ts", "time", "created_at"):
+            if obj.get(k) is not None:
+                ts = self._parse_ts(obj[k])
+                if ts:
+                    return ts
+
+        for v in obj.values():
+            ts = self._parse_ts(v)
+            if ts:
+                return ts
+
+        return None
+
+    def _parse_ts(self, value):
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return int(value.timestamp() * 1000)
+
+        if isinstance(value, (int, float)):
+            return int(value) if value > 1e12 else int(value * 1000)
+
+        if isinstance(value, str):
+            try:
+                return int(isoparse(value).timestamp() * 1000)
+            except Exception:
+                return None
+
+        if isinstance(value, dict):
+            for k in ("timestamp", "t", "ts", "time", "created_at"):
+                if value.get(k) is not None:
+                    return self._parse_ts(value[k])
+
+        return None
+
+    def _compute_last_price(self, qdata, tdata, symbol):
+        if isinstance(tdata, dict):
+            p = tdata.get("price") or tdata.get("last") or tdata.get("p")
+            if p is not None:
+                return float(p)
+
+        if isinstance(qdata, dict):
+            try:
+                bid = qdata.get("bid_price") or qdata.get("bid")
+                ask = qdata.get("ask_price") or qdata.get("ask")
+                close = qdata.get("close")
+
+                if bid and ask:
+                    return (float(bid) + float(ask)) / 2
+                if close:
+                    return float(close)
+            except Exception as e:
+                logger.debug(f"price calc failed for {symbol}: {e}", exc_info=True)
+
+        return None
 
     def fetch_ohlcv(
         self,
@@ -1252,6 +1398,17 @@ class Alpacastocks(Stockexchange):
         params: dict | None = None,
     ) -> list[list]:
         try:
+            # --- Convert timeframe to seconds ---
+            timeframe_map = {
+                "1m": 60,
+                "5m": 300,
+                "15m": 900,
+                "1h": 3600,
+                "1d": 86400,
+            }
+            tf_sec = timeframe_map.get(timeframe, 60)
+
+            # --- Fetch raw bars ---
             bars = self.get_historic_ohlcv(
                 pair=symbol,
                 timeframe=timeframe,
@@ -1259,18 +1416,69 @@ class Alpacastocks(Stockexchange):
                 limit=limit,
                 params=params or {},
             )
+
+            if bars is None or bars.empty:
+                logger.debug(
+                    f"No data returned for {symbol} {timeframe} (likely no trades in interval)"
+                )
+                return []
+
+            df = bars.sort_values("date")
+
+            # --- Convert to OHLCV ---
             ohlcv = [
                 [
-                    int(bar["date"].timestamp() * 1000),
-                    float(bar["open"]),
-                    float(bar["high"]),
-                    float(bar["low"]),
-                    float(bar["close"]),
-                    float(bar["volume"]),
+                    int(row["date"].timestamp() * 1000),
+                    float(row["open"]),
+                    float(row["high"]),
+                    float(row["low"]),
+                    float(row["close"]),
+                    float(row["volume"]),
                 ]
-                for bar in bars.to_dict("records")
+                for _, row in df.iterrows()
             ]
-            return ohlcv
+
+            if not ohlcv:
+                return []
+
+            # --- Remove current (possibly incomplete) candle ---
+            # Renamed now_ts to now_ms to match the usage below
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+            last_ts = ohlcv[-1][0]
+            if last_ts >= now_ms - (tf_sec * 1000):
+                ohlcv.pop()
+
+            # --- Fill missing candles (CRITICAL FIX) ---
+            filled = []
+            prev = ohlcv[0]
+            filled.append(prev)
+
+            for curr in ohlcv[1:]:
+                prev_ts = prev[0]
+                curr_ts = curr[0]
+
+                expected_ts = prev_ts + tf_sec * 1000
+
+                # Fill gaps
+                while expected_ts < curr_ts:
+                    filled.append(
+                        [
+                            expected_ts,
+                            prev[4],  # open = last close
+                            prev[4],  # high
+                            prev[4],  # low
+                            prev[4],  # close
+                            0.0,  # volume
+                        ]
+                    )
+                    expected_ts += tf_sec * 1000
+
+                filled.append(curr)
+                prev = curr
+
+            return filled
+
         except Exception as e:
             logger.error(f"Error fetching OHLCV for {symbol} via Alpaca: {e}")
             return []
@@ -1336,6 +1544,7 @@ class Alpacastocks(Stockexchange):
         self,
         pair: str,
         since: int | None = None,
+        since_ms=None,
         limit: int | None = None,
         params: dict | None = None,
     ) -> list[dict]:
@@ -1350,8 +1559,10 @@ class Alpacastocks(Stockexchange):
 
         # Convert since (ms) to ISO8601, if provided
         start: str | None = None
-        if since:
-            start = datetime.fromtimestamp(since / 1000, tz=timezone.utc).isoformat()  # noqa: UP017
+
+        ts = since_ms if since_ms is not None else since
+        if ts is not None:
+            start = datetime.fromtimestamp(ts / 1000, UTC).isoformat()
 
         # Default limit if not set
         max_trades = limit or 1000
@@ -1366,7 +1577,8 @@ class Alpacastocks(Stockexchange):
         for t in api_resp.data:
             # Alpaca Trade.timestamp is ISO str; parse to ms
             ts = int(isoparse(t.timestamp).timestamp() * 1000)
-            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()  # noqa: UP017
+            dt = datetime.fromtimestamp(ts / 1000, UTC).isoformat()
+
             ccxt_trades.append(
                 {
                     "id": t.trade_id,
@@ -1389,43 +1601,57 @@ class Alpacastocks(Stockexchange):
         limit: int | None = None,
         params: dict | None = None,
     ):
-        """
-        Streams live OHLCV bars from Alpaca into Freqtrade/FreqUI.
-        Yields lists: [ timestamp(ms), open, high, low, close, volume ].
-        """
-        # 1) Symbol part
         symbol = pair.split("/", 1)[0]
-
-        # 2) Convert Freqtrade TF (e.g. "1m", "5m") to Alpaca bar_timeframe (e.g. "1Min", "5Min")
+        # convert timeframe to Alpaca bar timeframe
         minutes = int(timeframe.rstrip("m"))
         alpaca_tf = f"{minutes}Min"
 
-        # 3) Create the stream client
         stream = TradingStream(self.key, self.secret, paper=self.dry_run)
-
-        # 4) Use an asyncio.Queue to hand bars over to the generator
         queue: asyncio.Queue = asyncio.Queue()
 
         async def _on_bar(bar):
-            ts = int(bar.start * 1000)
+            # bar.start is datetime-like -> use .timestamp()
+            try:
+                start_dt = (
+                    getattr(bar, "start", None) or bar.get("t") if isinstance(bar, dict) else None
+                )
+                if isinstance(start_dt, (int, float)):
+                    ts = int(start_dt * 1000)
+                elif isinstance(start_dt, datetime):
+                    ts = int(start_dt.timestamp() * 1000)
+                else:
+                    # fallback: try bar.start.timestamp()
+                    # Fix: Use direct property access instead of getattr with constant
+                    ts = int(bar.start.timestamp() * 1000)
+            except Exception:
+                # last-resort: now
+                ts = int(datetime.now(UTC).timestamp() * 1000)
+
             await queue.put(
                 [
                     ts,
-                    float(bar.open),
-                    float(bar.high),
-                    float(bar.low),
-                    float(bar.close),
-                    float(bar.volume),
+                    float(getattr(bar, "open", bar.get("o", 0))),
+                    float(getattr(bar, "high", bar.get("h", 0))),
+                    float(getattr(bar, "low", bar.get("l", 0))),
+                    float(getattr(bar, "close", bar.get("c", 0))),
+                    float(getattr(bar, "volume", bar.get("v", 0))),
                 ]
             )
 
-        # 5) Subscribe to bar updates
         stream.subscribe_bars(_on_bar, symbol, bar_timeframe=alpaca_tf)
 
-        # 6) Kick off the streaming loop in the background
-        self._stream_task = asyncio.create_task(stream._run_forever())
+        # Use the public run method instead of private _run_forever when possible
+        try:
+            # run() may be blocking; create_task for the official coroutine entry if available
+            self._stream_task = asyncio.create_task(
+                stream.run()
+            )  # or stream._run_forever() if run() isn't provided
+        except Exception:
+            try:
+                self._stream_task = asyncio.create_task(stream._run_forever())
+            except Exception:
+                logger.exception("Failed to start Alpaca bar stream.")
 
-        # 7) Yield bars as they arrive
         while True:
             ohlcv = await queue.get()
             yield ohlcv
@@ -1565,7 +1791,7 @@ class Alpacastocks(Stockexchange):
         async def _on_trade(trade):
             ts = int(isoparse(trade.timestamp).timestamp() * 1000)
             # Alpaca Trade.timestamp is ISO str; parse to ms
-            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()  # noqa: UP017
+            dt = datetime.fromtimestamp(ts / 1000, UTC).isoformat()
             await q.put(
                 {
                     "id": trade.trade_id,
