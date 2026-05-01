@@ -361,7 +361,7 @@ class FreqaiDataDrawer:
             label_loc = df.columns.get_loc(label)
             pred_label_loc = predictions.columns.get_loc(label)
             df.iloc[-1, label_loc] = predictions.iloc[-1, pred_label_loc]
-            if df[label].dtype == object:
+            if pd.api.types.is_string_dtype(df[label].dtype):
                 continue
             label_mean_loc = df.columns.get_loc(f"{label}_mean")
             label_std_loc = df.columns.get_loc(f"{label}_std")
@@ -614,9 +614,13 @@ class FreqaiDataDrawer:
         elif self.model_type == "pytorch":
             import torch
 
-            zipfile = torch.load(dk.data_path / f"{dk.model_filename}_model.zip")
-            model = zipfile["pytrainer"]
-            model = model.load_from_checkpoint(zipfile)
+            zipfile = torch.load(
+                dk.data_path / f"{dk.model_filename}_model.zip",
+                weights_only=False,
+            )
+            # weights_only is necessary due to pytrainer being a serialized python object.
+            _trainer = zipfile["pytrainer"]
+            model = _trainer.load_from_checkpoint(zipfile)
 
         if not model:
             raise OperationalException(

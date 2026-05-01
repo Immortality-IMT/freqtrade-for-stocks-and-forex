@@ -59,7 +59,7 @@ jobs:
       uses: ./.github/actions/docker-tags
 
     - name: Login to Docker Hub
-      uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -183,13 +183,13 @@ jobs:
       uses: ./.github/actions/docker-tags
 
     - name: Login to Docker Hub
-      uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
     - name: Login to github
-      uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
@@ -310,9 +310,8 @@ jobs:
         docker image prune -a --force --filter "until=24h"
 
     - name: Discord notification
-      uses: rjstone/discord-webhook-notify@c2597273488aeda841dd1e891321952b51f7996f #v2.2.1
+      uses: sarisia/actions-status-discord@eb045afee445dc055c18d3d90bd0f244fd062708 # v1.16.0
       if: always() && ( github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && (github.event_name != 'schedule')
       with:
-          severity: info
-          details: Deploy Succeeded!
-          webhookUrl: ${{ secrets.DISCORD_WEBHOOK }}
+          title: Deploy Succeeded!
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}

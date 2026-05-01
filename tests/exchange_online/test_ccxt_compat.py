@@ -101,6 +101,30 @@ class TestCCXTExchange:
         else:
             pytest.skip(f"No sample order available for exchange {exchangename}")
 
+    def test_ccxt_order_parse_futures(self, exchange_futures: EXCHANGE_FIXTURE_TYPE):
+        exch, exchangename, exchange_params = exchange_futures
+        if orders := exchange_params.get("sample_order_futures"):
+            for order in orders:
+                pair = order["pair"]
+                exchange_response: dict = order["exchange_response"]
+
+                market = exch._api.markets[pair]
+                po = exch._api.parse_order(exchange_response, market)
+                expected = order["expected"]
+                assert isinstance(po["id"], str)
+                assert po["id"] is not None
+
+                # Generic comparison which works for all fields
+                for key, value in expected.items():
+                    assert key in po, f"Expected key {key} not found in parsed order"
+                    assert po[key] == value, f"Expected {key} to be {value}, got {po[key]}"
+                    assert isinstance(po[key], type(value)), (
+                        f"Expected {key} to be of type {type(value)}, got {type(po[key])}"
+                    )
+
+        else:
+            pytest.skip(f"No sample order available for exchange {exchangename}")
+
     def test_ccxt_my_trades_parse(self, exchange: EXCHANGE_FIXTURE_TYPE):
         exch, exchangename, exchange_params = exchange
         if trades := exchange_params.get("sample_my_trades"):
@@ -263,7 +287,7 @@ class TestCCXTExchange:
         # Check if last-timeframe is within the last 2 intervals
         now = datetime.now(UTC) - timedelta(minutes=(timeframe_to_minutes(timeframe) * 2))
         assert exch.klines(pair_tf).iloc[-1]["date"] >= timeframe_to_prev_date(timeframe, now)
-        assert exch.klines(pair_tf)["date"].astype(int).iloc[0] // 1e6 == since_ms
+        assert exch.klines(pair_tf)["date"].dt.as_unit("ms").astype("int64").iloc[0] == since_ms
 
     def _ccxt__async_get_candle_history(
         self, exchange, pair: str, timeframe: str, candle_type: CandleType, factor: float = 0.9

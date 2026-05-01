@@ -6,9 +6,7 @@ from freqtrade.exceptions import OperationalException
 from freqtrade.exchange import available_exchanges, is_exchange_known_ccxt, validate_exchange
 from freqtrade.exchange.common import MAP_EXCHANGE_CHILDCLASS, SUPPORTED_EXCHANGES
 
-
 logger = logging.getLogger(__name__)
-
 
 def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     """
@@ -43,6 +41,7 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     is_known_ccxt = is_exchange_known_ccxt(exchange)
     exchange_name = MAP_EXCHANGE_CHILDCLASS.get(exchange, exchange)
 
+    # Your original logic for supported exchanges
     if exchange_name in SUPPORTED_EXCHANGES:
         if is_known_ccxt:
             logger.info(
@@ -72,16 +71,14 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
                 f"{', '.join(available_exchanges())}"
             )
 
-    if is_known_ccxt:
-        valid, reason, *_ = validate_exchange(exchange)
-        if not valid:
-            if check_for_bad:
-                raise OperationalException(
-                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}'
-                )
-            else:
-                logger.warning(
-                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}'
-                )
+    # Upstream logic for validate_exchange
+    valid, reason, _, _ = validate_exchange(exchange)
+    if not valid:
+        if check_for_bad:
+            raise OperationalException(
+                f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
+            )
+        else:
+            logger.warning(f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.')
 
     return True

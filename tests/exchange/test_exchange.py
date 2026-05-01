@@ -1,5 +1,6 @@
 import copy
 import logging
+import re
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from random import randint
@@ -346,6 +347,22 @@ def test_validate_freqai_compat(default_conf, mocker, caplog):
     ex.validate_freqai(default_conf)
     default_conf["freqai"] = {"enabled": False}
     ex.validate_freqai(default_conf)
+
+
+def test_validate_demo_trading(default_conf_usdt, mocker, caplog):
+    # Test - nothing enabled so nothing happens
+    ex = get_patched_exchange(mocker, default_conf_usdt, exchange="kraken")
+    ex.validate_demo_trading(default_conf_usdt["exchange"])
+
+    default_conf_usdt["exchange"]["demo_trading"] = True
+    with pytest.raises(ConfigurationError, match=r"Demo trading is not supported for .*"):
+        ex.validate_demo_trading(default_conf_usdt["exchange"])
+
+    msg = r"Demo trading enabled for .*"
+    assert not log_has_re(msg, caplog)
+    ex_bybit = get_patched_exchange(mocker, default_conf_usdt, exchange="bybit")
+    ex_bybit.validate_demo_trading(default_conf_usdt["exchange"])
+    assert log_has_re(msg, caplog)
 
 
 @pytest.mark.parametrize(
@@ -960,7 +977,8 @@ def test_validate_ordertypes_stop_advanced(default_conf, mocker, exchange_name, 
         ExchangeResolver.load_exchange(default_conf)
     else:
         with pytest.raises(
-            OperationalException, match=r"On exchange stoploss price type is not supported for .*"
+            OperationalException,
+            match=r"On exchange stoploss price type '.*' is not supported for .*",
         ):
             ExchangeResolver.load_exchange(default_conf)
 
@@ -1058,6 +1076,24 @@ def test_create_dry_run_order(default_conf, mocker, side, exchange_name, leverag
     assert order["symbol"] == "ETH/BTC"
     assert order["amount"] == 1
     assert order["cost"] == 1 * 200
+
+
+def test_create_dry_run_order_id_unique_with_same_timestamp(default_conf, mocker, time_machine):
+    exchange = get_patched_exchange(mocker, default_conf)
+
+    time_machine.move_to("2026-04-27T04:49:57.438232Z", tick=False)
+    order1 = exchange.create_dry_run_order(
+        pair="ETH/USDT", ordertype="limit", side="sell", amount=1, rate=2.05, leverage=1.0
+    )
+    order2 = exchange.create_dry_run_order(
+        pair="ETH/USDT", ordertype="limit", side="sell", amount=1, rate=2.05, leverage=1.0
+    )
+
+    assert order1["id"] != order2["id"]
+    assert re.match(
+        r"^dry_run_sell_ETH/USDT_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        order1["id"],
+    )
 
 
 @pytest.mark.parametrize(
@@ -1968,6 +2004,7 @@ def test_fetch_orders(default_conf, mocker, exchange_name, limit_order):
 
     api_mock.fetch_orders = MagicMock(side_effect=return_value)
     api_mock.fetch_open_orders = MagicMock(return_value=[limit_order["buy"]])
+    api_mock.fetch_canceled_orders = MagicMock(return_value=[])
     api_mock.fetch_closed_orders = MagicMock(return_value=[limit_order["buy"]])
 
     mocker.patch(f"{EXMS}.exchange_has", return_value=True)
@@ -2000,6 +2037,8 @@ def test_fetch_orders(default_conf, mocker, exchange_name, limit_order):
             return True
         if endpoint == "fetchOpenOrders":
             return True
+        if endpoint == "fetchCanceledOrders":
+            return True
 
     if exchange_name == "okx":
         # Special OKX case is tested separately
@@ -2012,6 +2051,7 @@ def test_fetch_orders(default_conf, mocker, exchange_name, limit_order):
     assert api_mock.fetch_orders.call_count == 0
     assert api_mock.fetch_open_orders.call_count == expected
     assert api_mock.fetch_closed_orders.call_count == expected
+    assert api_mock.fetch_canceled_orders.call_count == expected
 
     mocker.patch(f"{EXMS}.exchange_has", return_value=True)
 
@@ -2031,12 +2071,77 @@ def test_fetch_orders(default_conf, mocker, exchange_name, limit_order):
     api_mock.fetch_orders = MagicMock(side_effect=ccxt.NotSupported())
     api_mock.fetch_open_orders.reset_mock()
     api_mock.fetch_closed_orders.reset_mock()
+    api_mock.fetch_canceled_orders.reset_mock()
 
     exchange.fetch_orders("mocked", start_time)
 
     assert api_mock.fetch_orders.call_count == expected
     assert api_mock.fetch_open_orders.call_count == expected
     assert api_mock.fetch_closed_orders.call_count == expected
+    assert api_mock.fetch_canceled_orders.call_count == expected
+
+
+@pytest.mark.parametrize("exchange_name", [ex for ex in EXCHANGES if ex != "bybit"])
+@pytest.mark.parametrize(
+    "call_config, expected",
+    [
+        # call_config: (fetch_orders, fetch_open, fetch_closed, fetch_canceled)
+        # expected: (fetch_orders_calls, fetch_open_calls, fetch_closed_calls, fetch_canceled_calls)
+        ((True, False, False, False), (1, 0, 0, 0)),
+        ((False, True, True, False), (0, 1, 1, 0)),
+        ((False, True, False, True), (0, 1, 0, 1)),
+        ((False, True, True, True), (0, 1, 1, 1)),
+    ],
+)
+def test_fetch_orders_multi(
+    default_conf, mocker, exchange_name, limit_order, call_config, expected
+):
+    default_conf["dry_run"] = False
+    api_mock = MagicMock()
+    call_count = 1
+
+    def return_value(*args, **kwargs):
+        nonlocal call_count
+        call_count += 2
+        return [
+            {**limit_order["buy"], "id": call_count},
+            {**limit_order["sell"], "id": call_count + 1},
+        ]
+
+    api_mock.fetch_orders = MagicMock(side_effect=return_value)
+    api_mock.fetch_open_orders = MagicMock(return_value=[limit_order["buy"]])
+    api_mock.fetch_canceled_orders = MagicMock(return_value=[limit_order["sell"]])
+    api_mock.fetch_closed_orders = MagicMock(return_value=[limit_order["buy"]])
+
+    mocker.patch(f"{EXMS}.exchange_has", return_value=True)
+    start_time = datetime.now(UTC) - timedelta(days=20)
+
+    exchange = get_patched_exchange(mocker, default_conf, api_mock, exchange=exchange_name)
+
+    def has_resp(_, endpoint):
+
+        if endpoint == "fetchOrders":
+            return call_config[0]
+        if endpoint == "fetchClosedOrders":
+            return call_config[2]
+        if endpoint == "fetchOpenOrders":
+            return call_config[1]
+        if endpoint == "fetchCanceledOrders":
+            return call_config[3]
+
+    if exchange_name == "okx":
+        # Special OKX case is tested separately
+        return
+
+    mocker.patch(f"{EXMS}.exchange_has", has_resp)
+
+    #
+    resp = exchange.fetch_orders("mocked", start_time)
+    assert api_mock.fetch_orders.call_count == expected[0]
+    assert api_mock.fetch_open_orders.call_count == expected[1]
+    assert api_mock.fetch_closed_orders.call_count == expected[2]
+    assert api_mock.fetch_canceled_orders.call_count == expected[3]
+    assert len(resp) == 2 * expected[0] + expected[1] + expected[2] + expected[3]
 
 
 def test_fetch_trading_fees(default_conf, mocker):
@@ -4226,11 +4331,28 @@ def test_fetch_order_or_stoploss_order(default_conf, mocker):
 
 
 @pytest.mark.parametrize("exchange_name", EXCHANGES)
-def test_name(default_conf, mocker, exchange_name):
-    exchange = get_patched_exchange(mocker, default_conf, exchange=exchange_name)
+def test_name(default_conf_usdt, mocker, exchange_name):
+    # exchange = get_patched_exchange(mocker, default_conf_usdt, exchange=exchange_name)
+    api_mock = MagicMock()
+    api_mock.name = exchange_name.title()
+    api_mock.id = exchange_name
+    mocker.patch(f"{EXMS}._init_ccxt", MagicMock(return_value=api_mock))
+    mocker.patch(f"{EXMS}._load_async_markets")
+    # mocker.patch(f"{EXMS}.validate_timeframes")
+    # mocker.patch(f"{EXMS}.validate_stakecurrency")
+    # mocker.patch(f"{EXMS}.validate_pricing")
+    default_conf_usdt["exchange"]["name"] = "exchange_name"
+    exchange = ExchangeResolver.load_exchange(default_conf_usdt, validate=False)
 
     assert exchange.name == exchange_name.title()
     assert exchange.id == exchange_name
+
+    default_conf_usdt["exchange"]["demo_trading"] = True
+
+    exchange_demo = ExchangeResolver.load_exchange(default_conf_usdt, validate=False)
+
+    assert exchange_demo.name == f"{exchange_name.title()} (Demo)"
+    assert exchange_demo.id == f"{exchange_name}_demo"
 
 
 @pytest.mark.parametrize(
@@ -5274,19 +5396,16 @@ def test_get_max_leverage_from_margin(default_conf, mocker, pair, nominal_value,
 
 
 @pytest.mark.parametrize(
-    "size,funding_rate,mark_price,time_in_ratio,funding_fee,kraken_fee",
+    "size,funding_rate,mark_price,funding_fee",
     [
-        (10, 0.0001, 2.0, 1.0, 0.002, 0.002),
-        (10, 0.0002, 2.0, 0.01, 0.004, 0.00004),
-        (10, 0.0002, 2.5, None, 0.005, None),
-        (10, 0.0002, nan, None, 0.0, None),
+        (10, 0.0001, 2.0, 0.002),
+        (10, 0.0002, 2.0, 0.004),
+        (10, 0.0002, 2.5, 0.005),
+        (10, 0.0002, nan, 0.0),
     ],
 )
-def test_calculate_funding_fees(
-    default_conf, mocker, size, funding_rate, mark_price, funding_fee, kraken_fee, time_in_ratio
-):
+def test_calculate_funding_fees(default_conf, mocker, size, funding_rate, mark_price, funding_fee):
     exchange = get_patched_exchange(mocker, default_conf)
-    kraken = get_patched_exchange(mocker, default_conf, exchange="kraken")
     prior_date = timeframe_to_prev_date("1h", datetime.now(UTC) - timedelta(hours=1))
     trade_date = timeframe_to_prev_date("1h", datetime.now(UTC))
     funding_rates = DataFrame(
@@ -5310,34 +5429,9 @@ def test_calculate_funding_fees(
             is_short=True,
             open_date=trade_date,
             close_date=trade_date,
-            time_in_ratio=time_in_ratio,
         )
         == funding_fee
     )
-
-    if kraken_fee is None:
-        with pytest.raises(OperationalException):
-            kraken.calculate_funding_fees(
-                df,
-                amount=size,
-                is_short=True,
-                open_date=trade_date,
-                close_date=trade_date,
-                time_in_ratio=time_in_ratio,
-            )
-
-    else:
-        assert (
-            kraken.calculate_funding_fees(
-                df,
-                amount=size,
-                is_short=True,
-                open_date=trade_date,
-                close_date=trade_date,
-                time_in_ratio=time_in_ratio,
-            )
-            == kraken_fee
-        )
 
 
 @pytest.mark.parametrize(
