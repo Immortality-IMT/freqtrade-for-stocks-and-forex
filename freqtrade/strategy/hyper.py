@@ -47,13 +47,14 @@ class HyperStrategyMixin:
         :param space: parameter space to filter for, or None for all spaces.
         :return:
         """
-        for space in [c for c in self._ft_hyper_params if space is None or c == space]:
-            for par in self._ft_hyper_params[space].values():
+        for space_ in [c for c in self._ft_hyper_params if space is None or c == space]:
+            for par in self._ft_hyper_params[space_].values():
                 yield par.name, par
 
-    def ft_load_params_from_file(self) -> None:
+    def ft_set_special_params_from_file(self) -> None:
         """
-        Load Parameters from parameter file
+        Sets special parameters (stoploss, roi, trailing, max_open_trades) from the
+        previously loaded file.
         Should/must run before config values are loaded in strategy_resolver.
         """
         if self._ft_params_from_file:
@@ -92,11 +93,11 @@ class HyperStrategyMixin:
         """
         self._ft_hyper_params = detect_all_parameters(self)
 
-        for space in self._ft_hyper_params.keys():
+        for space in self._ft_hyper_params:
             params_values = deep_merge_dicts(
                 self._ft_params_from_file.get(space, {}), getattr(self, f"{space}_params", {})
             )
-            self._ft_load_params(self._ft_hyper_params[space], params_values, space, hyperopt)
+            self._ft_set_param(self._ft_hyper_params[space], params_values, space, hyperopt)
 
     def load_params_from_file(self) -> dict:
         filename_str = getattr(self, "__file__", "")
@@ -107,7 +108,7 @@ class HyperStrategyMixin:
         if filename.is_file():
             logger.info(f"Loading parameters from file {filename}")
             try:
-                params = HyperoptTools.load_params(filename)
+                params = HyperoptTools.load_params_from_file(filename)
                 if params.get("strategy_name") != self.__class__.__name__:
                     raise OperationalException("Invalid parameter file provided.")
                 return params
@@ -118,12 +119,15 @@ class HyperStrategyMixin:
 
         return {}
 
-    def _ft_load_params(
+    def _ft_set_param(
         self, params: SpaceParams, param_values: dict, space: str, hyperopt: bool = False
     ) -> None:
         """
         Set optimizable parameter values.
         :param params: Dictionary with new parameter values.
+        :param param_values: Dictionary with values to set.
+        :param space: The space to which the parameters belong.
+        :param hyperopt: Flag indicating if we are in hyperopt mode.
         """
         if not param_values:
             logger.info(f"No params for {space} found, using default values.")

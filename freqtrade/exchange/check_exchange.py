@@ -45,9 +45,9 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     if exchange_name in SUPPORTED_EXCHANGES:
         if is_known_ccxt:
             logger.info(
+                f'Exchange "{exchange}" is officially supported by the Freqtrade development team. '
                 f"The {exchange.capitalize()} exchange has been recognized "
-                f"and is compatible with ccxt. "
-                f"Exchange {exchange} is officially supported by the Freqtrade development team."
+                f"and is compatible with ccxt."
             )
         else:
             logger.warning(
@@ -57,16 +57,16 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     else:
         if is_known_ccxt:
             logger.warning(
-                f"The {exchange.capitalize()} exchange is not recognized by Freqtrade "
-                f"but is compatible with ccxt. "
-                f"Not officially supported by the Freqtrade development team. "
+                f'Exchange "{exchange}" is known to the ccxt library, available for the bot, '
+                f"but not officially supported by the Freqtrade development team. "
+                f"The {exchange.capitalize()} exchange is not recognized by Freqtrade. "
                 f"It may work flawlessly (please report back) or have serious issues. "
                 f"Use it at your own discretion."
             )
         else:
             raise OperationalException(
-                f"Exchange '{exchange}' is not recognized by Freqtrade and not "
-                f"compatible with ccxt, and therefore not available for the bot.\n"
+                f'Exchange "{exchange}" is not known to the ccxt library '
+                f"and therefore not available for the bot.\n"
                 f"The following exchanges are available for Freqtrade: "
                 f"{', '.join(available_exchanges())}"
             )

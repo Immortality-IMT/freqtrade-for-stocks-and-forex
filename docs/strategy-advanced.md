@@ -96,6 +96,7 @@ The above is a simple example - there are simpler ways to retrieve trade data li
     * `trade.get_custom_data(key='something', default=0)` - Returns the actual value given in the type provided.
     * `trade.get_custom_data_entry(key='something')` - Returns the entry - including metadata. The value is accessible via `.value` property.
     * `trade.set_custom_data(key='something', value={'some': 'value'})` - set or update the corresponding key for this trade. Value must be serializable - and we recommend to keep the stored data relatively small.
+    * `trade.delete_custom_data(key='something')` - delete the corresponding key for this trade. Without a key, all custom data of this trade is deleted.
 
     "value" can be any type (both in setting and receiving) - but must be json serializable.
 
@@ -292,6 +293,9 @@ class MyAwesomeStrategy2(MyAwesomeStrategy):
 Both attributes and methods may be overridden, altering behavior of the original strategy in a way you need.
 
 While keeping the subclass in the same file is technically possible, it can lead to some problems with hyperopt parameter files, we therefore recommend to use separate strategy files, and import the parent strategy as shown above.
+
+!!! Warning "backtest Caching"
+    When using Backtesting with split files - only changes in the strategy file will be taken into account for cache invalidation. If you change the parent strategy (or any imported module) - you will need to use `--cache none` once to force a fresh backtest.
 
 ## Embedding Strategies
 

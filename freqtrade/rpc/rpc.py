@@ -190,6 +190,10 @@ class RPC:
                 else -1
             ),
         }
+        if config.get("trading_mode", "spot") == TradingMode.FUTURES and (
+            proxy_coin := config.get("proxy_coin")
+        ):
+            val["proxy_coin"] = proxy_coin
         return val
 
     def _rpc_trade_status(self, trade_ids: list[int] | None = None) -> list[dict[str, Any]]:
@@ -276,24 +280,24 @@ class RPC:
 
                 trade_dict = trade.to_json()
                 trade_dict.update(
-                    dict(
-                        close_profit=trade.close_profit if not trade.is_open else None,
-                        current_rate=current_rate,
-                        profit_ratio=current_profit,
-                        profit_pct=round(current_profit * 100, 2),
-                        profit_abs=current_profit_abs,
-                        profit_fiat=current_profit_fiat,
-                        total_profit_abs=total_profit_abs,
-                        total_profit_fiat=total_profit_fiat,
-                        total_profit_ratio=total_profit_ratio,
-                        stoploss_current_dist=stoploss_current_dist,
-                        stoploss_current_dist_ratio=round(stoploss_current_dist_ratio, 8),
-                        stoploss_current_dist_pct=round(stoploss_current_dist_ratio * 100, 2),
-                        stoploss_entry_dist=stoploss_entry_dist,
-                        stoploss_entry_dist_ratio=round(stoploss_entry_dist_ratio, 8),
-                        open_orders=oo_details,
-                        nr_of_successful_entries=trade.nr_of_successful_entries,
-                    )
+                    {
+                        "close_profit": trade.close_profit if not trade.is_open else None,
+                        "current_rate": current_rate,
+                        "profit_ratio": current_profit,
+                        "profit_pct": round(current_profit * 100, 2),
+                        "profit_abs": current_profit_abs,
+                        "profit_fiat": current_profit_fiat,
+                        "total_profit_abs": total_profit_abs,
+                        "total_profit_fiat": total_profit_fiat,
+                        "total_profit_ratio": total_profit_ratio,
+                        "stoploss_current_dist": stoploss_current_dist,
+                        "stoploss_current_dist_ratio": round(stoploss_current_dist_ratio, 8),
+                        "stoploss_current_dist_pct": round(stoploss_current_dist_ratio * 100, 2),
+                        "stoploss_entry_dist": stoploss_entry_dist,
+                        "stoploss_entry_dist_ratio": round(stoploss_entry_dist_ratio, 8),
+                        "open_orders": oo_details,
+                        "nr_of_successful_entries": trade.nr_of_successful_entries,
+                    }
                 )
                 results.append(trade_dict)
             return results
@@ -405,7 +409,7 @@ class RPC:
         profit_units: dict[date, dict] = {}
         daily_stake = self._freqtrade.wallets.get_total_stake_amount()
 
-        for day in range(0, timescale):
+        for day in range(timescale):
             profitday = start_date - time_offset(day)
             # Only query for necessary columns for performance reasons.
             trades = Trade.session.execute(
@@ -591,7 +595,7 @@ class RPC:
         """
         Returns cumulative profit statistics, with optional direction filter (long/short)
         """
-        start_date = datetime.fromtimestamp(0) if start_date is None else start_date
+        start_date = dt_from_ts(0) if start_date is None else start_date
 
         trade_filter = (
             Trade.is_open.is_(False) & (Trade.close_date >= start_date)
@@ -796,7 +800,7 @@ class RPC:
         results = results.rename({"timestamp": "date"}, axis=1)
         results.loc[:, "__date_ts"] = results.loc[:, "date"].dt.as_unit("ms").astype("int64")
         # Exclude non-bot managed for now
-        results_filtered = results.loc[results["bot_managed"]]
+        results_filtered = results.loc[results["bot_managed"].astype(bool)]
 
         results_final = (
             results_filtered.groupby(["date", "__date_ts"])
@@ -830,7 +834,6 @@ class RPC:
                 return est_stake, est_bot_stake
             except (ExchangeError, PricingError) as e:
                 logger.warning(f"Error {e} getting rate for {coin}")
-                pass
         return est_stake, est_bot_stake
 
     def _rpc_balance(self, stake_currency: str, fiat_display_currency: str) -> dict:
@@ -914,7 +917,6 @@ class RPC:
                             est_stake = pos.collateral * (1 + pos.leverage) - rate * pos.position
                 except (ExchangeError, PricingError) as e:
                     logger.warning(f"Error {e} getting rate for futures {symbol} / {pos_base}")
-                    pass
 
             # Add the estimated stake (collateral + unlevered PnL) to totals
             total += est_stake
@@ -1494,7 +1496,7 @@ class RPC:
             buffer = bufferHandler.buffer
         records = [
             [
-                format_date(datetime.fromtimestamp(r.created)),
+                format_date(dt_from_ts(r.created)),
                 r.created * 1000,
                 r.name,
                 r.levelname,
@@ -1540,7 +1542,7 @@ class RPC:
                 dataframe.loc[:, "date"].dt.as_unit("ms").astype("int64")
             )
             # Move signal close to separate column when signal for easy plotting
-            for sig_type in signals.keys():
+            for sig_type in signals:
                 if sig_type in dataframe.columns:
                     mask = dataframe[sig_type] == 1
                     signals[sig_type] = int(mask.sum())
@@ -1548,8 +1550,7 @@ class RPC:
 
             # band-aid until this is fixed:
             # https://github.com/pandas-dev/pandas/issues/45836
-            datetime_types = ["datetime", "datetime64", "datetimetz"]
-            date_columns = dataframe.select_dtypes(include=datetime_types)
+            date_columns = dataframe.select_dtypes(include=["datetime", "datetime64", "datetimetz"])
             for date_column in date_columns:
                 # replace NaT with `None`
                 dataframe[date_column] = dataframe[date_column].astype(object).replace({NaT: None})
@@ -1695,8 +1696,11 @@ class RPC:
                     else dt_ts(dt_now() - timedelta(days=30)),
                     is_new_pair=True,  # history is never available - so always treat as new pair
                     candle_type=config.get("candle_type_def", CandleType.SPOT),
-                    until_ms=timerange_parsed.stopts,
+                    until_ms=timerange_parsed.stopts * 1000 if timerange_parsed.stopts else None,
                 )
+                if timerange_parsed.stopts and len(data) > 1:
+                    # trim last candle if it is newer than the stop time
+                    data = data.loc[data["date"] <= timerange_parsed.stopdt]
             else:
                 _data = load_data(
                     datadir=config["datadir"],
@@ -1719,9 +1723,15 @@ class RPC:
                 strategy.ft_bot_start()
 
                 df_analyzed = strategy.analyze_ticker(data, {"pair": pair})
+                prev_len = len(df_analyzed)
                 df_analyzed = trim_dataframe(
                     df_analyzed, timerange_parsed, startup_candles=startup_candles
                 )
+                if prev_len > 0 and len(df_analyzed) == 0:
+                    raise RPCException(
+                        f"After trimming by startup_candle_count, no data for "
+                        f"{pair}, {timeframe} in {config.get('timerange')} left."
+                    )
                 annotations = strategy.ft_plot_annotations(pair=pair, dataframe=df_analyzed)
 
             else:
@@ -1782,7 +1792,7 @@ class RPC:
 
     def health(self) -> dict[str, str | int | None]:
         last_p = self._freqtrade.last_process
-        res: dict[str, None | str | int] = {
+        res: dict[str, str | int | None] = {
             "last_process": None,
             "last_process_loc": None,
             "last_process_ts": None,

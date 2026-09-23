@@ -42,6 +42,7 @@ class Bybit(Exchange):
     _ft_has_futures: FtHas = {
         "ohlcv_has_history": True,
         "funding_fee_candle_limit": 200,
+        "open_interest_candle_limit": 200,
         "stoploss_on_exchange": True,
         "stoploss_order_types": {"limit": "limit", "market": "market"},
         "stoploss_blocks_assets": False,
@@ -329,3 +330,13 @@ class Bybit(Exchange):
                 return dt_from_ts(delivery_time)
 
         return None
+
+
+class BybitEU(Bybit):
+    """Bybit EU exchange class.
+    Minimal adjustment to disable futures trading for the EU version of Bybit.
+    """
+
+    _supported_trading_mode_margin_pairs: list[tuple[TradingMode, MarginMode]] = [
+        (TradingMode.SPOT, MarginMode.NONE),
+    ]

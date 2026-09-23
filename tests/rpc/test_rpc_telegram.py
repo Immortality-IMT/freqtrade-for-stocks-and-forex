@@ -474,7 +474,7 @@ async def test_order_handle(default_conf, update, ticker, fee, mocker) -> None:
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(3)
 
     mocker.patch("freqtrade.rpc.telegram.MAX_MESSAGE_LENGTH", 500)
 
@@ -584,7 +584,7 @@ async def test_status_handle(default_conf, update, ticker, fee, mocker) -> None:
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(3)
     # Trigger status while we have a fulfilled order for the open trade
     await telegram._status(update=update, context=MagicMock())
 
@@ -655,7 +655,7 @@ async def test_status_table_handle(default_conf, update, ticker, fee, mocker) ->
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
 
     await telegram._status_table(update=update, context=MagicMock())
 
@@ -918,7 +918,7 @@ async def test_telegram_profit_handle(
     msg_mock.reset_mock()
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
     trade = Trade.session.scalars(select(Trade)).first()
 
     context = MagicMock()
@@ -1363,7 +1363,7 @@ async def test_telegram_forceexit_handle(
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
 
     trade = Trade.session.scalars(select(Trade)).first()
     assert trade
@@ -1433,7 +1433,7 @@ async def test_telegram_force_exit_down_handle(
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
 
     # Decrease the price and sell it
     mocker.patch.multiple(EXMS, fetch_ticker=ticker_sell_down)
@@ -1501,7 +1501,7 @@ async def test_forceexit_all_handle(default_conf, update, ticker, fee, mocker) -
     patch_get_signal(freqtradebot)
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(4)
     msg_mock.reset_mock()
 
     # /forceexit all
@@ -1591,7 +1591,7 @@ async def test_force_exit_no_pair(default_conf, update, ticker, fee, mocker) -> 
     assert msg_mock.call_args_list[0][1]["msg"] == "No open trade found."
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(4)
     msg_mock.reset_mock()
 
     # /forceexit
@@ -1832,7 +1832,7 @@ async def test_count_handle(default_conf, update, ticker, fee, mocker) -> None:
     freqtradebot.state = State.RUNNING
 
     # Create some test data
-    freqtradebot.enter_positions()
+    freqtradebot.enter_positions(1)
     msg_mock.reset_mock()
     await telegram._count(update=update, context=MagicMock())
 
@@ -2322,6 +2322,75 @@ def test_send_msg_protection_notification(default_conf, mocker, time_machine) ->
         msg_mock.call_args[0][0] == "*Protection* triggered due to randreason. "
         "*All pairs* will be locked until `2021-09-01 06:45:00`."
     )
+
+
+def test_send_msg_liquidation_warning_notification(default_conf, mocker) -> None:
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    msg = {
+        "type": RPCMessageType.LIQUIDATION_WARNING,
+        "exchange": "Binance",
+        "margin_mode": "isolated",
+        "trade_id": 1,
+        "pair": "ETH/USDT:USDT",
+        "base_currency": "ETH",
+        "quote_currency": "USDT",
+        "direction": "Long",
+        "leverage": 5.0,
+        "current_rate": 0.92,
+        "liquidation_price": 0.9,
+        "remaining_ratio": 0.2,
+        "warn_ratio": 0.2,
+        "positions_at_risk": 1,
+        "open_positions": 2,
+    }
+    telegram.send_msg(msg)
+    assert msg_mock.call_args[0][0] == (
+        "\N{WARNING SIGN} *Binance (dry):* `ETH/USDT:USDT` (#1) is approaching its "
+        "liquidation stop\n"
+        "*Direction:* `Long (5x)`\n"
+        "*Current Rate:* `0.92 USDT`\n"
+        "*Liquidation Stop:* `0.9 USDT`\n"
+        "*Remaining:* `20.00%` of the price move the margin covers\n\n"
+        "This is freqtrade's own liquidation, placed ahead of the exchange's liquidation price by "
+        "`liquidation_buffer` - it is not an exchange liquidation. In isolated margin this "
+        "position's collateral is fixed - adding funds to your account will not move its "
+        "liquidation stop. Reduce or close the position, or add margin to it directly on the "
+        "exchange - freqtrade picks the changed liquidation price up on the next order fill "
+        "for this trade."
+    )
+
+    msg_mock.reset_mock()
+    msg.update({"margin_mode": "cross", "positions_at_risk": 2})
+    telegram.send_msg(msg)
+    assert msg_mock.call_args[0][0] == (
+        "\N{WARNING SIGN} *Binance (dry):* 2 of 2 positions are approaching their "
+        "liquidation stop\n"
+        "*Closest:* `ETH/USDT:USDT` (#1)\n"
+        "*Direction:* `Long (5x)`\n"
+        "*Current Rate:* `0.92 USDT`\n"
+        "*Liquidation Stop:* `0.9 USDT`\n"
+        "*Remaining:* `20.00%` of the price move the margin covers\n\n"
+        "This is freqtrade's own liquidation, placed ahead of the exchange's liquidation price by "
+        "`liquidation_buffer` - it is not an exchange liquidation. In cross margin all "
+        "positions share the same collateral. Adding margin moves the liquidation stop away "
+        "from all of them - without it freqtrade will exit each position as it reaches its "
+        "own stop."
+    )
+
+    # Singular wording
+    msg_mock.reset_mock()
+    msg.update({"positions_at_risk": 1})
+    telegram.send_msg(msg)
+    assert msg_mock.call_args[0][0].startswith(
+        "\N{WARNING SIGN} *Binance (dry):* 1 of 2 positions is approaching its liquidation stop\n"
+    )
+
+    # Can be turned off
+    msg_mock.reset_mock()
+    default_conf["telegram"]["notification_settings"]["liquidation_warning"] = "off"
+    telegram, _, msg_mock = get_telegram_testobject(mocker, default_conf)
+    telegram.send_msg(msg)
+    assert msg_mock.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -2946,7 +3015,6 @@ async def test_telegram_list_custom_data(default_conf_usdt, update, ticker, fee,
     assert "Trade-id not set." in msg_mock.call_args_list[0][0][0]
     msg_mock.reset_mock()
 
-    #
     context.args = ["1"]
     await telegram._list_custom_data(update=update, context=context)
     assert msg_mock.call_count == 1

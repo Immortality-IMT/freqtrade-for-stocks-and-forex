@@ -94,6 +94,13 @@ site/
 # PyBuilder
 target/
 
+# AI Agents
+*.local.md
+.cursor/
+.codex/
+.claude/*.local.json
+.claude/**/*.log
+
 # Jupyter Notebook
 *.ipynb_checkpoints
 
@@ -105,8 +112,7 @@ target/
 .idea
 .vscode
 
-.pytest_cache/
-.mypy_cache/
+.*_cache/
 
 #exceptions
 !*.gitkeep

@@ -15,7 +15,6 @@ from freqtrade.rpc.api_server.deps import get_api_config
 logger = logging.getLogger(__name__)
 
 ALGORITHM = "HS256"
-__DEFAULT_JWT = "somethingRandomSomethingRandom123"
 
 router_login = APIRouter()
 
@@ -69,7 +68,7 @@ async def validate_ws_token(
             is_valid_ws_token = secrets.compare_digest(secret_ws_token, ws_token)
         elif isinstance(secret_ws_token, list):
             is_valid_ws_token = any(
-                [secrets.compare_digest(potential, ws_token) for potential in secret_ws_token]
+                secrets.compare_digest(potential, ws_token) for potential in secret_ws_token
             )
 
         if is_valid_ws_token:

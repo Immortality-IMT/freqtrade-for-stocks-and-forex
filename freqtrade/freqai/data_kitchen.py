@@ -1,4 +1,3 @@
-import copy
 import inspect
 import logging
 import random
@@ -12,7 +11,7 @@ import numpy.typing as npt
 import pandas as pd
 import psutil
 from datasieve.pipeline import Pipeline
-from pandas import DataFrame
+from pandas import DataFrame, Series
 from sklearn.model_selection import train_test_split
 
 from freqtrade.configuration import TimeRange
@@ -20,6 +19,7 @@ from freqtrade.constants import DOCS_LINK, ORDERFLOW_ADDED_COLUMNS, Config
 from freqtrade.data.converter import reduce_dataframe_footprint
 from freqtrade.exceptions import OperationalException
 from freqtrade.exchange import timeframe_to_seconds
+from freqtrade.misc import is_path_in_dir
 from freqtrade.strategy import merge_informative_pair
 from freqtrade.strategy.interface import IStrategy
 
@@ -120,8 +120,6 @@ class FreqaiDataKitchen:
         self.data_path = Path(
             self.full_path / f"sub-train-{pair.split('/')[0]}_{trained_timestamp}"
         )
-
-        return
 
     def make_train_test_datasets(
         self, filtered_dataframe: DataFrame, labels: DataFrame
@@ -237,14 +235,14 @@ class FreqaiDataKitchen:
         filtered_df = filtered_df.replace([np.inf, -np.inf], np.nan)
 
         drop_index = pd.isnull(filtered_df).any(axis=1)  # get the rows that have NaNs,
-        drop_index = drop_index.replace(True, 1).replace(False, 0).infer_objects()
+        drop_index = drop_index.astype(int)
         if training_filter:
             # we don't care about total row number (total no. datapoints) in training, we only care
             # about removing any row with NaNs
             # if labels has multiple columns (user wants to train multiple modelEs), we detect here
             labels = unfiltered_df.filter(label_list or [], axis=1)
             drop_index_labels = pd.isnull(labels).any(axis=1)
-            drop_index_labels = drop_index_labels.replace(True, 1).replace(False, 0).infer_objects()
+            drop_index_labels = drop_index_labels.astype(int)
             dates = unfiltered_df["date"]
             filtered_df = filtered_df[
                 (drop_index == 0) & (drop_index_labels == 0)
@@ -283,7 +281,7 @@ class FreqaiDataKitchen:
             # replacing all NaNs with zeros to avoid issues in 'prediction', but any prediction
             # that was based on a single NaN is ultimately protected from buys with do_predict
             drop_index = ~drop_index
-            self.do_predict = np.array(drop_index.replace(True, 1).replace(False, 0))
+            self.do_predict = np.array(drop_index.astype(int))
             if (len(self.do_predict) - self.do_predict.sum()) > 0:
                 logger.info(
                     "dropped %s of %s prediction data points due to NaNs.",
@@ -338,8 +336,8 @@ class FreqaiDataKitchen:
         config_timerange = TimeRange.parse_timerange(self.config["timerange"])
         if config_timerange.stopts == 0:
             config_timerange.stopts = int(datetime.now(tz=UTC).timestamp())
-        timerange_train = copy.deepcopy(full_timerange)
-        timerange_backtest = copy.deepcopy(full_timerange)
+        timerange_train = full_timerange.copy()
+        timerange_backtest = full_timerange.copy()
 
         tr_training_list = []
         tr_backtesting_list = []
@@ -354,17 +352,16 @@ class FreqaiDataKitchen:
 
             first = False
             tr_training_list.append(timerange_train.timerange_str)
-            tr_training_list_timerange.append(copy.deepcopy(timerange_train))
+            tr_training_list_timerange.append(timerange_train.copy())
 
             # associated backtest period
             timerange_backtest.startts = timerange_train.stopts
             timerange_backtest.stopts = timerange_backtest.startts + int(bt_period)
 
-            if timerange_backtest.stopts > config_timerange.stopts:
-                timerange_backtest.stopts = config_timerange.stopts
+            timerange_backtest.stopts = min(timerange_backtest.stopts, config_timerange.stopts)
 
             tr_backtesting_list.append(timerange_backtest.timerange_str)
-            tr_backtesting_list_timerange.append(copy.deepcopy(timerange_backtest))
+            tr_backtesting_list_timerange.append(timerange_backtest.copy())
 
             # ensure we are predicting on exactly same amount of data as requested by user defined
             #  --timerange
@@ -427,7 +424,7 @@ class FreqaiDataKitchen:
         # Build dict first and construct DataFrame once to avoid
         # column-by-column assignment which causes DataFrame fragmentation
         # and PerformanceWarning on large prediction sets.
-        append_dict: dict[str, Any] = {}
+        append_dict: dict[str, Series | npt.ArrayLike] = {}
 
         for label in predictions.columns:
             append_dict[label] = predictions[label]
@@ -478,8 +475,6 @@ class FreqaiDataKitchen:
             self.full_df.columns
         ].fillna(value=0)
         self.full_df = DataFrame()
-
-        return
 
     def create_fulltimerange(self, backtest_tr: str, backtest_period_days: int) -> str:
         if not isinstance(backtest_period_days, int):
@@ -547,8 +542,7 @@ class FreqaiDataKitchen:
         max_tf_seconds = 0
         for tf in timeframes:
             secs = timeframe_to_seconds(tf)
-            if secs > max_tf_seconds:
-                max_tf_seconds = secs
+            max_tf_seconds = max(max_tf_seconds, secs)
 
         # We notice that users like to use exotic indicators where
         # they do not know the required timeperiod. Here we include a factor
@@ -596,8 +590,8 @@ class FreqaiDataKitchen:
         self.model_filename = f"cb_{coin.lower()}_{timestamp_id}"
 
     def set_all_pairs(self) -> None:
-        self.all_pairs = copy.deepcopy(
-            self.freqai_config["feature_parameters"].get("include_corr_pairlist", [])
+        self.all_pairs = (
+            self.freqai_config["feature_parameters"].get("include_corr_pairlist", []).copy()
         )
         for pair in self.config.get("exchange", "").get("pair_whitelist"):
             if pair not in self.all_pairs:
@@ -764,12 +758,15 @@ class FreqaiDataKitchen:
             informative_df = self.merge_features(informative_df, generic_df, tf, tf, suffix)
 
             indicators = [col for col in informative_df if col.startswith("%")]
+            shifted_parts = []
             for n in range(self.freqai_config["feature_parameters"]["include_shifted_candles"] + 1):
                 if n == 0:
                     continue
                 df_shift = informative_df[indicators].shift(n)
                 df_shift = df_shift.add_suffix("_shift-" + str(n))
-                informative_df = pd.concat((informative_df, df_shift), axis=1)
+                shifted_parts.append(df_shift)
+            if shifted_parts:
+                informative_df = pd.concat([informative_df] + shifted_parts, axis=1)
 
             dataframe = self.merge_features(
                 dataframe.copy(), informative_df, self.config["timeframe"], tf, f"{pair}_{tf}"
@@ -884,8 +881,6 @@ class FreqaiDataKitchen:
         for label in self.unique_class_list:
             self.data["labels_mean"][label], self.data["labels_std"][label] = 0, 0
 
-        return
-
     def remove_features_from_df(self, dataframe: DataFrame) -> DataFrame:
         """
         Remove the features from the dataframe before returning it to strategy. This keeps it
@@ -965,7 +960,14 @@ class FreqaiDataKitchen:
         :param config: Configuration dictionary
         """
         freqai_config: dict[str, Any] = config["freqai"]
-        return Path(config["user_data_dir"] / "models" / str(freqai_config.get("identifier")))
+        identifier = str(freqai_config.get("identifier"))
+        models_dir = Path(config["user_data_dir"] / "models")
+        full_path = models_dir / identifier
+        if not is_path_in_dir(full_path, models_dir):
+            raise OperationalException(
+                f"Invalid freqai identifier '{identifier}' - it must stay within {models_dir}."
+            )
+        return full_path
 
     def remove_special_chars_from_feature_names(self, dataframe: pd.DataFrame) -> pd.DataFrame:
         """

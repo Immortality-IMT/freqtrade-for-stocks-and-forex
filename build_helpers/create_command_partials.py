@@ -20,6 +20,8 @@ def _get_help_output(parser) -> str:
 def extract_command_partials():
     # Set terminal width to 80 columns for consistent output formatting
     os.environ["COLUMNS"] = "80"
+    # Disable color codes for consistent output with python 3.14 (which added colors to argparse)
+    os.environ["NO_COLOR"] = "1"
 
     # Import Arguments here to avoid circular imports and ensure COLUMNS is set
     from freqtrade.commands.arguments import Arguments
@@ -91,7 +93,9 @@ def extract_command_partials():
 
     # freqtrade-client still uses subprocess as requested
     print("Running for freqtrade-client")
-    result_client = subprocess.run(["freqtrade-client", "--show"], capture_output=True, text=True)
+    result_client = subprocess.run(
+        ["freqtrade-client", "--show"], capture_output=True, text=True, check=True
+    )
 
     _write_partial_file("docs/commands/freqtrade-client.md", result_client.stdout)
 

@@ -4,7 +4,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 import numpy as np
-from pandas import DataFrame, Series, concat, to_datetime
+from pandas import DataFrame, Series, to_datetime
 
 from freqtrade.constants import BACKTEST_BREAKDOWNS, DATETIME_PRINT_FORMAT
 from freqtrade.data.metrics import (
@@ -16,6 +16,7 @@ from freqtrade.data.metrics import (
     calculate_market_change,
     calculate_max_drawdown,
     calculate_max_drawdown_from_balance,
+    calculate_p_value,
     calculate_sharpe,
     calculate_sharpe_from_balance,
     calculate_sortino,
@@ -125,22 +126,19 @@ def generate_trade_signal_candles(
     preprocessed_df: dict[str, DataFrame], bt_results: BacktestContentType, date_col: str
 ) -> dict[str, DataFrame]:
     signal_candles_only = {}
-    for pair in preprocessed_df.keys():
-        signal_candles_only_df = DataFrame()
-
-        pairdf = preprocessed_df[pair]
+    for pair, pairdf in preprocessed_df.items():
         resdf = bt_results["results"]
         pairresults = resdf.loc[(resdf["pair"] == pair)]
 
         if pairdf.shape[0] > 0:
-            for t, v in pairresults.iterrows():
-                allinds = pairdf.loc[(pairdf["date"] < v[date_col])]
-                signal_inds = allinds.iloc[[-1]]
-                signal_candles_only_df = concat(
-                    [signal_candles_only_df.infer_objects(), signal_inds.infer_objects()]
-                )
-
-            signal_candles_only[pair] = signal_candles_only_df
+            if pairresults.empty:
+                signal_candles_only[pair] = DataFrame()
+                continue
+            # Last candle with date strictly before the trade date, for each trade.
+            candle_idx = pairdf["date"].searchsorted(pairresults[date_col], side="left") - 1
+            # Drop trades with no candle strictly before the trade date (idx < 0),
+            candle_idx = candle_idx[candle_idx >= 0]
+            signal_candles_only[pair] = pairdf.iloc[candle_idx].infer_objects()
     return signal_candles_only
 
 
@@ -149,19 +147,19 @@ def generate_rejected_signals(
 ) -> dict[str, DataFrame]:
     rejected_candles_only = {}
     for pair, signals in rejected_dict.items():
-        rejected_signals_only_df = DataFrame()
         pairdf = preprocessed_df[pair]
+        if not len(signals):
+            rejected_candles_only[pair] = DataFrame()
+            continue
 
-        for t in signals:
-            data_df_row = pairdf.loc[(pairdf["date"] == t[0])].copy()
-            data_df_row["pair"] = pair
-            data_df_row["enter_tag"] = t[1]
-
-            rejected_signals_only_df = concat(
-                [rejected_signals_only_df.infer_objects(), data_df_row.infer_objects()]
-            )
-
-        rejected_candles_only[pair] = rejected_signals_only_df
+        signals_df = DataFrame(signals, columns=["date", "enter_tag"])
+        # Drop a pre-existing enter_tag (e.g. assigned in populate_indicators)
+        pairdf = pairdf.drop(columns=["enter_tag"], errors="ignore")
+        rejected = pairdf.merge(signals_df, on="date", how="inner").infer_objects()
+        rejected["pair"] = pair
+        # Keep the pre-existing column layout: candle columns, then pair, then enter_tag.
+        cols = [col for col in rejected.columns if col not in ("pair", "enter_tag")]
+        rejected_candles_only[pair] = rejected[[*cols, "pair", "enter_tag"]]
     return rejected_candles_only
 
 
@@ -224,6 +222,7 @@ def _generate_result_line(
         "sharpe": calculate_sharpe(result, min_date, max_date, starting_balance),
         "calmar": calculate_calmar(result, min_date, max_date, starting_balance),
         "sqn": calculate_sqn(result, starting_balance),
+        "p_value": calculate_p_value(result, starting_balance),
         "profit_factor": profit_factor,
         "max_drawdown_account": drawdown.relative_account_drawdown if drawdown else 0.0,
         "max_drawdown_abs": drawdown.drawdown_abs if drawdown else 0.0,
@@ -237,7 +236,7 @@ def calculate_trade_volume(trades_dict: list[dict[str, Any]]) -> float:
     return sum(sum(order["cost"] for order in trade.get("orders", [])) for trade in trades_dict)
 
 
-def generate_pair_metrics(  #
+def generate_pair_metrics(
     pairlist: list[str],
     stake_currency: str,
     starting_balance: float,
@@ -429,7 +428,6 @@ def calc_streak(dataframe: DataFrame) -> tuple[int, int]:
     df["streaks"] = df["result"].ne(df["result"].shift()).cumsum().rename("streaks")
     df["counter"] = df["streaks"].groupby(df["streaks"]).cumcount() + 1
     res = df.groupby(df["result"]).max()
-    #
     cons_wins = int(res.loc["win", "counter"]) if "win" in res.index else 0
     cons_losses = int(res.loc["loss", "counter"]) if "loss" in res.index else 0
     return cons_wins, cons_losses
@@ -684,6 +682,7 @@ def generate_strategy_stats(
         "sharpe": calculate_sharpe(results, min_date, max_date, start_balance),
         "calmar": calculate_calmar(results, min_date, max_date, start_balance),
         "sqn": calculate_sqn(results, start_balance),
+        "p_value": calculate_p_value(results, start_balance),
         "wallet_stats": generate_wallet_stats(content.get("wallet_summary"), stake_currency),
         "profit_factor": profit_factor,
         "backtest_start": min_date.strftime(DATETIME_PRINT_FORMAT),

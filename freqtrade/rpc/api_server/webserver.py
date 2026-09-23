@@ -200,6 +200,7 @@ class ApiServer(RPCHandler):
         )
 
     def configure_app(self, app: FastAPI, config):
+        from freqtrade.rpc.api_server.api_analysis import router_lookahead, router_recursive
         from freqtrade.rpc.api_server.api_auth import http_basic_or_jwt_token, router_login
         from freqtrade.rpc.api_server.api_background_tasks import router as api_bg_tasks
         from freqtrade.rpc.api_server.api_backtest import router as api_backtest
@@ -263,6 +264,18 @@ class ApiServer(RPCHandler):
             tags=["Download-data", "Webserver"],
             dependencies=[Depends(http_basic_or_jwt_token), Depends(is_webserver_mode)],
         )
+        app.include_router(
+            router_lookahead,
+            prefix="/api/v1",
+            tags=["Lookahead Analysis", "Webserver"],
+            dependencies=[Depends(http_basic_or_jwt_token), Depends(is_webserver_mode)],
+        )
+        app.include_router(
+            router_recursive,
+            prefix="/api/v1",
+            tags=["Recursive Analysis", "Webserver"],
+            dependencies=[Depends(http_basic_or_jwt_token), Depends(is_webserver_mode)],
+        )
         app.include_router(ws_router, prefix="/api/v1")
         # UI Router MUST be last!
         app.include_router(router_ui, prefix="")
@@ -317,7 +330,7 @@ class ApiServer(RPCHandler):
             host=rest_ip,
             use_colors=False,
             log_config=None,
-            access_log=True if verbosity != "error" else False,
+            access_log=verbosity != "error",
             ws_ping_interval=None,  # We do this explicitly ourselves
         )
         try:

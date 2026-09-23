@@ -5,6 +5,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 
 logger = logging.getLogger(__name__)
@@ -74,11 +75,13 @@ def combined_dataframes_with_rel_mean(
     df_comb = combine_dataframes_by_column(data, column)
     # Trim dataframes to the given timeframe
     df_comb = df_comb.iloc[(df_comb.index >= fromdt) & (df_comb.index < todt)]
-    rel_mean = df_comb.pct_change().mean(axis=1).fillna(0).cumsum()
-    df_comb["count"] = df_comb.count(axis=1)
-    df_comb["mean"] = df_comb.mean(axis=1)
-    df_comb["rel_mean"] = rel_mean
-    return df_comb[["mean", "rel_mean", "count"]]
+    return pd.DataFrame(
+        {
+            "mean": df_comb.mean(axis=1),
+            "rel_mean": df_comb.pct_change().mean(axis=1).fillna(0).cumsum(),
+            "count": df_comb.count(axis=1),
+        }
+    )
 
 
 def combine_dataframes_with_mean(
@@ -94,9 +97,7 @@ def combine_dataframes_with_mean(
     """
     df_comb = combine_dataframes_by_column(data, column)
 
-    df_comb["mean"] = df_comb.mean(axis=1)
-
-    return df_comb
+    return pd.concat([df_comb, df_comb.mean(axis=1).rename("mean")], axis=1)
 
 
 def create_cum_profit(
@@ -299,7 +300,11 @@ def calculate_cagr(days_passed: int, starting_balance: float, final_balance: flo
     if (final_balance < 0) or (starting_balance <= 0) or (days_passed <= 0):
         # With leveraged trades, final_balance can become negative.
         return 0
-    return (final_balance / starting_balance) ** (1 / (days_passed / 365)) - 1
+    try:
+        return (final_balance / starting_balance) ** (1 / (days_passed / 365)) - 1
+    except OverflowError:
+        # Extrapolating a large gain over a very short timeframe can exceed float range.
+        return 0
 
 
 def calculate_expectancy(trades: pd.DataFrame) -> tuple[float, float]:
@@ -632,3 +637,24 @@ def calculate_sqn(trades: pd.DataFrame, starting_balance: float) -> float:
         sqn = -100.0
 
     return round(sqn, 4)
+
+
+def calculate_p_value(trades: pd.DataFrame, starting_balance: float) -> float:
+    """
+    Two-sided p-value for the null hypothesis that mean per-trade profit
+    (profit_abs / starting_balance) equals zero.
+    Returns 1.0 for fewer than 2 trades or zero-variance samples.
+
+    :param trades: DataFrame containing trades (requires column profit_abs)
+    :param starting_balance: Starting balance of the trading system
+    :return: Two-sided p-value in the range [0, 1]. Returns 1.0 (no evidence
+             against the null) when it cannot be computed - fewer than two
+             trades or zero return variance.
+    """
+    if len(trades) < 2:
+        return 1.0
+    returns = trades["profit_abs"] / starting_balance
+    if returns.std() == 0:
+        return 1.0
+    _, p_value = stats.ttest_1samp(returns, popmean=0)
+    return float(p_value)

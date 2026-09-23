@@ -22,6 +22,7 @@ class TestExchangeOnlineSetup(TypedDict):
     futures_pair: str | None
     candle_count_futures: int | None
     hasQuoteVolumeFutures: bool | None
+    open_interest_history_days: int | None
     leverage_tiers_public: bool
     leverage_in_spot_market: bool
     trades_lookback_hours: int
@@ -48,6 +49,8 @@ EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
         "futures_pair": "BTC/USDT:USDT",
         "candle_count_futures": 499,
         "hasQuoteVolumeFutures": True,
+        # Binance rejects "startTime" older than 30 days for open interest history.
+        "open_interest_history_days": 30,
         "leverage_tiers_public": False,
         "leverage_in_spot_market": False,
         "trades_lookback_hours": 4,
@@ -117,6 +120,88 @@ EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
                     "side": "buy",
                     "status": "closed",
                     "amount": 1.1,
+                },
+            },
+        ],
+        "sample_order_futures": [
+            {
+                # Futures - create order
+                "exchange_response": {
+                    "orderId": 1235611235,
+                    "symbol": "ONDOUSDT",
+                    "status": "FILLED",
+                    "clientOrderId": "x-abvasdfasdfasd",
+                    "price": "0.3817000",
+                    "origQty": "977.4",
+                    "executedQty": "977.4",
+                    "cumQty": "977.4",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "reduceOnly": True,
+                    "closePosition": False,
+                    "side": "BUY",
+                    "positionSide": "BOTH",
+                    "stopPrice": "0.0000000",
+                    "workingType": "CONTRACT_PRICE",
+                    "priceProtect": False,
+                    "origType": "LIMIT",
+                    "priceMatch": "NONE",
+                    "selfTradePreventionMode": "EXPIRE_MAKER",
+                    "goodTillDate": 0,
+                    "updateTime": 1784606414905,
+                },
+                "pair": "ONDO/USDT:USDT",
+                "expected": {
+                    "symbol": "ONDO/USDT:USDT",
+                    "id": "1235611235",
+                    "timestamp": 1784606414905,
+                    "datetime": "2026-07-21T04:00:14.905Z",
+                    "price": 0.3817,
+                    "status": "closed",
+                    "side": "buy",
+                    "amount": 977.4,
+                    "average": None,  # create order does not contain avgPrice ...
+                },
+            },
+            {
+                # Futures - fetch order
+                "exchange_response": {
+                    "orderId": 1235611235,
+                    "symbol": "ONDOUSDT",
+                    "status": "FILLED",
+                    "clientOrderId": "x-abvasdfasdfasd",
+                    "price": "0.3817000",
+                    "avgPrice": "0.36360000",
+                    "origQty": "977.4",
+                    "executedQty": "977.4",
+                    "cumQuote": "355.38264000",
+                    "timeInForce": "GTC",
+                    "type": "LIMIT",
+                    "reduceOnly": True,
+                    "closePosition": False,
+                    "side": "BUY",
+                    "positionSide": "BOTH",
+                    "stopPrice": "0",
+                    "workingType": "CONTRACT_PRICE",
+                    "priceMatch": "NONE",
+                    "selfTradePreventionMode": "EXPIRE_MAKER",
+                    "goodTillDate": 0,
+                    "priceProtect": False,
+                    "origType": "LIMIT",
+                    "time": 1784606414905,
+                    "updateTime": 1784606414905,
+                },
+                "pair": "ONDO/USDT:USDT",
+                "expected": {
+                    "symbol": "ONDO/USDT:USDT",
+                    "id": "1235611235",
+                    "timestamp": 1784606414905,
+                    "datetime": "2026-07-21T04:00:14.905Z",
+                    "price": 0.3817,
+                    "status": "closed",
+                    "side": "buy",
+                    "amount": 977.4,
+                    "average": 0.3636,
                 },
             },
         ],
@@ -271,6 +356,8 @@ EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
         "futures_pair": "BTC/USDT:USDT",
         "candle_count_futures": 1999,
         "hasQuoteVolumeFutures": True,
+        # gate rejects a "from" older than 180 days ("from time exceeds 180-day limit").
+        "open_interest_history_days": 179,
         "leverage_tiers_public": True,
         "leverage_in_spot_market": True,
         "sample_order": [
@@ -389,6 +476,8 @@ EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
         "futures": True,
         "futures_pair": "BTC/USDT:USDT",
         "hasQuoteVolumeFutures": False,
+        # okx raises "Illegal time range" beyond 30 days of open interest history.
+        "open_interest_history_days": 30,
         "leverage_tiers_public": True,
         "leverage_in_spot_market": True,
         "private_methods": ["fetch_accounts"],
@@ -402,6 +491,9 @@ EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
         "candle_count": 1000,
         "futures_pair": "BTC/USDT:USDT",
         "futures": True,
+        # Bybit serves well over 2 years of open interest history - capped here to keep the
+        # runtime of this test in check, 200 candles per call add up quickly.
+        "open_interest_history_days": 180,
         "orderbook_max_entries": 50,
         "leverage_tiers_public": True,
         "leverage_in_spot_market": True,
@@ -435,14 +527,6 @@ EXCHANGES: dict[str, TestExchangeOnlineSetup] = {
                 },
             }
         ],
-    },
-    "bitmart": {
-        "pair": "BTC/USDT",
-        "stake_currency": "USDT",
-        "hasQuoteVolume": True,
-        "timeframe": "1h",
-        "candle_count": 200,
-        "orderbook_max_entries": 50,
     },
     "bitget": {
         "pair": "BTC/USDT",
@@ -699,8 +783,8 @@ EXCHANGES_SPOT = [exch for exch, params in EXCHANGES.items() if not params.get("
 def exchange_conf():
     config = get_default_conf_usdt((Path(__file__).parent / "testdata").resolve())
     config["exchange"]["pair_whitelist"] = []
-    config["exchange"]["key"] = ""
-    config["exchange"]["secret"] = ""
+    config["exchange"]["api_key"] = None
+    config["exchange"]["secret"] = None
     config["dry_run"] = False
     config["entry_pricing"]["use_order_book"] = True
     config["exit_pricing"]["use_order_book"] = True

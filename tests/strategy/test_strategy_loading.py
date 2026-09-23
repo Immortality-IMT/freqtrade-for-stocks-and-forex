@@ -35,7 +35,7 @@ def test_search_all_strategies_no_failed():
     directory = Path(__file__).parent / "strats"
     strategies = StrategyResolver._search_all_objects(directory, enum_failed=False)
     assert isinstance(strategies, list)
-    assert len(strategies) == 13
+    assert len(strategies) == 14
     assert isinstance(strategies[0], dict)
 
 
@@ -43,10 +43,10 @@ def test_search_all_strategies_with_failed():
     directory = Path(__file__).parent / "strats"
     strategies = StrategyResolver._search_all_objects(directory, enum_failed=True)
     assert isinstance(strategies, list)
-    assert len(strategies) == 14
+    assert len(strategies) == 15
     # with enum_failed=True search_all_objects() shall find 2 good strategies
     # and 1 which fails to load
-    assert len([x for x in strategies if x["class"] is not None]) == 13
+    assert len([x for x in strategies if x["class"] is not None]) == 14
 
     assert len([x for x in strategies if x["class"] is None]) == 1
 
@@ -531,7 +531,7 @@ def test_strategy_interface_versioning(dataframe_1m, default_conf):
     assert "exit_long" in exitdf
 
 
-def test_strategy_ft_load_params_from_file(mocker, default_conf):
+def test_strategy_ft_set_special_params_from_file(mocker, default_conf):
     default_conf.update({"strategy": "StrategyTestV2"})
     del default_conf["max_open_trades"]
     mocker.patch(

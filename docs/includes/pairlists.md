@@ -31,6 +31,7 @@ You may also use something like `.*DOWN/BTC` or `.*UP/BTC` to exclude leveraged 
 * [`DelistFilter`](#delistfilter)
 * [`FullTradesFilter`](#fulltradesfilter)
 * [`OffsetFilter`](#offsetfilter)
+* [`PairInformationFilter`](#pairinformationfilter)
 * [`PerformanceFilter`](#performancefilter)
 * [`PrecisionFilter`](#precisionfilter)
 * [`PriceFilter`](#pricefilter)
@@ -180,7 +181,7 @@ More sophisticated approach can be used, by using `lookback_timeframe` for candl
 * `max_value`: Sets a maximum percentage change threshold. Pairs with a percentage change above this value will be filtered out.
 * `sort_direction`: Specifies the order in which pairs are sorted based on their percentage change. Accepts two values: `asc` for ascending order and `desc` for descending order.
 * `refresh_period`: Defines the interval (in seconds) at which the pairlist will be refreshed. The default is 1800 seconds (30 minutes).
-* `lookback_days`: Number of days to look back. When `lookback_days` is selected, the `lookback_timeframe` is defaulted to 1 day.
+* `lookback_days`: Number of days to look back. `lookback_days` implies a `lookback_timeframe` of 1 day - combining it with a different `lookback_timeframe` will result in an error.
 * `lookback_timeframe`: Timeframe to use for the lookback period.
 * `lookback_period`: Number of periods to look back at.
 
@@ -469,6 +470,65 @@ Example to remove the first 10 pairs from the pairlist, and takes the next 20 (t
 !!! Note
     An offset larger than the total length of the incoming pairlist will result in an empty pairlist.
 
+#### PairInformationFilter
+
+Filters pairs based on the presence of certain information in the ccxt markets argument.
+
+To get the correct field - you can use the following code snippet to print the market information for a given pair, and find the correct field and value to filter for:
+
+``` python
+import ccxt
+from pprint import pprint
+exchange = ccxt.binance({
+    'options': {'defaultType': 'swap'} 
+    })
+lm = exchange.load_markets()
+pprint(lm['XAU/USDT:USDT'])
+```
+
+``` json hl_lines="13 16"
+{
+    "id": "XAUUSDT",
+    "lowercaseId": "xauusdt",
+    "symbol": "XAU/USDT:USDT",
+    "base": "XAU",
+    "quote": "USDT",
+    "settle": "USDT",
+    "baseId": "XAU",
+    "quoteId": "USDT",
+    "settleId": "USDT",
+    "type": "swap",
+    // ...
+    "info": {
+        "symbol": "XAUUSDT",
+        "pair": "XAUUSDT",
+        "contractType": "TRADIFI_PERPETUAL",
+        "deliveryDate": 4133404800000,
+        "onboardDate": 1765440300000,
+        "status": "TRADING",
+        // ...
+    }
+}
+
+```
+
+As the highlighted lines show, the `contractType` field in the `info` section of the market data contains the value `TRADIFI_PERPETUAL`, which can be used to filter for TradeFi perpetual contracts.
+Nested dictionaries can be accessed by using dot notation in the `info_key` - so the `contractType` field can be accessed with `info.contractType`.
+
+In this example, the resulting `PairInformationFilter` configuration will include pairs that have `TRADIFI_PERPETUAL` as their `contractType` in the `info` section of the market data.
+
+``` json
+[
+    // ...
+    {
+        "method": "PairInformationFilter",
+        "selection_mode": "whitelist",  // can be whitelist or blacklist
+        "info_key" : "info.contractType", // can be any key in market data
+        "info_compare_value": "TRADIFI_PERPETUAL", // can be any matching value
+    }
+]
+```
+
 #### PerformanceFilter
 
 Sorts pairs by past trade performance, as follows:
@@ -575,7 +635,9 @@ If `DOGE/BTC` maximum bid is 0.00000026 and minimum ask is 0.00000027, the ratio
 
 #### RangeStabilityFilter
 
-Removes pairs where the difference between lowest low and highest high over `lookback_days` days is below `min_rate_of_change` or above `max_rate_of_change`. Since this is a filter that requires additional data, the results are cached for `refresh_period`.
+Removes pairs where the difference between lowest low and highest high over `lookback_period` candles of `lookback_timeframe` (defaults to `1d`) is below `min_rate_of_change` or above `max_rate_of_change`. Since this is a filter that requires additional data, the results are cached for `refresh_period`.
+
+For convenience, `lookback_days` can be used instead, which implies daily candles (equivalent to setting `lookback_period` with a `lookback_timeframe` of `1d`). One of `lookback_days` or `lookback_period` must be set - setting both is ambiguous and will result in an error, as does combining `lookback_days` with a `lookback_timeframe` other than `1d`. Setting neither is deprecated and currently falls back to a lookback of 10 days - this fallback will be removed in a future version.
 
 In the below example:
 If the trading range over the last 10 days is <1% or >99%, remove the pair from the whitelist.
@@ -584,10 +646,26 @@ If the trading range over the last 10 days is <1% or >99%, remove the pair from 
 "pairlists": [
     {
         "method": "RangeStabilityFilter",
-        "lookback_days": 10,
+        "lookback_timeframe": "1d",
+        "lookback_period": 10,
         "min_rate_of_change": 0.01,
         "max_rate_of_change": 0.99,
         "refresh_period": 86400
+    }
+]
+```
+
+The same filter based on a trading range of 72 1h candles (3 days) would look as follows:
+
+```json
+"pairlists": [
+    {
+        "method": "RangeStabilityFilter",
+        "lookback_timeframe": "1h",
+        "lookback_period": 72,
+        "min_rate_of_change": 0.01,
+        "max_rate_of_change": 0.99,
+        "refresh_period": 3600
     }
 ]
 ```
@@ -600,9 +678,11 @@ Adding `"sort_direction": "asc"` or `"sort_direction": "desc"` enables sorting f
 
 #### VolatilityFilter
 
-Volatility is the degree of historical variation of a pairs over time, it is measured by the standard deviation of logarithmic daily returns. Returns are assumed to be normally distributed, although actual distribution might be different. In a normal distribution, 68% of observations fall within one standard deviation and 95% of observations fall within two standard deviations. Assuming a volatility of 0.05 means that the expected returns for 20 out of 30 days is expected to be less than 5% (one standard deviation). Volatility is a positive ratio of the expected deviation of return and can be greater than 1.00. Please refer to the wikipedia definition of [`volatility`](https://en.wikipedia.org/wiki/Volatility_(finance)).
+Volatility is the degree of historical variation of a pairs over time, it is measured by the standard deviation of logarithmic candle-to-candle returns. Returns are assumed to be normally distributed, although actual distribution might be different. In a normal distribution, 68% of observations fall within one standard deviation and 95% of observations fall within two standard deviations. Assuming a volatility of 0.05 means that the expected returns for 20 out of 30 days is expected to be less than 5% (one standard deviation). Volatility is a positive ratio of the expected deviation of return and can be greater than 1.00. Please refer to the wikipedia definition of [`volatility`](https://en.wikipedia.org/wiki/Volatility_(finance)).
 
-This filter removes pairs if the average volatility over a `lookback_days` days is below `min_volatility` or above `max_volatility`. Since this is a filter that requires additional data, the results are cached for `refresh_period`.
+This filter removes pairs if the average volatility over `lookback_period` candles of `lookback_timeframe` (defaults to `1d`) is below `min_volatility` or above `max_volatility`. Since this is a filter that requires additional data, the results are cached for `refresh_period`.
+
+For convenience, `lookback_days` can be used instead, which implies daily candles (equivalent to setting `lookback_period` with a `lookback_timeframe` of `1d`). One of `lookback_days` or `lookback_period` must be set - setting both is ambiguous and will result in an error, as does combining `lookback_days` with a `lookback_timeframe` other than `1d`. Setting neither is deprecated and currently falls back to a lookback of 10 days - this fallback will be removed in a future version.
 
 This filter can be used to narrow down your pairs to a certain volatility or avoid very volatile pairs.
 
@@ -613,10 +693,26 @@ If the volatility over the last 10 days is not in the range of 0.05-0.50, remove
 "pairlists": [
     {
         "method": "VolatilityFilter",
-        "lookback_days": 10,
+        "lookback_timeframe": "1d",
+        "lookback_period": 10,
         "min_volatility": 0.05,
         "max_volatility": 0.50,
         "refresh_period": 86400
+    }
+]
+```
+
+The same filter based on the volatility of 72 1h candles (3 days) would look as follows:
+
+```json
+"pairlists": [
+    {
+        "method": "VolatilityFilter",
+        "lookback_timeframe": "1h",
+        "lookback_period": 72,
+        "min_volatility": 0.05,
+        "max_volatility": 0.50,
+        "refresh_period": 3600
     }
 ]
 ```

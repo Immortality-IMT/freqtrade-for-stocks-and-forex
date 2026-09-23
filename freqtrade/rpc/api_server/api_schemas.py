@@ -1,12 +1,38 @@
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, Field, RootModel, SerializeAsAny, model_validator
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    Field,
+    RootModel,
+    SerializeAsAny,
+    model_validator,
+)
+from pydantic_core import PydanticCustomError
 
 from freqtrade.constants import DL_DATA_TIMEFRAMES, IntOrInf
 from freqtrade.enums import MarginMode, OrderTypeValues, SignalDirection, TradingMode
 from freqtrade.ft_types import AnnotationType, ValidExchangesType
-from freqtrade.rpc.api_server.webserver_bgwork import ProgressTask
+from freqtrade.rpc.api_server.webserver_bgwork import JOB_CATEGORIES, ProgressTask
+
+
+def _no_base64_strategy(value: str) -> str:
+    """
+    Reject `StrategyName:base64` strategy names.
+    This is a security measure to prevent potential attacks using base64 encoded strategies.
+    Embedding a strategy as base64 is a config-file convenience
+    (see docs/strategy-advanced.md) - an API caller must never be able to supply one.
+    """
+    if ":" in value:
+        raise PydanticCustomError("strategy_name", "base64 encoded strategies are not allowed.")
+    return value
+
+
+# A strategy name as accepted from an API caller. Every request parameter or payload
+# field carrying a strategy name must use this instead of a plain `str`.
+StrategyName = Annotated[str, AfterValidator(_no_base64_strategy)]
 
 
 class ExchangeModePayloadMixin(BaseModel):
@@ -41,7 +67,7 @@ class BgJobStarted(StatusMsg):
 
 class BackgroundTaskStatus(BaseModel):
     job_id: str
-    job_category: str
+    job_category: JOB_CATEGORIES
     status: str
     running: bool
     progress: float | None = None
@@ -237,6 +263,7 @@ class ShowConfig(BaseModel):
     margin_mode: str
     short_allowed: bool
     stake_currency: str
+    proxy_coin: str | None = None
     stake_amount: str
     available_capital: float | None = None
     stake_currency_decimals: int
@@ -598,7 +625,7 @@ class PairCandlesRequest(BaseModel):
 
 class PairHistoryRequest(PairCandlesRequest, ExchangeModePayloadMixin):
     timerange: str
-    strategy: str | None = None
+    strategy: StrategyName | None = None
     freqaimodel: str | None = None
     live_mode: bool = False
 
@@ -632,7 +659,7 @@ class BacktestFreqAIInputs(BaseModel):
 
 
 class BacktestRequest(BaseModel):
-    strategy: str
+    strategy: StrategyName
     timeframe: str | None = None
     timeframe_detail: str | None = None
     timerange: str | None = None
@@ -670,7 +697,7 @@ class BacktestHistoryEntry(BaseModel):
 
 
 class BacktestMetadataUpdate(BaseModel):
-    strategy: str
+    strategy: StrategyName
     notes: str = ""
 
 
@@ -678,6 +705,60 @@ class BacktestMarketChange(BaseModel):
     columns: list[str]
     length: int
     data: list[list[Any]]
+
+
+class LookaheadAnalysisRequest(BaseModel):
+    strategy: StrategyName
+    timeframe: str | None = None
+    timerange: str | None = None
+    minimum_trade_amount: int = 10
+    targeted_trade_amount: int = 20
+    lookahead_allow_limit_orders: bool = False
+
+
+class LookaheadAnalysisResultEntry(BaseModel):
+    strategy: str
+    has_bias: bool
+    total_signals: int
+    biased_entry_signals: int
+    biased_exit_signals: int
+    biased_indicators: list[str]
+
+
+class LookaheadAnalysisResponse(BaseModel):
+    status: str
+    running: bool
+    status_msg: str
+    result: LookaheadAnalysisResultEntry | None = None
+
+
+class RecursiveAnalysisRequest(BaseModel):
+    strategy: StrategyName
+    timeframe: str | None = None
+    timerange: str | None = None
+    startup_candle: list[int] | None = None
+
+
+class RecursiveAnalysisResultEntry(BaseModel):
+    strategy: str
+    startup_candles: list[int] = Field(description="The startup candle counts that were tested.")
+    strategy_scc: int | None = Field(
+        default=None,
+        description="The strategy's own startup_candle_count, if it could be determined.",
+    )
+    results: dict[str, dict[str, float]] = Field(
+        description=(
+            "Per-indicator variance keyed by indicator name, then by startup candle count. "
+            "e.g. { 'rsi': { '199': 0.123, '200': float('nan'), ... }, 'macd': { ... }, ... } }. "
+        )
+    )
+
+
+class RecursiveAnalysisResponse(BaseModel):
+    status: str
+    running: bool
+    status_msg: str
+    result: RecursiveAnalysisResultEntry | None = None
 
 
 class WalletHistoryResponse(BaseModel):
@@ -692,6 +773,7 @@ class WalletHistoryResponse(BaseModel):
 class MarketRequest(ExchangeModePayloadMixin, BaseModel):
     base: str | None = None
     quote: str | None = None
+    include_inactive: bool = False
 
 
 class MarketModel(BaseModel):
@@ -700,6 +782,7 @@ class MarketModel(BaseModel):
     quote: str
     spot: bool
     swap: bool
+    active: bool = False  # Assume false if the field is missing.
 
 
 class MarketResponse(BaseModel):

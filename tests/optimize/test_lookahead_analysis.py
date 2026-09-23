@@ -10,6 +10,7 @@ from freqtrade.data.history import get_timerange
 from freqtrade.exceptions import OperationalException
 from freqtrade.optimize.analysis.lookahead import Analysis, LookaheadAnalysis
 from freqtrade.optimize.analysis.lookahead_helpers import LookaheadAnalysisSubFunctions
+from freqtrade.util import get_progress_tracker
 from tests.conftest import EXMS, get_args, log_has_re, patch_exchange
 
 
@@ -136,6 +137,9 @@ def test_lookahead_helper_start(lookahead_conf, mocker, caplog) -> None:
     assert text_table_mock.call_count == 1
     assert log_has_re("Forced order_types to market orders.", caplog)
     assert single_mock.call_args_list[0][0][0]["order_types"]["entry"] == "market"
+    assert single_mock.call_args_list[0][0][0]["order_types"]["exit"] == "market"
+    assert single_mock.call_args_list[0][0][0]["entry_pricing"]["price_side"] == "other"
+    assert single_mock.call_args_list[0][0][0]["exit_pricing"]["price_side"] == "other"
 
     single_mock.reset_mock()
     text_table_mock.reset_mock()
@@ -146,6 +150,7 @@ def test_lookahead_helper_start(lookahead_conf, mocker, caplog) -> None:
     assert text_table_mock.call_count == 1
     assert log_has_re("Using configured order_types, skipping order_types override.", caplog)
     assert "order_types" not in single_mock.call_args_list[0][0][0]
+    assert "price_side" not in single_mock.call_args_list[0][0][0]["exit_pricing"]
 
 
 @pytest.mark.parametrize(
@@ -448,7 +453,7 @@ def test_initialize_single_lookahead_analysis(lookahead_conf, mocker, caplog):
     }
 
     instance = LookaheadAnalysisSubFunctions.initialize_single_lookahead_analysis(
-        lookahead_conf, strategy_obj
+        lookahead_conf, strategy_obj, get_progress_tracker()
     )
     assert log_has_re(r"Bias test of .* started\.", caplog)
     assert start_mock.call_count == 1
@@ -480,7 +485,7 @@ def test_biased_strategy(lookahead_conf, mocker, caplog, scenario) -> None:
 
     strategy_obj = {"name": "strategy_test_v3_with_lookahead_bias"}
     instance = LookaheadAnalysis(lookahead_conf, strategy_obj)
-    instance.start()
+    instance.start(get_progress_tracker())
     # Assert init correct
     assert log_has_re(f"Strategy Parameter: scenario = {scenario}", caplog)
 
