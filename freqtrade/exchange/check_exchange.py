@@ -6,7 +6,9 @@ from freqtrade.exceptions import OperationalException
 from freqtrade.exchange import available_exchanges, is_exchange_known_ccxt, validate_exchange
 from freqtrade.exchange.common import MAP_EXCHANGE_CHILDCLASS, SUPPORTED_EXCHANGES
 
+
 logger = logging.getLogger(__name__)
+
 
 def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
     """
@@ -71,14 +73,18 @@ def check_exchange(config: Config, check_for_bad: bool = True) -> bool:
                 f"{', '.join(available_exchanges())}"
             )
 
-    # Upstream logic for validate_exchange
-    valid, reason, _, _ = validate_exchange(exchange)
-    if not valid:
-        if check_for_bad:
-            raise OperationalException(
-                f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
-            )
-        else:
-            logger.warning(f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.')
+    # Only validate exchanges that are known to CCXT.
+    # Custom Freqtrade exchanges (e.g. Alpacastocks, Immortality) bypass CCXT validation.
+    if is_known_ccxt:
+        valid, reason, _, _ = validate_exchange(exchange)
+        if not valid:
+            if check_for_bad:
+                raise OperationalException(
+                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
+                )
+            else:
+                logger.warning(
+                    f'Exchange "{exchange}" will not work with Freqtrade. Reason: {reason}.'
+                )
 
     return True
