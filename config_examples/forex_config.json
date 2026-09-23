@@ -62,8 +62,8 @@
         "listen_port": 8080,
         "verbosity": "error",
         "enable_openapi": false,
-        "jwt_secret_key": "xxx",
-        "ws_token": "xxx",
+        "jwt_secret_key": "4e5Y1gklkxLrN00M-FBVAI7uvPesd7PCwydd7kHk7JvbQRRwewBW_xGbYlaQl9vk",
+        "ws_token": "1nT-JCLiCA6vZelVJZYO8ZdCsou9iK0PQfO7q400Q37jErMV07TqD_NY9XEFnzBs",
         "CORS_origins": [],
         "username": "freqtrader",
         "password": "xxx"
