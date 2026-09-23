@@ -66,3 +66,5 @@ packaging==26.3
 alpaca-py
 #InteractiveBrokers
 ib_insync
+
+web3
