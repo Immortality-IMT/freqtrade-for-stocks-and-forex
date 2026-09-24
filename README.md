@@ -28,9 +28,12 @@ It stays in sync with upstream Freqtrade and allows **all your existing strategi
 Installation is identical to [Freqtrade](https://www.freqtrade.io/en/stable/installation/):
 
 ```plain
+git clone https://github.com/Immortality-IMT/freqtrade-for-stocks-and-forex.git
+cd freqtrade-for-stocks-and-forex
 ./setup.sh -i
 ```
 ```plain
+source ./.venv/bin/activate
 freqtrade create-userdir --userdir user_data
 ```
 
@@ -43,8 +46,8 @@ Setup
 - Sign up at Alpaca
 - Get your Paper Trading API keys
 - Copy:
-  - stocks_config.json → user_data/
-  - TestAlpaca.py → user_data/strategies/
+  - config_examples/stocks_config.json → user_data/
+  - config_examples/TestAlpaca.py → user_data/strategies/
 - Edit stocks_config.json to include your Alpaca API keys
 - ✅ Use "USD" instead of "USDT" in your config. Example: "TSLA/USD"
 
@@ -102,8 +105,8 @@ Setup
   - Disable: Read-only API
 - Ensure your base currency is USD
 - Copy:
-  - forex_config.json → user_data/
-  - TestIB.py → user_data/strategies/
+  - config_examples/forex_config.json → user_data/
+  - config_examples/TestIB.py → user_data/strategies/
 
 ```
 Example Config Snippet
@@ -155,8 +158,8 @@ Setup
 - Edit immortality_config.json in config_examples/:
   - Add your public key, private key, and NodeReal API key
 - Copy:
-  - immortality_config.json → user_data/
-  - TestIMT.py → user_data/strategies/
+  - config_examples/immortality_config.json → user_data/
+  - config_examples/TestIMT.py → user_data/strategies/
 
 Run Command
 
