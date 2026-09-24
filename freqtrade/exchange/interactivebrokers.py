@@ -228,6 +228,7 @@ class Interactivebrokers(Foreignexchange):
                 logger.info("✅ IBKR connection established.")
                 self._ws_connected = True
                 self.connected = True
+                self._resync_order_cache()
 
             except ConnectionRefusedError:
                 logger.error(
@@ -244,6 +245,21 @@ class Interactivebrokers(Foreignexchange):
                 self.connected = False
                 raise SystemExit("❌ Unexpected failure connecting to IBKR.")
 
+    def _resync_order_cache(self) -> None:
+        """
+        Repopulate ib_insync's client-side order/trade cache after a (re)connect.
+        Without this, self.ib.trades()/self.ib.openTrades() only reflect orders
+        placed since this connection was established, which makes fetch_order()
+        report 'not_found' for orders that are actually still live on IBKR —
+        and that false negative can cause sync_orders() to incorrectly mark a
+        still-open Freqtrade trade as closed.
+        """
+        try:
+            self.ib.reqAllOpenOrders()
+            self.ib.reqExecutions()
+        except Exception as e:
+            logger.warning(f"Failed to resync order/trade cache after (re)connect: {e}")
+
     def _setup_event_loop(self) -> None:
         if self._connection_thread and self._connection_thread.is_alive():
             return
@@ -254,32 +270,42 @@ class Interactivebrokers(Foreignexchange):
 
         def _start_ib_loop():
             logger.info("Starting IBKR event loop")
+
             while self._running and not self.shutdown_event.is_set():
                 try:
                     if not self.ib.isConnected():
                         self._reconnect_attempts += 1
                         delay = min(
                             self._reconnect_base_delay * 2**self._reconnect_attempts,
-                            60,  # Max 60 seconds
+                            60,
                         )
+
                         logger.warning(
                             f"Connection lost. Reconnecting in {delay}s "
-                            f"(attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
+                            f"(attempt {self._reconnect_attempts}/"
+                            f"{self._max_reconnect_attempts})"
                         )
+
                         time.sleep(delay)
                         self._connect_to_ib()
+
                     else:
                         self._reconnect_attempts = 0
                         self.ib.sleep(1)
+
                 except ConnectionError as e:
                     logger.error(f"IB connection error: {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error in event loop: {e}", exc_info=True)
+
+                except Exception:
+                    logger.exception("Unexpected error in event loop")
                     time.sleep(5)
 
             logger.info("IBKR event loop stopped")
 
-        self._connection_thread = Thread(target=_start_ib_loop, daemon=True)
+        self._connection_thread = Thread(
+            target=_start_ib_loop,
+            daemon=True,
+        )
         self._connection_thread.start()
 
     @property
@@ -353,12 +379,13 @@ class Interactivebrokers(Foreignexchange):
         rate: float | None = None,
         **kwargs,
     ) -> dict:
-        # 1) Detect TWS down & back off before everything else
-        self.ensure_connected()
+        """
+        Create an order on Interactive Brokers.
 
-        # 2) Wait for market open before placing orders (trading operation)
-        # if not self.is_market_open():
-        #    self.wait_for_market_open()
+        Preserves Freqtrade's time-in-force and passes it explicitly to IBKR.
+        """
+
+        self.ensure_connected()
 
         if not self.is_market_open():
             raise OperationalException("Forex market is currently closed. Order rejected.")
@@ -366,57 +393,190 @@ class Interactivebrokers(Foreignexchange):
         params = params or {}
         pair = pair[0] if isinstance(pair, tuple) else pair
 
-        # ——— Prevent duplicate in-flight orders for the same pair+side ———
+        time_in_force = (
+            kwargs.get("time_in_force")
+            or params.get("timeInForce")
+            or params.get("time_in_force")
+            or "GTC"
+        ).upper()
+
+        valid_tifs = {"DAY", "GTC", "IOC", "FOK"}
+
+        if time_in_force not in valid_tifs:
+            logger.warning(
+                f"Unsupported time-in-force '{time_in_force}' for {pair}. Falling back to GTC."
+            )
+            time_in_force = "GTC"
+
+        logger.info(
+            f"Creating {side.upper()} {ordertype.upper()} order for {pair}: "
+            f"amount={amount}, price={price}, TIF={time_in_force}"
+        )
+
+        # Prevent duplicate in-flight orders.
         try:
             open_orders = self.fetch_open_orders(pair)
-            # match on side and open status
+
             dup = [
                 o
                 for o in open_orders
-                if o["side"].lower() == side.lower() and o["status"] == "open"
+                if str(o.get("side", "")).lower() == side.lower() and o.get("status") == "open"
             ]
+
             if dup:
                 logger.warning(
                     f"Skipping new {side.upper()} order for {pair}: "
                     f"{len(dup)} existing open order(s) detected."
                 )
-                from freqtrade.exceptions import ExchangeError
-
                 raise ExchangeError(f"Duplicate in-flight {side} order for {pair}")
-        except ExchangeError:
-            # bubble up to FreqTrade so it won't persist anything
-            raise
-        except Exception as e:
-            logger.error(f"Error checking existing orders for {pair}: {e}")
-            # proceed anyway
 
-        # ——— initialize contract, amount, price ———
-        contract, amount, price = self._initialize_contract_amount_price(pair, amount, price, rate)
+        except ExchangeError:
+            raise
+
+        except Exception:
+            logger.exception(f"Error checking existing orders for {pair}")
+
+        contract, amount, price = self._initialize_contract_amount_price(
+            pair,
+            amount,
+            price,
+            rate,
+        )
 
         use_market = ordertype.lower() == "market" or (
             side.lower() == "sell" and params.get("exit_as_market", False)
         )
 
-        # ——— build IB order object ———
         if use_market:
-            order = Order(action=side.upper(), totalQuantity=amount, orderType="MKT")
+            order = Order(
+                action=side.upper(),
+                totalQuantity=amount,
+                orderType="MKT",
+                tif=time_in_force,
+            )
+
         else:
             try:
                 if price is None or price <= 0:
                     price = self.get_rate(pair, side=side)
+
                 if not (0.00001 <= price <= 1000.0):
                     raise ValueError(f"Invalid price for order: {price}")
+
                 order = Order(
                     action=side.upper(),
                     totalQuantity=amount,
                     orderType="LMT",
-                    lmtPrice=round(price, self.SIGNIFICANT_DIGITS - 1),
+                    lmtPrice=round(
+                        price,
+                        self.SIGNIFICANT_DIGITS - 1,
+                    ),
+                    tif=time_in_force,
                 )
-            except ValueError as e:
-                logger.error(f"Failed to get valid price for order: {e}")
-                return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
-        return self._place_and_wait_for_order(contract, order, pair, ordertype, side, amount, price)
+            except ValueError as e:
+                logger.error(f"Failed to get valid price for order {pair}: {e}")
+
+                return self._failed_response(
+                    pair,
+                    ordertype,
+                    side,
+                    amount,
+                    price,
+                    str(e),
+                )
+
+        logger.info(
+            f"Prepared IBKR order: "
+            f"{order.action} {order.totalQuantity} {pair} "
+            f"type={order.orderType} "
+            f"price={getattr(order, 'lmtPrice', None)} "
+            f"TIF={getattr(order, 'tif', '')}"
+        )
+
+        return self._place_and_wait_for_order(
+            contract,
+            order,
+            pair,
+            ordertype,
+            side,
+            amount,
+            price,
+        )
+
+    def _has_ib_error(self, trade: Any, error_code: int) -> bool:
+        """
+        Check whether an IBKR trade log contains a specific error code.
+        """
+        return any(
+            getattr(log_entry, "errorCode", 0) == error_code
+            for log_entry in getattr(trade, "log", [])
+        )
+
+    def _wait_for_10349_recovery(
+        self,
+        trade,
+        pair: str,
+        amount: float,
+    ) -> None:
+        """
+        Handle IBKR error 10349 as a potentially transient cancellation.
+
+        TWS can report:
+            Cancelled -> PreSubmitted -> Filled
+
+        for the same order when the TIF is adjusted by TWS.
+        """
+
+        if not self._has_ib_error(trade, 10349):
+            return
+
+        order_id = getattr(trade.order, "orderId", 0)
+
+        logger.warning(
+            f"IBKR order {order_id} for {pair} reported Cancelled "
+            "with error 10349. Waiting for final TWS order state."
+        )
+
+        deadline = time.time() + 10
+
+        while time.time() < deadline and not self.shutdown_event.is_set():
+            self.ib.waitOnUpdate(timeout=0.25)
+
+            status = getattr(
+                trade.orderStatus,
+                "status",
+                "",
+            )
+
+            filled = float(
+                getattr(
+                    trade.orderStatus,
+                    "filled",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            if filled > 0:
+                logger.info(
+                    f"IBKR order {order_id} for {pair} "
+                    f"has filled {filled}/{amount} "
+                    "after transient 10349."
+                )
+                return
+
+            if status in (
+                "PreSubmitted",
+                "Submitted",
+                "Filled",
+            ):
+                logger.info(
+                    f"IBKR order {order_id} for {pair} "
+                    f"recovered from transient 10349 state: "
+                    f"{status}"
+                )
+                return
 
     def _place_and_wait_for_order(
         self,
@@ -428,32 +588,107 @@ class Interactivebrokers(Foreignexchange):
         amount: float,
         price: float | None,
     ) -> dict:
-        """Place order and wait for IB to acknowledge it."""
+        """
+        Place an IBKR order and wait for a stable final state.
+        """
+
         try:
             trade = self.ib.placeOrder(contract, order)
-            logger.info(
-                f"Order placed: {order.action} {order.totalQuantity} "
-                f"{pair} at {getattr(order, 'lmtPrice', 'MARKET')}"
-            )
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            return self._failed_response(pair, ordertype, side, amount, price, str(e))
 
-        # ——— wait for IB to ack/fill ———
+            logger.info(
+                f"Order placed: "
+                f"{order.action} {order.totalQuantity} "
+                f"{pair} at "
+                f"{getattr(order, 'lmtPrice', 'MARKET')} "
+                f"TIF={getattr(order, 'tif', '')}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error placing order for {pair}: {e}")
+
+            return self._failed_response(
+                pair,
+                ordertype,
+                side,
+                amount,
+                price,
+                str(e),
+            )
+
+        # Wait for initial IBKR acknowledgement.
         deadline = time.time() + 30
-        while (
-            time.time() < deadline
-            and trade.orderStatus.status in ("ApiPending", "PendingSubmit", "Submitted")
-            and not self.shutdown_event.is_set()
-        ):
-            self.ib.waitOnUpdate(timeout=1)
+
+        while time.time() < deadline and not self.shutdown_event.is_set():
+            status = getattr(
+                trade.orderStatus,
+                "status",
+                "",
+            )
+
+            if status in (
+                "ApiPending",
+                "PendingSubmit",
+                "PreSubmitted",
+                "Submitted",
+                "PendingCancel",
+            ):
+                self.ib.waitOnUpdate(timeout=0.5)
+                continue
+
+            if status in ("Cancelled", "Canceled"):
+                self._wait_for_10349_recovery(
+                    trade,
+                    pair,
+                    amount,
+                )
+                break
+
+            break
 
         if self.shutdown_event.is_set():
             logger.info("Shutdown signal received, exiting order placement.")
-            return self._failed_response(pair, ordertype, side, amount, price, "Shutdown")
 
-        # ——— finalize or raise on failure ———
-        return self._finalize_trade_status(trade, pair, ordertype, side, amount, price)
+            return self._failed_response(
+                pair,
+                ordertype,
+                side,
+                amount,
+                price,
+                "Shutdown",
+            )
+
+        # Give IBKR a brief opportunity to populate final execution data.
+        final_deadline = time.time() + 2
+
+        while time.time() < final_deadline:
+            status = getattr(
+                trade.orderStatus,
+                "status",
+                "",
+            )
+
+            filled = float(
+                getattr(
+                    trade.orderStatus,
+                    "filled",
+                    0.0,
+                )
+                or 0.0
+            )
+
+            if status == "Filled" or filled >= float(amount):
+                break
+
+            self.ib.waitOnUpdate(timeout=0.25)
+
+        return self._finalize_trade_status(
+            trade,
+            pair,
+            ordertype,
+            side,
+            amount,
+            price,
+        )
 
     def _initialize_contract_amount_price(self, pair, amount, price, rate):
         if rate is not None and (price is None or price <= 0):
@@ -474,56 +709,144 @@ class Interactivebrokers(Foreignexchange):
 
         return contract, amount, price
 
-    def _finalize_trade_status(self, trade, pair, ordertype, side, amount, price):
-        status = trade.orderStatus.status
-        oid = str(trade.order.orderId)
-        filled = float(trade.orderStatus.filled)
-        remaining = amount - filled
+    def _finalize_trade_status(
+        self,
+        trade,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        price: float | None,
+    ) -> dict:
+        """
+        Convert the final IBKR trade state into the order structure
+        expected by Freqtrade.
 
-        # Map to Freqtrade status
+        Uses IBKR avgFillPrice when available so Freqtrade/FreqUI receives
+        the actual execution price.
+        """
+
+        status = getattr(
+            trade.orderStatus,
+            "status",
+            "unknown",
+        )
+
+        oid = str(
+            getattr(
+                trade.order,
+                "orderId",
+                "",
+            )
+        )
+
+        filled = float(
+            getattr(
+                trade.orderStatus,
+                "filled",
+                0.0,
+            )
+            or 0.0
+        )
+
+        remaining = max(
+            0.0,
+            float(amount) - filled,
+        )
+
+        # Freqtrade's normalized status.
         ft_status = self._parse_order_status(status)
 
-        # Handle open orders (including partially filled ones)
+        # ------------------------------------------------------------------
+        # Actual IBKR average execution price.
+        # ------------------------------------------------------------------
+        avg_fill_price = float(
+            getattr(
+                trade.orderStatus,
+                "avgFillPrice",
+                0.0,
+            )
+            or 0.0
+        )
+
+        # For filled orders, avgFillPrice should normally be populated.
+        # Fall back to the requested price only if IBKR did not provide one.
+        if avg_fill_price <= 0:
+            if price is not None and price > 0:
+                avg_fill_price = float(price)
+            else:
+                avg_fill_price = 0.0
+
+        # ------------------------------------------------------------------
+        # Open / partially-filled order.
+        # ------------------------------------------------------------------
         if ft_status == "open":
             logger.info(
-                f"Order {oid} for {pair} is open (status={status}), "
-                f"filled={filled}, remaining={remaining}"
+                f"Order {oid} for {pair} is open "
+                f"(IB status={status}), "
+                f"filled={filled}, "
+                f"remaining={remaining}"
             )
+
             return {
                 "id": oid,
                 "symbol": pair,
                 "type": ordertype.lower(),
                 "side": side.lower(),
-                "amount": amount,
+                "amount": float(amount),
                 "price": price,
+                "average": avg_fill_price if avg_fill_price > 0 else None,
                 "filled": filled,
                 "remaining": remaining,
-                "status": ft_status,
+                "cost": (filled * avg_fill_price if avg_fill_price > 0 else 0.0),
+                "status": "open",
+                "timeInForce": getattr(
+                    trade.order,
+                    "tif",
+                    None,
+                ),
                 "info": trade,
             }
 
-        # Handle filled orders
+        # ------------------------------------------------------------------
+        # Filled order.
+        # ------------------------------------------------------------------
         if ft_status == "closed":
-            logger.info(f"Order {oid} for {pair} filled {filled} / {amount}")
+            logger.info(
+                f"Order {oid} for {pair} filled {filled}/{amount} at average price {avg_fill_price}"
+            )
+
             return {
                 "id": oid,
                 "symbol": pair,
                 "type": ordertype.lower(),
                 "side": side.lower(),
-                "amount": amount,
+                "amount": float(amount),
                 "price": price,
+                "average": avg_fill_price,
                 "filled": filled,
                 "remaining": remaining,
-                "status": ft_status,
+                "cost": (filled * avg_fill_price if avg_fill_price > 0 else 0.0),
+                "status": "closed",
+                "timeInForce": getattr(
+                    trade.order,
+                    "tif",
+                    None,
+                ),
                 "info": trade,
             }
 
-        # Handle failed/canceled orders
+        # ------------------------------------------------------------------
+        # Failed / cancelled / inactive order.
+        # ------------------------------------------------------------------
         logger.warning(
             f"Order {oid} for {pair} failed with status: {status}. "
-            f"Reason: {trade.orderStatus.whyHeld}"
+            f"Filled={filled}, Remaining={remaining}, "
+            f"Reason={getattr(trade.orderStatus, 'whyHeld', '')}"
         )
+
         Trade.session.rollback()
+
         raise ExchangeError(f"Order for {pair} failed with status: {status}.")
 
     def get_rate(
@@ -996,6 +1319,7 @@ class Interactivebrokers(Foreignexchange):
             self.ib.disconnect()
         try:
             self.ib.connect(self.host, self.port, clientId=self.client_id)
+            self._resync_order_cache()
             logger.info("WebSocket connection reset")
             self._ws_connected = True
         except Exception as e:
@@ -1006,6 +1330,7 @@ class Interactivebrokers(Foreignexchange):
         if not self.ib.isConnected():
             try:
                 self.ib.connect(self.host, self.port, clientId=self.client_id)
+                self._resync_order_cache()
                 self._setup_event_loop()
                 self._ws_connected = True
                 logger.info("WebSocket started")
@@ -1270,7 +1595,7 @@ class Interactivebrokers(Foreignexchange):
         self.ensure_connected()
 
         orders: list[dict] = []
-        for o in self.ib.openOrders():
+        for o in self.ib.openTrades():
             # ——— Guard: skip anything that is not a full IB Trade object ———
             if (
                 not hasattr(o, "contract")
@@ -1511,6 +1836,26 @@ class Interactivebrokers(Foreignexchange):
 
             trade = order.trade
             if trade and trade.is_open:
+                # Safety check: never mark a Freqtrade trade closed just because we
+                # lost track of its order locally. Confirm with IBKR that the
+                # position for this pair is actually flat first — otherwise a
+                # stale/reconnect-related "not_found" can silently orphan a real,
+                # still-open position (it disappears from FreqUI but stays live
+                # on IBKR, and Freqtrade will then re-enter the pair on top of it).
+                base, quote = self._extract_currencies_from_pair(trade.pair)
+                still_open = any(
+                    p.contract.symbol == base
+                    and p.contract.currency == quote
+                    and float(p.position) != 0
+                    for p in self.ib.positions()
+                )
+                if still_open:
+                    logger.warning(
+                        f"Refusing to close trade for order {order_id} ({trade.pair}): "
+                        "IBKR still reports an open position for this pair."
+                    )
+                    return
+
                 trade.is_open = False
                 # Corrected attribute: 'average' instead of 'price_open'
                 trade.close_rate = order.average  # Previously order.price_open
@@ -1766,7 +2111,8 @@ class Interactivebrokers(Foreignexchange):
             time.sleep(backoff)
             try:
                 # adjust host/port/clientId to your settings
-                self.ib.connect(self.host, self.port, clientId=self.clientId)
+                self.ib.connect(self.host, self.port, clientId=self.client_id)
+                self._resync_order_cache()
                 logger.info("Reconnected to TWS successfully.")
                 return
             except Exception as e:
