@@ -97,12 +97,15 @@ Setup
   chmod u+x tws-latest-linux-x64.sh
   ./tws-latest-linux-x64.sh
 
+If TWS GUI is too small bug, edit the start menu launcher, (keep your path) with /home/x/Jts/tws -J-Dsun.java2d.uiScale=2 %U
+You also have to add currency pairs to TWS and transfer funds to them by typing them into Order Entry using a dot, they must match the Freqtrade config currency pairs.
+
 - In TWS settings:
   - Port: 4002 (paper) or 7497 (live)
   - Enable:
     - ActiveX & socket clients
     - Connections from localhost
-  - Disable: Read-only API
+  - Uncheck: Read-only API
 - Ensure your base currency is USD
 - Copy:
   - config_examples/forex_config.json → user_data/
