@@ -1572,20 +1572,23 @@ class Alpacastocks(Stockexchange):
             sleep_time = time_until_open - 300
             hours, rem = divmod(sleep_time, 3600)
             minutes, seconds = divmod(rem, 60)
+
             logger.info(
-                "US stock market is closed, sleeping for %d hours, %d minutes, and %.1f "
-                "seconds until 5 minutes before the next market opens.",
+                "\033[93mUS stock market is closed, sleeping for %d hours, %d minutes, "
+                "and %.1f seconds until 5 minutes before the next market opens. "
+                "Reminder, JPX (Japan) opens at 8:00 PM "
+                "and the SSE (China) and HKEX open at 9:30 PM\033[0m",
                 hours,
                 minutes,
                 seconds,
             )
             time.sleep(sleep_time)
-            return
-        logger.info(
-            "US stock market is closed, but opens in %.1f seconds; continuing with the "
-            "final pre-open refresh.",
-            max(0.0, time_until_open),
-        )
+        else:
+            logger.info(
+                "\033[93mUS stock market is closed, but opens in %.1f seconds; "
+                "continuing with the final pre-open refresh.\033[0m",
+                max(0.0, time_until_open),
+            )
 
     def _normalise_candle_key(self, item: Any) -> tuple[str, str, CandleType]:
         if isinstance(item, tuple) and len(item) >= 3:
