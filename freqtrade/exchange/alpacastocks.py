@@ -1,24 +1,60 @@
-# Alpaca exchange stock integration for FreqTrade
+"""Native Alpaca US-equity exchange adapter for the Freqtrade stock fork.
+
+This module intentionally bypasses CCXT.  It translates between the
+Freqtrade/CCXT-shaped interface used by the fork and Alpaca's native
+trading + market-data APIs.
+
+Supported trading model:
+    * US equities only
+    * spot / long-only
+    * market and limit orders
+    * DAY / GTC / OPG / CLS / IOC / FOK TIFs supported by Alpaca
+
+Important design rules:
+    * Freqtrade's ``dry_run`` never submits an Alpaca order.
+    * Stock balances are exposed as normal spot wallets (USD + shares).
+    * Stock market data uses ``StockDataStream``; order updates use
+      ``TradingStream``.
+    * Missing stock candles are NOT fabricated across market closures.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import math
-import sys
 import threading
 import time
-import warnings
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
-import pyarrow.feather as feather
 import requests
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
+from alpaca.data.enums import Adjustment, DataFeed
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.live.stock import StockDataStream
+from alpaca.data.requests import (
+    StockBarsRequest,
+    StockLatestQuoteRequest,
+    StockLatestTradeRequest,
+    StockTradesRequest,
+)
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetClass, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import (
+    AssetClass,
+    AssetStatus,
+    OrderSide,
+    QueryOrderStatus,
+    TimeInForce,
+)
+from alpaca.trading.models import Asset
 from alpaca.trading.requests import (
     GetAssetsRequest,
     GetOrdersRequest,
@@ -26,82 +62,143 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
 )
 from alpaca.trading.stream import TradingStream
-from dateutil.parser import isoparse
 
-from freqtrade.exceptions import OperationalException
+from freqtrade.enums import CandleType
+from freqtrade.exceptions import (
+    ConfigurationError,
+    ExchangeError,
+    InsufficientFundsError,
+    InvalidOrderException,
+    OperationalException,
+    PricingError,
+    TemporaryError,
+)
 from freqtrade.exchange.stockexchange import Stockexchange
 
 
-warnings.filterwarnings("ignore", message="The HMAC key is 3 bytes long")
-
 logger = logging.getLogger(__name__)
-
-_min_interval = 3.0  # throttle it by 1 call every 2 sec to avoid time bans
-_last_request_ts = 0.0
-
-
-def throttle():
-    global _last_request_ts
-    now = time.time()
-    elapsed = now - _last_request_ts
-    if elapsed < _min_interval:
-        time.sleep(_min_interval - elapsed)
-    _last_request_ts = time.time()
 
 
 class Alpacastocks(Stockexchange):
-    """
-    Alpacastocks exchange class. Contains adjustments needed for Freqtrade to work
-    with this exchange.
-    """
+    """Freqtrade adapter for Alpaca US equities."""
 
+    # Freqtrade/CCXT precision mode constants.  This adapter uses TICK_SIZE
+    # because Alpaca expresses quantity/price constraints as increments.
     DECIMAL_PLACES = 2
     SIGNIFICANT_DIGITS = 3
     TICK_SIZE = 4
-    MAX_DATA_DELAY = pd.Timedelta(minutes=1440)  # Allowed data delay during market hours
     PAIRLIST_FILE = "user_data/data/alpacastocks/alpaca_pairs.json"
-    _ft_has_default = {
+
+    # This is deliberately kept close to Freqtrade's capability vocabulary,
+    # but the adapter does not use CCXT itself.
+    _ft_has_default: dict[str, Any] = {
         "stoploss_on_exchange": False,
-        "order_time_in_force": ["GTC", "DAY"],
+        "order_time_in_force": ["GTC", "DAY", "IOC", "FOK", "OPG", "CLS"],
         "ohlcv_candle_limit": 10000,
         "ohlcv_has_history": True,
         "ohlcv_partial_candle": True,
         "ohlcv_require_since": False,
         "ohlcv_volume_currency": "base",
-        "tickers_have_quoteVolume": True,
-        "tickers_have_percentage": True,
+        "tickers_have_quoteVolume": False,
+        "tickers_have_percentage": False,
         "tickers_have_bid_ask": True,
         "tickers_have_price": True,
         "trades_limit": 1000,
         "trades_pagination": "time",
         "trades_pagination_arg": "since",
-        "trades_has_history": False,
-        "l2_limit_range": None,
-        "l2_limit_range_required": True,
-        "mark_ohlcv_price": "mark",
-        "mark_ohlcv_timeframe": "8h",
-        "funding_fee_timeframe": "8h",
-        "ccxt_futures_name": "swap",
-        "needs_trading_fees": True,
-        "order_props_in_contracts": ["amount", "filled", "remaining"],
-        "market_props_in_contracts": ["status"],
-        "market_has_ticker": False,
+        "trades_has_history": True,
+        "market_has_ticker": True,
         "market_has_ohlcv": True,
         "order_has_status": True,
         "order_has_type": True,
         "order_has_side": True,
-        "order_has_time_in_force": False,
+        "order_has_time_in_force": True,
         "order_has_price": True,
         "order_has_amount": True,
-        "order_has_cost": False,
-        "order_has_fee": True,
+        "order_has_cost": True,
+        # Alpaca trading API does not put an execution fee into the normal
+        # Order response for the simple stock orders this adapter supports.
+        "order_has_fee": False,
         "order_has_slippage": False,
         "order_has_filled": True,
         "order_has_remaining": True,
-        "order_has_status_history": False,
+        "order_statuses": {
+            "new": "open",
+            "pending_new": "open",
+            "accepted": "open",
+            "accepted_for_bidding": "open",
+            "partially_filled": "open",
+            "pending_cancel": "open",
+            "pending_replace": "open",
+            "calculated": "open",
+            "held": "open",
+            "filled": "closed",
+            "canceled": "canceled",
+            "cancelled": "canceled",
+            "expired": "canceled",
+            "rejected": "rejected",
+            "stopped": "canceled",
+            "suspended": "open",
+            # done_for_day is terminal. It may contain a partial fill, so use
+            # Freqtrade's canceled state while preserving filled/remaining.
+            "done_for_day": "canceled",
+            # replaced is normally followed by a new order id and therefore
+            # remains open until the replacement is observed.
+            "replaced": "canceled",
+        },
         "ws_enabled": True,
         "ws_auto_reconnect": True,
         "ws_reconnect_interval": 30,
+        "balance_includes_unrealized_pnl": False,
+        "contract_size": 1.0,
+    }
+
+    _METHOD_MAP = {
+        "fetchTicker": "fetch_ticker",
+        "fetchTickers": "fetch_tickers",
+        "fetchOHLCV": "fetch_ohlcv",
+        "fetchTrades": "fetch_trades",
+        "fetchOpenOrders": "fetch_open_orders",
+        "fetchOrders": "fetch_orders",
+        "fetchOrder": "fetch_order",
+        "fetchBalance": "fetch_balance",
+        "fetchPositions": "fetch_positions",
+        "createOrder": "create_order",
+        "createMarketOrder": "create_order",
+        "createLimitOrder": "create_order",
+        "cancelOrder": "cancel_order",
+        "cancelOrderWithResult": "cancel_order_with_result",
+        "watchTicker": "watch_ticker",
+        "watchOHLCV": "watch_ohlcv",
+        "watchTrades": "watch_trades",
+    }
+
+    _TF_MAP = {
+        "1m": TimeFrame(1, TimeFrameUnit.Minute),
+        "5m": TimeFrame(5, TimeFrameUnit.Minute),
+        "15m": TimeFrame(15, TimeFrameUnit.Minute),
+        "1h": TimeFrame(1, TimeFrameUnit.Hour),
+        "1d": TimeFrame(1, TimeFrameUnit.Day),
+    }
+
+    _TIF_MAP = {
+        "day": TimeInForce.DAY,
+        "gtc": TimeInForce.GTC,
+        "ioc": TimeInForce.IOC,
+        "fok": TimeInForce.FOK,
+        "opg": TimeInForce.OPG,
+        "cls": TimeInForce.CLS,
+    }
+
+    _TERMINAL_STATUSES = {
+        "filled",
+        "canceled",
+        "expired",
+        "rejected",
+        "stopped",
+        "suspended",
+        "done_for_day",
+        "replaced",
     }
 
     def __init__(
@@ -118,1276 +215,1248 @@ class Alpacastocks(Stockexchange):
             validate=validate,
             load_leverage_tiers=load_leverage_tiers,
         )
-        exchange_conf = exchange_config if exchange_config else config.get("exchange", {})
-        self.id = "alpacastocks"
 
-        self._entry_rate_cache: dict[str, float] = {}
-        self._exit_rate_cache: dict[str, float] = {}
-        self._cache_lock = threading.Lock()
+        self.config = config
+        exchange_conf = (
+            exchange_config if exchange_config is not None else config.get("exchange", {})
+        )
+        self.exchange_config = exchange_conf
+        self.id = "alpacastocks"
+        self.dry_run = bool(config.get("dry_run", False))
 
         self.key = exchange_conf.get("key")
         self.secret = exchange_conf.get("secret")
         if not self.key or not self.secret:
-            raise ValueError("API key and secret are required for Alpaca")
-        self.dry_run = config.get("dry_run", False)
-        if self.dry_run:
-            logger.info("Connecting to Alpaca paper trading.")
-        else:
-            logger.info("Connecting to Alpaca live trading.")
+            raise ConfigurationError("Alpaca API key and secret are required for alpacastocks.")
+
+        self.data_feed = self._parse_data_feed(
+            exchange_conf.get("data_feed", exchange_conf.get("feed", "iex"))
+        )
+        self.adjustment = self._parse_adjustment(exchange_conf.get("adjustment", "raw"))
+        self.extended_hours = bool(exchange_conf.get("extended_hours", False))
+        self.pairlist_file = Path(exchange_conf.get("pairlist_file", self.PAIRLIST_FILE))
+
+        # The stock adapter does not use CCXT's caches, so maintain the few
+        # pieces of state Freqtrade normally gets from Exchange.
+        self._ft_has = dict(self._ft_has_default)
+        self._markets: dict[str, dict[str, Any]] = {}
+        self._assets: dict[str, Asset] = {}
+        self._assets_lock = threading.RLock()
+        self._klines: dict[tuple[str, str, CandleType], pd.DataFrame] = {}
+        self._klines_lock = threading.RLock()
+
+        # Rate cache: (pair, is_short) -> (entry, exit, monotonic_time).
+        self._rate_cache: dict[tuple[str, bool], tuple[float, float, float]] = {}
+        self._rate_cache_ttl = float(exchange_conf.get("rate_cache_ttl", 5.0))
+        self._rate_cache_lock = threading.RLock()
+
+        # Dry-run orders never reach Alpaca.  Keep a small local order book so
+        # fetch_order/cancel_order continue to work with Freqtrade's state machine.
+        self._dry_orders: dict[str, dict[str, Any]] = {}
+        self._dry_order_lock = threading.RLock()
+
+        # Trading websocket is for account/order updates only.
+        self._trading_stream: TradingStream | None = None
+        self._trading_stream_thread: threading.Thread | None = None
+        self._stream_stop_events: list[threading.Event] = []
+        self._stream_threads: list[threading.Thread] = []
+        self._stream_clients: list[Any] = []
+        self._stream_lock = threading.RLock()
+        self._order_updates: dict[str, Any] = {}
+
+        self._market_open_cache: tuple[bool, float, float] | None = None
+
+        # Alpaca's trading client works against either paper or live endpoints.
         self.trading_client = TradingClient(self.key, self.secret, paper=self.dry_run)
         self.data_client = StockHistoricalDataClient(self.key, self.secret)
-        self.ws_client = None
-        self._ws_thread = None
-        self._last_market_state = None
-        if self._ft_has_default["ws_enabled"]:
-            self.setup_websocket()
+        self._trading_api_base_url = (
+            "https://paper-api.alpaca.markets" if self.dry_run else "https://api.alpaca.markets"
+        )
+        self._http_session = requests.Session()
 
         if "candle_type_def" not in self.config:
             self.config["candle_type_def"] = "spot"
-            logger.info("Set default candle_type_def to 'spot' for alpacastocks")
 
-    @property
-    def name(self):
-        return "alpacastocks"
-
-    def setup_websocket(self):
-        if (
-            self.ws_client is not None
-            and self._ws_thread is not None
-            and self._ws_thread.is_alive()
-        ):
-            logger.debug("WebSocket client already running.")
-            return
-
-        try:
-            self.ws_client = TradingStream(self.key, self.secret, paper=self.dry_run)
-            # Test authentication by trying to subscribe (this will fail if credentials are invalid)
-            self.ws_client.subscribe_trade_updates(self.handle_trade_update)
-            self._ws_thread = threading.Thread(target=self.ws_client.run, daemon=True)
-            self._ws_thread.start()
-        except Exception as e:
-            error_msg = str(e).lower()
-            if (
-                "authenticate" in error_msg
-                or "unauthorized" in error_msg
-                or "forbidden" in error_msg
-            ):
-                logger.error(
-                    "WebSocket authentication failed - Invalid API credentials. "
-                    "Please check your Alpaca API key and secret."
-                )
-                sys.exit(1)
-            logger.warning(f"WebSocket setup failed (non-auth error): {e}")
-
-    async def handle_trade_update(self, trade_update):
-        logger.info(f"Trade update received: {trade_update}")
-
-    def create_order(self, pair, ordertype, side, amount, price=None, params=None, **kwargs):
-        symbol = pair.split("/", 1)[0]
-        params = params or {}
-
-        try:
-            side_enum = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-
-            if ordertype == "market":
-                qty = round(amount, 6)
-                if qty <= 0:
-                    raise OperationalException(f"Invalid quantity: {qty}")
-
-                order_req = MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=side_enum,
-                    time_in_force=TimeInForce.DAY,
-                )
-
-            elif ordertype == "limit":
-                order_req = self._limit_order(
-                    symbol, side, side_enum, amount, price, params, kwargs
-                )
-
-            else:
-                raise OperationalException(f"Unsupported order type: {ordertype}")
-
-            return self._submit(order_req)
-
-        except APIError as e:
-            logger.error(f"Failed to create order: {e}")
-            raise OperationalException(f"Order rejected by Alpaca: {e}")
-
-    def _limit_order(self, symbol, side, side_enum, amount, price, params, kwargs):
-        # ---- quantity ----
-        available = self._get_available_qty(symbol)
-        raw_qty = min(amount, available)
-
-        precision = int(params.get("precision_amount", 6))
-        qty = math.floor(raw_qty * (10**precision)) / (10**precision)
-
-        if qty <= 0:
-            raise OperationalException(f"Available quantity too small ({available})")
-
-        # ---- base price ----
-        base_price = None
-
-        if price is not None:
-            base_price = float(price)
-        else:
-            try:
-                t = self.fetch_ticker(f"{symbol}/USD")
-                bid = float(t.get("bid") or 0)
-                ask = float(t.get("ask") or 0)
-                close = float(t.get("close") or 0)
-                base_price = (ask or close or bid) if side == "buy" else (bid or close or ask)
-            except Exception as e:
-                logger.debug(f"fetch_ticker failed for {symbol}: {e}", exc_info=True)
-
-        # fallback 1: candle
-        if not base_price or base_price <= 0:
-            try:
-                now = int(time.time() * 1000)
-                bars = self.get_historic_ohlcv(
-                    pair=f"{symbol}/USD",
-                    timeframe="1m",
-                    since=now - 60000,
-                    limit=1,
-                    params={},
-                )
-                if not bars.empty:
-                    base_price = float(bars.iloc[-1]["close"])
-            except Exception as e:
-                logger.debug(f"candle fallback failed for {symbol}: {e}", exc_info=True)
-
-        # fallback 2: get_rate
-        if (not base_price or base_price <= 0) and hasattr(self, "get_rate"):
-            try:
-                r = self.get_rate(f"{symbol}/USD")
-                if r and r > 0:
-                    base_price = float(r)
-            except Exception as e:
-                logger.debug(f"get_rate fallback failed for {symbol}: {e}", exc_info=True)
-
-        # ---- fallback to market ----
-        allow_market = params.get("allow_market_if_no_price", True)
-        is_initial = kwargs.get("initial_order", True)
-
-        if not base_price or base_price <= 0:
-            if (not is_initial) or allow_market:
-                logger.warning(f"No price for {symbol}, fallback to market")
-                return MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=side_enum,
-                    time_in_force=TimeInForce.DAY,
-                )
-            raise OperationalException(f"Cannot derive price for {symbol}")
-
-        # ---- limit price ----
-        offset = float(params.get("limit_price_offset", 0.01))
-        final_price = base_price - offset if side == "buy" else base_price + offset
-
-        return LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=side_enum,
-            limit_price=round(final_price, 2),
-            time_in_force=params.get("time_in_force", TimeInForce.DAY),
+        logger.info(
+            "Initialized alpacastocks (%s trading, feed=%s, adjustment=%s)",
+            "dry-run" if self.dry_run else "live",
+            self.data_feed.value,
+            self.adjustment.value,
         )
 
-    def _submit(self, order_req):
-        o = self.trading_client.submit_order(order_req)
+        # Initial market load is intentionally done for both dry-run and live:
+        # Alpaca remains the source of market metadata/data in dry-run; dry-run
+        # only suppresses trading orders.
+        self.reload_markets(force=True)
 
-        filled = float(o.filled_qty or 0)
-        qty = float(o.qty) if o.qty is not None else filled
+        if validate:
+            self.validate_config(config)
 
-        return {
-            "id": str(o.id),
-            "symbol": f"{o.symbol}/USD",
-            "type": o.order_type.value,
-            "side": "buy" if o.side == OrderSide.BUY else "sell",
-            "price": float(o.limit_price or 0),
-            "amount": qty,
-            "filled": filled,
-            "remaining": qty - filled,
-            "status": o.status.lower(),
-            "cost": filled * float(o.filled_avg_price or 0),
-            "info": o.dict() if hasattr(o, "dict") else str(o),
-        }
-
-    def cancel_order(self, order_id: str, pair: str = ""):
-        try:
-            self.trading_client.cancel_order_by_id(order_id)
-            return {"id": order_id, "status": "canceled", "info": {}}
-        except APIError as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
-            return None
-
-    def cancel_order_with_result(self, order_id: str, pair: str, amount: float) -> dict:
-        """
-        Cancel an order and return the result in a Freqtrade-compatible format.
-
-        :param order_id: The ID of the order to cancel.
-        :param pair: The trading pair (e.g., "AAPL/USD").
-        :param amount: The amount of the order to cancel.
-        :return: A dictionary with order details post cancellation.
-        """
-        try:
-            # Fetch the order to check its status
-            alpaca_order = self.trading_client.get_order_by_id(order_id)
-            alpaca_status = alpaca_order.status.lower()
-            logger.debug(f"Order {order_id} status before cancellation: {alpaca_status}")
-
-            # Define non-cancellable statuses
-            non_cancellable_statuses = [
-                "filled",
-                "canceled",
-                "expired",
-                "rejected",
-                "done_for_day",
-                "stopped",
-                "suspended",
-            ]
-            if alpaca_status in non_cancellable_statuses:
-                logger.info(
-                    f"Order {order_id} is in {alpaca_status} state and cannot be canceled."
-                    f"Returning order details."
-                )
-                raw_qty = alpaca_order.qty
-                raw_filled = alpaca_order.filled_qty
-                filled = float(raw_filled or 0)
-                qty = float(raw_qty) if raw_qty is not None else filled
-                remaining = qty - filled
-                order_type = alpaca_order.order_type.value.lower()
-                taker_or_maker = "taker" if order_type == "market" else "maker"
-                fee_rate = self.get_fee(pair, taker_or_maker=taker_or_maker)
-                filled_avg_price = float(alpaca_order.filled_avg_price or 0)
-                fee_cost = filled * filled_avg_price * fee_rate
-                filled_cost = filled * filled_avg_price
-                order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
-                result = {
-                    "id": str(alpaca_order.id),
-                    "symbol": pair,
-                    "type": order_type,
-                    "side": order_side,
-                    "price": float(alpaca_order.limit_price or filled_avg_price or 0),
-                    "amount": qty,
-                    "filled": filled,
-                    "remaining": remaining,
-                    "status": alpaca_status,
-                    "timestamp": pd.to_datetime(alpaca_order.submitted_at)
-                    .tz_convert("UTC")
-                    .timestamp()
-                    * 1000
-                    if alpaca_order.submitted_at
-                    else None,
-                    "datetime": alpaca_order.submitted_at.isoformat()
-                    if alpaca_order.submitted_at
-                    else None,
-                    "cost": filled_cost,
-                    "filled_cost": filled_cost,
-                    "fee": {
-                        "cost": fee_cost,
-                        "currency": "USD",
-                        "rate": fee_rate,
-                    },
-                    "info": dict(alpaca_order),
-                }
-                return result
-
-            # Attempt to cancel the order if it's in a cancellable state
-            self.trading_client.cancel_order_by_id(order_id)
-            # Fetch the order again to get updated status
-            alpaca_order = self.trading_client.get_order_by_id(order_id)
-            raw_qty = alpaca_order.qty
-            raw_filled = alpaca_order.filled_qty
-            filled = float(raw_filled or 0)
-            qty = float(raw_qty) if raw_qty is not None else filled
-            remaining = qty - filled
-            order_type = alpaca_order.order_type.value.lower()
-            taker_or_maker = "taker" if order_type == "market" else "maker"
-            fee_rate = self.get_fee(pair, taker_or_maker=taker_or_maker)
-            filled_avg_price = float(alpaca_order.filled_avg_price or 0)
-            fee_cost = filled * filled_avg_price * fee_rate
-            filled_cost = filled * filled_avg_price
-            order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
-            result = {
-                "id": str(alpaca_order.id),
-                "symbol": pair,
-                "type": order_type,
-                "side": order_side,
-                "price": float(alpaca_order.limit_price or filled_avg_price or 0),
-                "amount": qty,
-                "filled": filled,
-                "remaining": remaining,
-                "status": alpaca_order.status.lower(),
-                "timestamp": pd.to_datetime(alpaca_order.submitted_at).tz_convert("UTC").timestamp()
-                * 1000
-                if alpaca_order.submitted_at
-                else None,
-                "datetime": alpaca_order.submitted_at.isoformat()
-                if alpaca_order.submitted_at
-                else None,
-                "cost": filled_cost,
-                "filled_cost": filled_cost,
-                "fee": {
-                    "cost": fee_cost,
-                    "currency": "USD",
-                    "rate": fee_rate,
-                },
-                "info": dict(alpaca_order),
-            }
-            logger.info(f"Order {order_id} canceled successfully for pair {pair}")
-            return result
-        except APIError as e:
-            if 'order is already in "filled" state' in str(e):
-                logger.info(
-                    f"Order {order_id} is already filled,"
-                    f"skipping cancellation and returning order details."
-                )
-                alpaca_order = self.trading_client.get_order_by_id(order_id)
-                raw_qty = alpaca_order.qty
-                raw_filled = alpaca_order.filled_qty
-                filled = float(raw_filled or 0)
-                qty = float(raw_qty) if raw_qty is not None else filled
-                remaining = qty - filled
-                order_type = alpaca_order.order_type.value.lower()
-                taker_or_maker = "taker" if order_type == "market" else "maker"
-                fee_rate = self.get_fee(pair, taker_or_maker=taker_or_maker)
-                filled_avg_price = float(alpaca_order.filled_avg_price or 0)
-                fee_cost = filled * filled_avg_price * fee_rate
-                filled_cost = filled * filled_avg_price
-                order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
-                result = {
-                    "id": str(alpaca_order.id),
-                    "symbol": pair,
-                    "type": order_type,
-                    "side": order_side,
-                    "price": float(alpaca_order.limit_price or filled_avg_price or 0),
-                    "amount": qty,
-                    "filled": filled,
-                    "remaining": remaining,
-                    "status": alpaca_order.status.lower(),
-                    "timestamp": pd.to_datetime(alpaca_order.submitted_at)
-                    .tz_convert("UTC")
-                    .timestamp()
-                    * 1000
-                    if alpaca_order.submitted_at
-                    else None,
-                    "datetime": alpaca_order.submitted_at.isoformat()
-                    if alpaca_order.submitted_at
-                    else None,
-                    "cost": filled_cost,
-                    "filled_cost": filled_cost,
-                    "fee": {
-                        "cost": fee_cost,
-                        "currency": "USD",
-                        "rate": fee_rate,
-                    },
-                    "info": dict(alpaca_order),
-                }
-                return result
-            logger.error(f"Failed to cancel order {order_id} for pair {pair}: {e}")
-            raise OperationalException(f"Order cancellation failed: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error while canceling order {order_id}: {e}")
-            raise OperationalException(f"Unexpected error during order cancellation: {e}")
-
-    def fetch_order(self, order_id: str, symbol: str, params: dict | None = None) -> dict | None:
-        params = params or {}
-        if not isinstance(order_id, str) or not order_id.strip():
-            logger.warning(f"fetch_order called with invalid order_id: {order_id}")
-            return None
-        try:
-            alpaca_order = self.trading_client.get_order_by_id(order_id)
-            logger.debug(
-                f"Fetched order {order_id} for {symbol}: status={alpaca_order.status},"
-                f"qty={alpaca_order.qty}, filled_qty={alpaca_order.filled_qty}"
-            )
-        except Exception as e:
-            logger.error(f"Error fetching order with ID {order_id}: {e}")
-            return None
-
-        raw_qty = alpaca_order.qty
-        raw_filled = alpaca_order.filled_qty
-        filled = float(raw_filled or 0)
-        qty = float(raw_qty) if raw_qty is not None else filled
-
-        # Ensure remaining is 0 if fully filled
-        remaining = max(0.0, qty - filled)
-
-        order_type = alpaca_order.order_type.value.lower()
-        taker_or_maker = "taker" if order_type == "market" else "maker"
-        fee_rate = self.get_fee(symbol, taker_or_maker=taker_or_maker)
-        filled_avg_price = float(alpaca_order.filled_avg_price or 0)
-        fee_cost = filled * filled_avg_price * fee_rate
-        filled_cost = filled * filled_avg_price
-        order_side = "buy" if alpaca_order.side == OrderSide.BUY else "sell"
-
-        # Map Alpaca status to Freqtrade status
-        alpaca_status = alpaca_order.status.lower()
-        status_map = {
-            "new": "open",
-            "partially_filled": "open",
-            "filled": "closed",  # Mark as closed when fully filled
-            "done_for_day": "closed",
-            "canceled": "canceled",
-            "expired": "canceled",
-            "rejected": "canceled",
-            "pending_cancel": "canceled",
-            "pending_replace": "open",
-            "replaced": "open",
-            "stopped": "canceled",
-            "suspended": "canceled",
-        }
-        freqtrade_status = status_map.get(alpaca_status, "open")
-
-        # Force close if fully filled
-        if filled >= qty:
-            freqtrade_status = "closed"
-            remaining = 0.0
-
-        freqtrade_order = {
-            "id": str(alpaca_order.id),
-            "symbol": symbol,
-            "type": order_type,
-            "side": order_side,
-            "price": float(alpaca_order.limit_price or filled_avg_price or 0),
-            "amount": qty,
-            "filled": filled,
-            "remaining": remaining,
-            "status": freqtrade_status,
-            "timestamp": pd.to_datetime(alpaca_order.submitted_at).tz_convert("UTC").timestamp()
-            * 1000
-            if alpaca_order.submitted_at
-            else None,
-            "datetime": alpaca_order.submitted_at.isoformat()
-            if alpaca_order.submitted_at
-            else None,
-            "cost": filled_cost,
-            "filled_cost": filled_cost,
-            "fee": {
-                "cost": fee_cost,
-                "currency": "USD",
-                "rate": fee_rate,
-            },
-            "info": dict(alpaca_order),
-        }
-
-        logger.debug(f"Returning Freqtrade order: {freqtrade_order}")
-        return freqtrade_order
+        if self._ft_has_default["ws_enabled"]:
+            self.setup_websocket()
 
     @property
-    def markets(self):
+    def name(self) -> str:
+        return "alpacastocks"
+
+    @property
+    def markets(self) -> dict[str, dict[str, Any]]:
         return self._markets
 
-    def reload_markets(self) -> None:
-        self.get_markets(reload=True)
-
-    def get_fee(self, symbol, now=None, taker_or_maker="maker"):
-        fee = {"maker": 0.001, "taker": 0.002}
-        return fee.get(taker_or_maker, 0.001)
+    @property
+    def timeframes(self) -> list[str]:
+        return list(self._TF_MAP)
 
     @property
-    def precisionMode(self):
-        return self.DECIMAL_PLACES
+    def margin_mode(self):
+        """Freqtrade margin-mode contract for this spot-only adapter.
+
+        Alpaca US equities are handled as spot/long-only here, so there is no
+        crypto-style cross/isolated margin mode to expose. Returning ``None``
+        also makes the Freqtrade liquidation-price helper skip margin logic.
+        """
+        return None
 
     @property
-    def precision_mode_price(self):
-        return self.precisionMode
+    def precisionMode(self) -> int:
+        # Alpaca's stock constraints are increments (tick sizes), not a fixed
+        # number of decimal places. Freqtrade's TICK_SIZE mode preserves an
+        # increment such as 0.000000001 instead of converting it to int(0).
+        return self.TICK_SIZE
 
-    def validate_required_startup_candles(self, startup_candle_count, timeframe):
-        return True
+    @property
+    def precision_mode_price(self) -> int:
+        return self.TICK_SIZE
 
-    def get_proxy_coin(self):
+    def get_option(self, option: str, default: Any = None) -> Any:
+        return self._ft_has.get(option, default)
+
+    def exchange_has(self, method: str) -> bool:
+        """Map Freqtrade/CCXT capability names to native adapter methods."""
+        mapped = self._METHOD_MAP.get(method, method)
+        if (
+            method in {"watchTicker", "watchOHLCV", "watchTrades"}
+            and not self._ft_has["ws_enabled"]
+        ):
+            return False
+        return hasattr(self, mapped)
+
+    # ------------------------------------------------------------------
+    # Basic exchange/spot contract
+    # ------------------------------------------------------------------
+
+    def get_proxy_coin(self) -> str:
         return "USD"
 
-    def get_precision_price(self, pair):
-        return 8
+    def get_pair_base_currency(self, pair: str) -> str:
+        return self._split_pair(pair)[0]
 
-    def get_max_leverage(self, pair, stake_amount):
-        return 1
+    def get_pair_quote_currency(self, pair: str) -> str:
+        return self._split_pair(pair)[1]
+
+    def get_contract_size(self, pair: str) -> float:
+        return 1.0
+
+    def get_liquidation_price(
+        self,
+        pair: str,
+        amount: float,
+        current_price: float | None = None,
+        order_side: str | None = None,
+        order_type: str | None = None,
+        open_rate: float | None = None,
+        is_short: bool | None = None,
+        stake_amount: float | None = None,
+        leverage: float | None = None,
+        wallet_balance: float | None = None,
+        open_trades: list[Any] | None = None,
+    ) -> None:
+        """Return no liquidation price for spot equities.
+
+        Alpaca stocks are represented by this adapter as Freqtrade spot
+        positions with no futures-style liquidation price.  The fork's
+        liquidation helper still calls this method for spot trades, so the
+        method must exist and return ``None`` implicitly.
+        """
+
+    def _contracts_to_amount(self, pair: str, num_contracts: float) -> float:
+        return float(num_contracts)
+
+    def _amount_to_contracts(self, pair: str, amount: float) -> float:
+        return float(amount)
+
+    def amount_to_contract_precision(self, pair: str, amount: float) -> float:
+        return self.amount_to_precision(pair, amount)
+
+    def balance_includes_unrealized_pnl(self) -> bool:
+        # get_balances() reports cash, not account equity.
+        return False
+
+    def market_is_tradable(self, market: dict[str, Any]) -> bool:
+        return bool(market.get("spot") and market.get("tradable") and market.get("active"))
+
+    def validate_trading_mode_and_margin_mode(
+        self,
+        trading_mode: Any,
+        margin_mode: Any,
+        allow_none_margin_mode: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        if trading_mode and str(trading_mode).lower() != "spot":
+            raise OperationalException("alpacastocks supports spot/long-only trading only.")
+        if margin_mode not in (None, "", "none"):
+            raise OperationalException("alpacastocks does not expose crypto margin modes.")
+
+    def validate_required_startup_candles(self, startup_candle_count: int, timeframe: str) -> bool:
+        return timeframe in self._TF_MAP and startup_candle_count >= 0
+
+    # ------------------------------------------------------------------
+    # Markets / asset metadata
+    # ------------------------------------------------------------------
+
+    def reload_markets(self, force: bool = True, *, load_leverage_tiers: bool = False) -> None:
+        """Reload Alpaca asset metadata, honoring explicit force requests."""
+        del load_leverage_tiers
+        self.get_markets(reload=force)
+
+    def get_markets(
+        self,
+        reload: bool = False,
+        params: dict | None = None,
+        tradable_only: bool = False,
+        active_only: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        del params
+
+        if not reload and self._markets:
+            return self._filtered_markets(tradable_only, active_only)
+
+        if not reload and self.pairlist_file.exists():
+            age = time.time() - self.pairlist_file.stat().st_mtime
+            if age < 86400:
+                try:
+                    payload = json.loads(self.pairlist_file.read_text())
+                    if isinstance(payload, dict):
+                        self._markets = payload
+                        return self._filtered_markets(tradable_only, active_only)
+                except (OSError, ValueError, TypeError):
+                    logger.warning(
+                        "Ignoring unreadable Alpaca pairlist file %s", self.pairlist_file
+                    )
+
+        request = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
+        assets = self._api_call(
+            lambda: self.trading_client.get_all_assets(request), "get_all_assets"
+        )
+
+        with self._assets_lock:
+            self._assets = {asset.symbol.upper(): asset for asset in assets}
+            self._markets = self._build_markets(assets)
+
+        try:
+            self.pairlist_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pairlist_file.write_text(json.dumps(self._markets, indent=2, default=str))
+        except OSError as exc:
+            logger.warning("Unable to save Alpaca pairlist cache: %s", exc)
+
+        return self._filtered_markets(tradable_only, active_only)
+
+    def _filtered_markets(
+        self, tradable_only: bool, active_only: bool
+    ) -> dict[str, dict[str, Any]]:
+        markets = self._markets
+        if tradable_only:
+            markets = {k: v for k, v in markets.items() if v.get("tradable")}
+        if active_only:
+            markets = {k: v for k, v in markets.items() if v.get("active")}
+        return markets
+
+    def _build_markets(self, assets: list[Asset]) -> dict[str, dict[str, Any]]:
+        markets: dict[str, dict[str, Any]] = {}
+        for asset in assets:
+            symbol = asset.symbol.upper()
+            pair = f"{symbol}/USD"
+            price_increment = float(asset.price_increment or 0.01)
+            if asset.fractionable:
+                # Fractional stock orders support quantities down to 9 decimal
+                # places. The current equity Asset API may leave
+                # min_trade_increment/min_order_size unset, and those fields
+                # historically described crypto-only constraints.
+                raw_increment = self._as_float(getattr(asset, "min_trade_increment", None), 0.0)
+                qty_increment = raw_increment if 0.0 < raw_increment < 1.0 else 1e-9
+                min_qty = qty_increment
+                min_cost = 1.0
+            else:
+                raw_increment = self._as_float(getattr(asset, "min_trade_increment", None), 1.0)
+                qty_increment = max(1.0, raw_increment)
+                min_qty = max(1.0, self._as_float(getattr(asset, "min_order_size", None), 1.0))
+                min_cost = None
+            markets[pair] = {
+                "id": pair,
+                "symbol": pair,
+                "base": symbol,
+                "quote": "USD",
+                "spot": True,
+                "tradable": bool(asset.tradable),
+                "margin": bool(asset.marginable),
+                "active": self._enum_value(asset.status) == AssetStatus.ACTIVE.value,
+                "maker": 0.0,
+                "taker": 0.0,
+                "info": self._model_to_dict(asset),
+                "precision": {
+                    "amount": qty_increment,
+                    "price": price_increment,
+                },
+                "limits": {
+                    "amount": {"min": min_qty, "max": None},
+                    "price": {"min": price_increment, "max": None},
+                    "cost": {"min": min_cost, "max": None},
+                },
+                "future": False,
+                "swap": False,
+                "option": False,
+                "linear": False,
+                "inverse": False,
+                "contractSize": 1.0,
+                "market_type": "spot",
+            }
+        return markets
+
+    def _get_asset(self, symbol: str) -> Asset:
+        symbol = symbol.upper()
+        asset = self._assets.get(symbol)
+        if asset is not None:
+            return asset
+        try:
+            asset = self.trading_client.get_asset(symbol)
+        except APIError as exc:
+            raise OperationalException(f"Unable to get Alpaca asset {symbol}: {exc}") from exc
+        self._assets[symbol] = asset
+        return asset
+
+    # ------------------------------------------------------------------
+    # Precision / stake limits
+    # ------------------------------------------------------------------
+
+    def get_precision_price(self, pair: str) -> float:
+        return float(self.markets.get(pair, {}).get("precision", {}).get("price", 0.01))
+
+    def get_precision_amount(self, pair: str) -> float:
+        return float(self.markets.get(pair, {}).get("precision", {}).get("amount", 1.0))
+
+    def amount_to_precision(self, pair: str, amount: float) -> float:
+        increment = self.get_precision_amount(pair)
+        if increment <= 0:
+            return float(amount)
+        return self._round_down_increment(float(amount), increment)
+
+    def price_to_precision(
+        self, pair: str, price: float, *, rounding_mode: int | None = None
+    ) -> float:
+        del rounding_mode
+        increment = self.get_precision_price(pair)
+        if increment <= 0:
+            return float(price)
+        return self._round_down_increment(float(price), increment)
 
     def get_min_pair_stake_amount(
         self,
         pair: str,
         price: float | None = None,
-        amount: float | None = None,
-        side: str | None = None,
-        is_entry: bool = True,
+        stoploss: float = 0.0,
+        leverage: float = 1.0,
+        *args: Any,
         **kwargs: Any,
     ) -> float:
+        del stoploss, leverage, args, kwargs
+        p = float(price or self.get_rate(pair, side="entry", is_short=False, refresh=True))
+        limits = self.markets.get(pair, {}).get("limits", {})
+        min_amount = float((limits.get("amount") or {}).get("min") or 1.0)
+        min_cost = float((limits.get("cost") or {}).get("min") or 0.0)
+        return max(min_amount * p, min_cost)
+
+    def get_max_pair_stake_amount(
+        self,
+        pair: str,
+        price: float | None = None,
+        leverage: float = 1.0,
+        *args: Any,
+        **kwargs: Any,
+    ) -> float:
+        del pair, price, leverage, args, kwargs
+        return float("inf")
+
+    def get_max_leverage(self, pair: str, stake_amount: float | None = None) -> float:
+        del pair, stake_amount
         return 1.0
 
-    def get_max_pair_stake_amount(self, *args, **kwargs):
-        return 1000000
+    # ------------------------------------------------------------------
+    # Balances / positions
+    # ------------------------------------------------------------------
 
-    def get_pair_base_currency(self, pair: str) -> str:
-        return pair.split("/")[0]
+    def get_balances(self) -> dict[str, dict[str, float]]:
+        """Return normal spot balances: USD cash plus each stock's shares."""
+        if self.dry_run and self.config.get("runmode") not in ("live",):
+            return {}
 
-    def ws_connection_reset(self):
-        pass
+        account = self._api_call(self.trading_client.get_account, "get_account")
+        cash = self._as_float(account.cash, 0.0)
+        balances: dict[str, dict[str, float]] = {
+            "USD": {
+                "free": cash,
+                "used": 0.0,
+                "total": cash,
+            }
+        }
 
-    def get_pair_quote_currency(self, pair):
-        return pair.split("/")[1]
+        positions = self._api_call(self.trading_client.get_all_positions, "get_all_positions")
+        for pos in positions:
+            qty = abs(self._as_float(pos.qty, 0.0))
+            qty_available = abs(self._as_float(pos.qty_available, qty))
+            if qty <= 0:
+                continue
+            used = max(0.0, qty - qty_available)
+            balances[pos.symbol.upper()] = {
+                "free": qty_available,
+                "used": used,
+                "total": qty,
+            }
+        return balances
 
-    def get_contract_size(self, pair):
-        return 1
+    def fetch_balance(self, params: dict | None = None) -> dict[str, dict[str, float]]:
+        del params
+        return self.get_balances()
 
-    def get_precision_amount(self, pair):
-        return 8
-
-    @property
-    def margin_mode(self):
-        return None
-
-    def get_liquidation_price(
-        self,
-        pair,
-        amount,
-        current_price=None,
-        order_side=None,
-        order_type=None,
-        open_rate=None,
-        is_short=None,
-        stake_amount=None,
-        leverage=None,
-        wallet_balance=None,
-    ):
-        return None
-
-    def update_liquidation_prices(self, trade, row):
-        try:
-            liquidation_price = self.get_liquidation_price(
-                pair=trade.pair,
-                current_price=row["close"],
-                order_side=trade.order_side,
-                amount=trade.amount,
-                order_type=None,
-                open_rate=row["open"],
-                is_short=None,
-                stake_amount=None,
-                leverage=None,
-                wallet_balance=None,
+    def fetch_positions(
+        self, symbols: list[str] | None = None, params: dict | None = None
+    ) -> list[dict[str, Any]]:
+        del params
+        positions = self._api_call(self.trading_client.get_all_positions, "get_all_positions")
+        allowed = {s.split("/", 1)[0].upper() for s in symbols} if symbols else None
+        result: list[dict[str, Any]] = []
+        for position in positions:
+            if allowed is not None and position.symbol.upper() not in allowed:
+                continue
+            qty = self._as_float(position.qty, 0.0)
+            if qty == 0:
+                continue
+            side = "short" if qty < 0 else "long"
+            quantity = abs(qty)
+            market_value = abs(self._as_float(position.market_value, 0.0))
+            result.append(
+                {
+                    "symbol": f"{position.symbol.upper()}/USD",
+                    "amount": quantity,
+                    "contracts": quantity,
+                    "contractSize": 1.0,
+                    "side": side,
+                    # Kept populated because the fork's Wallets parser expects
+                    # the futures-shaped key.  It is not used as collateral for
+                    # spot trading because trading_mode remains spot.
+                    "collateral": market_value,
+                    "initialMargin": market_value,
+                    "leverage": 1.0,
+                    "unrealizedPnl": self._as_float(position.unrealized_pl, 0.0),
+                    "currentPrice": self._as_float(position.current_price, 0.0),
+                    "avgEntryPrice": self._as_float(position.avg_entry_price, 0.0),
+                    "qtyAvailable": self._as_float(position.qty_available, quantity),
+                    "info": self._model_to_dict(position),
+                }
             )
-            if liquidation_price is not None:
-                trade.liquidation_price = liquidation_price
-        except Exception as e:
-            logger.error(f"Failed to update liquidation price: {str(e)}")
+        return result
 
-    def market_is_tradable(self, market):
-        return market.get("tradable", False) and market.get("spot", False)
+    # ------------------------------------------------------------------
+    # Pricing / ticker
+    # ------------------------------------------------------------------
 
-    def validate_timeframes(self, timeframes):
-        if isinstance(timeframes, str):
-            timeframes = [timeframes]
-        supported_timeframes = ["1m", "5m", "15m", "1h", "1d"]
-        logger.info(f"Validating timeframes: {timeframes}")
-        for timeframe in timeframes:
-            logger.info(f"Validating timeframe: {timeframe}")
-            if timeframe not in supported_timeframes:
-                raise ValueError(f"Timeframe '{timeframe}' is not supported by Alpaca.")
+    def fetch_ticker(self, pair: str, params: dict | None = None) -> dict[str, Any]:
+        del params
+        symbol = self._pair_symbol(pair)
 
-    def convert_timeframe(self, timeframe):
-        conversion_map = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "1d": "1Day"}
-        return conversion_map.get(timeframe, timeframe)
-
-    def get_option(self, option, default=None):
-        return self._ft_has_default.get(option, default)
-
-    def get_historical_bars(
-        self,
-        symbols: list[str],
-        timeframe: str,
-        start: str,
-        end: str,
-        limit: int = 1000,
-        adjustment: str = "raw",
-        feed: str = "iex",
-        currency: str = "USD",
-    ) -> dict:
-        """
-        Fetch *all* bars from Alpaca Data API between start/end by
-        paging through `next_page_token`. Returns a dict with a top-level
-        'bars' key mapping each symbol to its list of bars.
-        """
-        url = "https://data.alpaca.markets/v2/stocks/bars"
-        params = {
-            "symbols": ",".join(symbols),
-            "timeframe": self.convert_timeframe(timeframe),
-            "limit": limit,
-            "adjustment": adjustment,
-            "feed": feed,
-            "currency": currency,
-            "start": start,
-            "end": end,
-        }
-        headers = {
-            "APCA-API-KEY-ID": self.key,
-            "APCA-API-SECRET-KEY": self.secret,
-        }
-
-        all_bars: dict[str, list] = {s: [] for s in symbols}
-        page_token: str | None = None
-
-        while True:
-            if page_token:
-                params["page_token"] = page_token
-
-            throttle()
-            resp = requests.get(url, headers=headers, params=params, timeout=30)
-            try:
-                resp.raise_for_status()
-            except requests.HTTPError as e:
-                logger.error(f"HTTP error fetching historical bars: {e}")
-                break
-
-            data = resp.json()
-            # Accumulate bars for each symbol
-            for sym, bars in data.get("bars", {}).items():
-                all_bars.setdefault(sym, []).extend(bars)
-
-            # Next page?
-            page_token = data.get("next_page_token")
-            if not page_token:
-                break
-
-        logger.info(
-            f"Fetched {sum(len(v) for v in all_bars.values())} bars "
-            f"for {symbols} from {start} to {end}"
+        quote = self._api_call(
+            lambda: self.data_client.get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=self.data_feed)
+            ),
+            f"latest quote {symbol}",
+        )
+        trade = self._api_call(
+            lambda: self.data_client.get_stock_latest_trade(
+                StockLatestTradeRequest(symbol_or_symbols=symbol, feed=self.data_feed)
+            ),
+            f"latest trade {symbol}",
         )
 
-        # **Wrap** under the 'bars' key so Freqtrade can find it:
-        return {"bars": all_bars}
+        quote_obj = quote.get(symbol) if hasattr(quote, "get") else None
+        trade_obj = trade.get(symbol) if hasattr(trade, "get") else None
+
+        bid = self._as_float(getattr(quote_obj, "bid_price", None), 0.0)
+        ask = self._as_float(getattr(quote_obj, "ask_price", None), 0.0)
+        bid_size = self._as_float(getattr(quote_obj, "bid_size", None), 0.0)
+        ask_size = self._as_float(getattr(quote_obj, "ask_size", None), 0.0)
+        last = self._as_float(getattr(trade_obj, "price", None), 0.0)
+        timestamp = getattr(trade_obj, "timestamp", None) or getattr(quote_obj, "timestamp", None)
+        ts_ms = (
+            self._datetime_to_ms(timestamp) if timestamp is not None else int(time.time() * 1000)
+        )
+
+        if last <= 0 and bid > 0 and ask > 0:
+            last = (bid + ask) / 2.0
+        if last <= 0:
+            raise PricingError(f"Alpaca returned no usable price for {pair}.")
+
+        return {
+            "symbol": pair,
+            "timestamp": ts_ms,
+            "datetime": datetime.fromtimestamp(ts_ms / 1000, UTC).isoformat(),
+            "last": last,
+            "close": last,
+            "bid": bid or None,
+            "ask": ask or None,
+            "bidVolume": bid_size or None,
+            "askVolume": ask_size or None,
+            "open": None,
+            "high": None,
+            "low": None,
+            "baseVolume": None,
+            "quoteVolume": None,
+            "percentage": None,
+            "info": {
+                "quote": self._model_to_dict(quote_obj),
+                "trade": self._model_to_dict(trade_obj),
+            },
+        }
+
+    def fetch_tickers(
+        self, symbols: list[str] | None = None, params: dict | None = None
+    ) -> dict[str, dict[str, Any]]:
+        del params
+        pairs = symbols or list(self._markets)
+        return {pair: self.fetch_ticker(pair) for pair in pairs}
+
+    def get_rate(
+        self,
+        pair: str,
+        side: str | None = None,
+        is_short: bool = False,
+        refresh: bool = True,
+        *args: Any,
+        **kwargs: Any,
+    ) -> float:
+        del args, kwargs
+        key = (pair, bool(is_short))
+        now = time.monotonic()
+        if not refresh:
+            with self._rate_cache_lock:
+                cached = self._rate_cache.get(key)
+            if cached and now - cached[2] <= self._rate_cache_ttl:
+                return cached[0] if side == "entry" else cached[1]
+
+        ticker = self.fetch_ticker(pair)
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        last = float(ticker.get("last") or 0.0)
+
+        if side == "entry":
+            rate = (bid if is_short else ask) or last
+        elif side == "exit":
+            rate = (ask if is_short else bid) or last
+        else:
+            rate = last or (bid + ask) / 2.0
+
+        if rate <= 0:
+            raise PricingError(f"Could not determine a usable rate for {pair}.")
+
+        with self._rate_cache_lock:
+            previous = self._rate_cache.get(key)
+            entry = rate if side == "entry" or previous is None else previous[0]
+            exit_rate = rate if side == "exit" or previous is None else previous[1]
+            if side is None:
+                entry = rate
+                exit_rate = rate
+            self._rate_cache[key] = (entry, exit_rate, now)
+
+        return rate
+
+    def get_rates(self, pair: str, refresh: bool, is_short: bool) -> tuple[float, float]:
+        key = (pair, bool(is_short))
+        now = time.monotonic()
+        with self._rate_cache_lock:
+            cached = self._rate_cache.get(key)
+        if not refresh and cached and now - cached[2] <= self._rate_cache_ttl:
+            return cached[0], cached[1]
+
+        ticker = self.fetch_ticker(pair)
+        bid = float(ticker.get("bid") or 0.0)
+        ask = float(ticker.get("ask") or 0.0)
+        last = float(ticker.get("last") or 0.0)
+        if bid <= 0 and ask <= 0 and last <= 0:
+            raise PricingError(f"Could not determine rates for {pair}.")
+        entry = (bid if is_short else ask) or last
+        exit_rate = (ask if is_short else bid) or last
+        with self._rate_cache_lock:
+            self._rate_cache[key] = (entry, exit_rate, now)
+        return entry, exit_rate
+
+    def get_conversion_rate(self, base: str, quote: str) -> float:
+        """Return the market value of one unit of ``base`` in ``quote``.
+
+        Stocks in this adapter are USD-quoted pairs, so converting e.g.
+        TSLA -> USD is simply the current TSLA/USD market price.  This is
+        used by Freqtrade RPC/UI for fiat valuation of stock-denominated
+        amounts.
+        """
+        base = base.upper()
+        quote = quote.upper()
+        if base == quote:
+            return 1.0
+        if quote == "USD":
+            pair = f"{base}/USD"
+            ticker = self.fetch_ticker(pair)
+            bid = float(ticker.get("bid") or 0.0)
+            ask = float(ticker.get("ask") or 0.0)
+            last = float(ticker.get("last") or 0.0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+            if last > 0:
+                return last
+            raise PricingError(f"No current USD conversion rate available for {base}.")
+        raise PricingError(f"alpacastocks cannot convert {base} to {quote}.")
+
+    # ------------------------------------------------------------------
+    # Orders
+    # ------------------------------------------------------------------
+
+    def create_order(
+        self,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        rate: float | None = None,
+        leverage: float = 1.0,
+        reduceOnly: bool = False,
+        time_in_force: str = "DAY",
+        initial_order: bool = True,
+        params: dict | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Create a native Alpaca stock order with Freqtrade semantics."""
+        del leverage, reduceOnly, initial_order
+        params = params or {}
+        symbol = self._pair_symbol(pair)
+        side_text = self._validate_order_side(side, amount)
+        order_kind = ordertype.lower()
+        tif = self._parse_tif(time_in_force)
+        extended_hours = bool(params.get("extended_hours", self.extended_hours))
+        client_order_id = params.get("client_order_id") or kwargs.get("client_order_id")
+        asset = self._get_asset(symbol)
+
+        if self.dry_run:
+            return self._create_dry_order(
+                pair=pair,
+                ordertype=order_kind,
+                side=side_text,
+                amount=amount,
+                rate=rate,
+                tif=tif,
+                extended_hours=extended_hours,
+            )
+
+        self._validate_asset_for_order(asset, symbol)
+        tif, extended_hours = self._prepare_order_terms(
+            asset, order_kind, amount, tif, extended_hours, symbol
+        )
+        qty = self._normalize_order_quantity(asset, amount, order_kind)
+        self._validate_order_notional(asset, pair, qty, rate, side_text, order_kind)
+        self._validate_sell_quantity(symbol, side_text, qty)
+        request = self._build_order_request(
+            asset=asset,
+            symbol=symbol,
+            order_kind=order_kind,
+            side=side_text,
+            qty=qty,
+            rate=rate,
+            tif=tif,
+            extended_hours=extended_hours,
+            client_order_id=client_order_id,
+        )
+        submitted = self._api_call(
+            lambda: self.trading_client.submit_order(request),
+            f"submit {order_kind} {side_text} {symbol}",
+            order_exception=True,
+        )
+        return self._normalize_order(submitted, pair, requested_rate=rate)
+
+    @staticmethod
+    def _validate_order_side(side: str, amount: float) -> str:
+        side_text = side.lower()
+        if side_text not in {"buy", "sell"}:
+            raise InvalidOrderException(f"Unsupported stock order side: {side}")
+        if amount <= 0:
+            raise InvalidOrderException(f"Order amount must be positive: {amount}")
+        return side_text
+
+    @staticmethod
+    def _validate_asset_for_order(asset: Asset, symbol: str) -> None:
+        if not asset.tradable or asset.status != AssetStatus.ACTIVE:
+            raise InvalidOrderException(f"Alpaca asset {symbol} is not tradable/active.")
+
+    def _prepare_order_terms(
+        self,
+        asset: Asset,
+        order_kind: str,
+        amount: float,
+        tif: TimeInForce,
+        extended_hours: bool,
+        symbol: str,
+    ) -> tuple[TimeInForce, bool]:
+        if (
+            order_kind == "limit"
+            and asset.fractionable
+            and not self._is_whole_quantity(amount)
+            and tif != TimeInForce.DAY
+        ):
+            logger.warning(
+                "Alpaca fractional limit order for %s requires DAY time-in-force; "
+                "normalizing requested TIF %s to DAY (requested qty=%s).",
+                symbol,
+                self._enum_value(tif),
+                amount,
+            )
+            tif = TimeInForce.DAY
+
+        if (
+            extended_hours
+            and asset.fractionable
+            and not self._is_whole_quantity(amount)
+            and not bool(getattr(asset, "fractional_eh_enabled", False))
+        ):
+            raise InvalidOrderException(
+                f"Fractional extended-hours trading is not enabled for {symbol}."
+            )
+        return tif, extended_hours
+
+    def _validate_order_notional(
+        self,
+        asset: Asset,
+        pair: str,
+        qty: float,
+        rate: float | None,
+        side: str,
+        order_kind: str,
+    ) -> None:
+        if not asset.fractionable or order_kind not in {"market", "limit"}:
+            return
+        reference_price = (
+            rate
+            if rate is not None
+            else self.get_rate(pair, side="entry" if side == "buy" else "exit", refresh=True)
+        )
+        if qty * float(reference_price) < 1.0 - 1e-9:
+            raise InvalidOrderException(
+                f"Fractional Alpaca stock order for {asset.symbol} is below the $1 "
+                f"minimum notional: qty={qty}, price={reference_price}."
+            )
+
+    def _validate_sell_quantity(self, symbol: str, side: str, qty: float) -> None:
+        if side != "sell":
+            return
+        available = self._get_available_qty(symbol)
+        if qty > available + 1e-12:
+            raise InsufficientFundsError(
+                f"Not enough {symbol} shares available to sell {qty}; available={available}."
+            )
+
+    def _build_order_request(
+        self,
+        asset: Asset,
+        symbol: str,
+        order_kind: str,
+        side: str,
+        qty: float,
+        rate: float | None,
+        tif: TimeInForce,
+        extended_hours: bool,
+        client_order_id: str | None,
+    ) -> Any:
+        side_enum = OrderSide.BUY if side == "buy" else OrderSide.SELL
+        if order_kind == "market":
+            return MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=side_enum,
+                time_in_force=tif,
+                extended_hours=extended_hours,
+                client_order_id=client_order_id,
+            )
+        if order_kind == "limit":
+            if rate is None or rate <= 0:
+                raise PricingError(f"A limit order for {symbol} requires a positive rate.")
+            limit_price = self._normalize_price(asset, rate)
+            if limit_price <= 0:
+                raise InvalidOrderException(f"Invalid limit price {rate} for {symbol}")
+            return LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=side_enum,
+                time_in_force=tif,
+                limit_price=limit_price,
+                extended_hours=extended_hours,
+                client_order_id=client_order_id,
+            )
+        raise InvalidOrderException(
+            f"Unsupported Alpaca stock order type: {order_kind}. Supported: market, limit."
+        )
+
+    def fetch_order(self, order_id: str, symbol: str, params: dict | None = None) -> dict[str, Any]:
+        del params
+        if not order_id:
+            raise InvalidOrderException("Order id is required.")
+
+        if self.dry_run:
+            return self._fetch_dry_order(order_id, symbol)
+
+        try:
+            order = self.trading_client.get_order_by_id(order_id)
+        except APIError as exc:
+            message = str(exc).lower()
+            if "not found" in message or "404" in message:
+                raise InvalidOrderException(f"Alpaca order {order_id} was not found.") from exc
+            raise self._translate_api_error(exc, f"fetch order {order_id}") from exc
+        return self._normalize_order(order, symbol)
+
+    def check_order_canceled_empty(self, order: dict[str, Any]) -> bool:
+        """Return True when an order terminated without any fills.
+
+        Freqtrade uses this distinction to delete/timeout an entry order immediately
+        when it was canceled or otherwise reached a terminal state with zero fills.
+        A partially filled terminal order must return False so its filled quantity
+        is preserved and processed by Freqtrade.
+        """
+        if not isinstance(order, dict):
+            return False
+
+        status = str(order.get("status") or "").lower()
+        filled = float(order.get("filled") or 0.0)
+
+        return status in {
+            "canceled",
+            "cancelled",
+            "expired",
+            "rejected",
+            "stopped",
+            "done_for_day",
+            "replaced",
+        } and math.isclose(filled, 0.0, abs_tol=1e-12)
+
+    def cancel_order(
+        self, order_id: str, pair: str = "", params: dict | None = None
+    ) -> dict[str, Any]:
+        del params
+        if self.dry_run:
+            with self._dry_order_lock:
+                order = self._dry_orders.get(order_id)
+                if not order:
+                    raise InvalidOrderException(f"Dry-run order {order_id} not found.")
+                if order["status"] == "open":
+                    order["status"] = "canceled"
+                    order["remaining"] = max(0.0, order["amount"] - order["filled"])
+                return dict(order)
+
+        try:
+            self.trading_client.cancel_order_by_id(order_id)
+            # A cancel request is asynchronous. Return the actual order state;
+            # pending_cancel remains "open" until Alpaca confirms the terminal state.
+            return self.fetch_order(order_id, pair)
+        except APIError as exc:
+            message = str(exc).lower()
+            if 'already in "filled" state' in message or "already filled" in message:
+                return self.fetch_order(order_id, pair)
+            raise InvalidOrderException(f"Could not cancel Alpaca order {order_id}: {exc}") from exc
+
+    def cancel_order_with_result(self, order_id: str, pair: str, amount: float) -> dict[str, Any]:
+        try:
+            return self.cancel_order(order_id, pair)
+        except InvalidOrderException:
+            try:
+                return self.fetch_order(order_id, pair)
+            except InvalidOrderException:
+                return {
+                    "id": order_id,
+                    "symbol": pair,
+                    "type": "limit",
+                    "side": "sell",
+                    "amount": amount,
+                    "filled": 0.0,
+                    "remaining": amount,
+                    "status": "canceled",
+                    "price": None,
+                    "average": None,
+                    "cost": 0.0,
+                    "fee": None,
+                    "info": {},
+                }
+
+    def fetch_open_orders(
+        self,
+        symbol: str | None = None,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        del params
+        if self.dry_run:
+            with self._dry_order_lock:
+                orders = [o for o in self._dry_orders.values() if o["status"] == "open"]
+            if symbol:
+                base = self._pair_symbol(symbol)
+                orders = [o for o in orders if o["symbol"] == f"{base}/USD"]
+            if since is not None:
+                orders = [o for o in orders if o.get("timestamp", 0) >= since]
+            return orders[:limit] if limit else orders
+
+        after = self._ms_to_datetime(since) if since else None
+        alpaca_filter = GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            limit=min(int(limit), 500) if limit else None,
+            after=after,
+            symbols=[self._pair_symbol(symbol)] if symbol else None,
+        )
+        try:
+            orders = self.trading_client.get_orders(alpaca_filter)
+        except APIError as exc:
+            raise self._translate_api_error(exc, "fetch open orders") from exc
+        return [self._normalize_order(o, f"{o.symbol}/USD") for o in orders]
+
+    def fetch_orders(
+        self,
+        pair: str,
+        since: int | datetime | None = None,
+        params: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        del params
+        if self.dry_run:
+            with self._dry_order_lock:
+                orders = list(self._dry_orders.values())
+            orders = [o for o in orders if o["symbol"] == pair]
+            if since:
+                since_ms = (
+                    int(since.timestamp() * 1000) if isinstance(since, datetime) else int(since)
+                )
+                orders = [o for o in orders if o.get("timestamp", 0) >= since_ms]
+            return orders
+
+        after = None
+        if since:
+            after = since if isinstance(since, datetime) else self._ms_to_datetime(int(since))
+        symbol = self._pair_symbol(pair)
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            limit=500,
+            after=after,
+            symbols=[symbol],
+        )
+        try:
+            orders = self.trading_client.get_orders(request)
+        except APIError as exc:
+            raise self._translate_api_error(exc, f"fetch orders {pair}") from exc
+        return [self._normalize_order(o, pair) for o in orders]
+
+    # ------------------------------------------------------------------
+    # Fees / fills
+    # ------------------------------------------------------------------
+
+    def get_fee(self, symbol: str, now: Any = None, taker_or_maker: str | None = None) -> float:
+        del symbol, now, taker_or_maker
+        # No maker/taker fee is assumed.  Actual broker/account fees and
+        # regulatory charges are not synthesized into a crypto-style rate.
+        return 0.0
+
+    def order_has_fee(self, order: dict[str, Any]) -> bool:
+        del order
+        return False
+
+    def get_funding_fees(
+        self,
+        pair: str,
+        amount: float,
+        is_short: bool = False,
+        open_date: datetime | None = None,
+        **kwargs: Any,
+    ) -> float:
+        """Return funding fees for a position.
+
+        Equities in this adapter are spot positions, not perpetual/futures
+        contracts, so there is no periodic funding payment.  Freqtrade still
+        calls this method from the generic exit path, hence the explicit
+        zero rather than leaving the method undefined.
+        """
+        del pair, amount, is_short, open_date, kwargs
+        return 0.0
+
+    def get_order_id_conditional(self, order: dict[str, Any]) -> str:
+        """Return the exchange order id used for fill/fee lookup.
+
+        Freqtrade calls this before querying execution trades.  Alpaca stock
+        orders do not use a separate conditional/stop-loss id in this adapter,
+        so the normal order ``id`` is always the correct identifier.
+        """
+        if not isinstance(order, dict):
+            raise InvalidOrderException("Invalid order object: expected a dictionary.")
+        order_id = order.get("id")
+        if not order_id:
+            raise InvalidOrderException("Order object does not contain an id.")
+        return str(order_id)
+
+    def get_trades_for_order(
+        self,
+        order_id: str,
+        symbol: str,
+        since: int | datetime | dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Return Alpaca execution fills for a single order in Freqtrade format."""
+        del kwargs
+        since, params = self._normalise_fill_args(since, params)
+        symbol = self._normalise_pair_string(symbol)
+        if not order_id:
+            raise InvalidOrderException("Order id is required for fill lookup.")
+
+        if self.dry_run:
+            return self._dry_order_fills(order_id, symbol)
+
+        query = self._build_fill_query(order_id, since, params)
+        return self._fetch_fill_activities(order_id, symbol, query)
+
+    @staticmethod
+    def _normalise_fill_args(
+        since: int | datetime | dict[str, Any] | None,
+        params: dict[str, Any] | None,
+    ) -> tuple[int | datetime | None, dict[str, Any] | None]:
+        if isinstance(since, dict):
+            if params is not None:
+                raise TypeError("Fill lookup accepts either since-as-params or params, not both.")
+            return None, since
+        return since, params
+
+    def _dry_order_fills(self, order_id: str, symbol: str) -> list[dict[str, Any]]:
+        with self._dry_order_lock:
+            order = self._dry_orders.get(order_id)
+        if not order:
+            return []
+        filled = float(order.get("filled") or 0.0)
+        if filled <= 0:
+            return []
+        average = float(order.get("average") or order.get("price") or 0.0)
+        timestamp = int(
+            order.get("lastTradeTimestamp") or order.get("timestamp") or time.time() * 1000
+        )
+        return [
+            {
+                "id": f"{order_id}:fill",
+                "timestamp": timestamp,
+                "datetime": datetime.fromtimestamp(timestamp / 1000, UTC).isoformat(),
+                "symbol": symbol,
+                "side": str(order.get("side") or "buy").lower(),
+                "price": average,
+                "amount": filled,
+                "cost": filled * average,
+                "fee": None,
+                "fees": [],
+                "order": order_id,
+                "info": {"dry_run": True},
+            }
+        ]
+
+    def _build_fill_query(
+        self,
+        order_id: str,
+        since: int | datetime | None,
+        params: dict | None,
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {
+            "activity_types": "FILL",
+            "order_id": order_id,
+            "page_size": 100,
+            "direction": "asc",
+        }
+        if since is not None:
+            since_dt = (
+                self._ms_to_datetime(int(since)) if isinstance(since, (int, float)) else since
+            )
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=UTC)
+            query["after"] = since_dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        if params:
+            for key in ("page_size", "direction"):
+                if key in params:
+                    query[key] = params[key]
+        return query
+
+    def _fetch_fill_activities(
+        self,
+        order_id: str,
+        symbol: str,
+        query: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        fills: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            payload = self._request_fill_page(order_id, query, page_token)
+            for activity in payload:
+                fill = self._activity_to_fill(activity, order_id, symbol, len(fills))
+                if fill is not None:
+                    fills.append(fill)
+            page_size = int(query.get("page_size") or 100)
+            if len(payload) < page_size:
+                break
+            last_id = payload[-1].get("id") if payload else None
+            if not last_id or str(last_id) == str(page_token):
+                break
+            page_token = str(last_id)
+        fills.sort(key=lambda item: (item["timestamp"], item["id"]))
+        return fills
+
+    def _request_fill_page(
+        self,
+        order_id: str,
+        query: dict[str, Any],
+        page_token: str | None,
+    ) -> list[dict[str, Any]]:
+        request_params = dict(query)
+        if page_token:
+            request_params["page_token"] = page_token
+        try:
+            self._throttle()
+            response = self._http_session.get(
+                f"{self._trading_api_base_url}/v2/account/activities",
+                headers={
+                    "APCA-API-KEY-ID": self.key,
+                    "APCA-API-SECRET-KEY": self.secret,
+                },
+                params=request_params,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            status_code = getattr(response, "status_code", None)
+            message = response.text[:500] if hasattr(response, "text") else str(exc)
+            if status_code == 404:
+                raise InvalidOrderException(
+                    f"Alpaca fill lookup failed for order {order_id}: {message}"
+                ) from exc
+            if status_code == 429:
+                raise TemporaryError(
+                    f"Alpaca fill lookup rate-limited for order {order_id}: {message}"
+                ) from exc
+            raise OperationalException(
+                f"Alpaca fill lookup failed for order {order_id}: {message}"
+            ) from exc
+        except requests.RequestException as exc:
+            raise TemporaryError(
+                f"Alpaca fill lookup request failed for order {order_id}: {exc}"
+            ) from exc
+
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise OperationalException(
+                f"Unexpected Alpaca account-activity response for order {order_id}."
+            )
+        return payload
+
+    def _activity_to_fill(
+        self,
+        activity: Any,
+        order_id: str,
+        symbol: str,
+        index: int,
+    ) -> dict[str, Any] | None:
+        if not isinstance(activity, dict):
+            return None
+        activity_order_id = str(activity.get("order_id") or "")
+        if activity_order_id and activity_order_id != str(order_id):
+            return None
+        qty = self._as_float(activity.get("qty"), 0.0)
+        price = self._as_float(activity.get("price"), 0.0)
+        if qty <= 0 or price <= 0:
+            return None
+        timestamp_value = activity.get("transaction_time") or activity.get("date")
+        timestamp = (
+            self._datetime_to_ms(timestamp_value) if timestamp_value else int(time.time() * 1000)
+        )
+        fill_symbol = str(activity.get("symbol") or self._pair_symbol(symbol)).upper()
+        return {
+            "id": str(activity.get("id") or f"{order_id}:{index}"),
+            "timestamp": timestamp,
+            "datetime": datetime.fromtimestamp(timestamp / 1000, UTC).isoformat(),
+            "symbol": f"{fill_symbol}/USD",
+            "side": str(activity.get("side") or "buy").lower(),
+            "price": price,
+            "amount": qty,
+            "cost": qty * price,
+            "fee": None,
+            "fees": [],
+            "order": str(order_id),
+            "info": activity,
+        }
+
+    def extract_cost_curr_rate(self, *args: Any, **kwargs: Any) -> tuple[float, str, float]:
+        del args, kwargs
+        return 0.0, "USD", 0.0
+
+    def handle_order_fee(self, *args: Any, **kwargs: Any) -> None:
+        # Kept as a no-op for compatibility with older versions of the fork.
+        # Actual fee handling is performed through Freqtrade's fill pipeline.
+        pass
+
+    # ------------------------------------------------------------------
+    # Historical OHLCV
+    # ------------------------------------------------------------------
+
+    def validate_timeframes(self, timeframes: str | list[str]) -> None:
+        values = [timeframes] if isinstance(timeframes, str) else list(timeframes)
+        unsupported = [tf for tf in values if tf not in self._TF_MAP]
+        if unsupported:
+            raise ConfigurationError(
+                f"Unsupported Alpaca stock timeframe(s): {', '.join(unsupported)}. "
+                f"Supported: {', '.join(self._TF_MAP)}"
+            )
+
+    def convert_timeframe(self, timeframe: str) -> TimeFrame:
+        try:
+            return self._TF_MAP[timeframe]
+        except KeyError as exc:
+            raise ConfigurationError(f"Unsupported timeframe: {timeframe}") from exc
+
+    def ohlcv_candle_limit(
+        self, timeframe: str, candle_type: str = "trade", since_ms: int | None = None
+    ) -> int:
+        del candle_type, since_ms
+        self.validate_timeframes(timeframe)
+        return 10000
 
     def get_historic_ohlcv(
         self,
-        pair,
-        timeframe,
-        since=None,
-        limit=10000,
-        params=None,
-        since_ms=None,
-        is_new_pair=True,
-        candle_type="spot",
-        until_ms=None,
-    ):
-        try:
-            if params is None:
-                params = {}
-            symbol = pair.split("/")[0]
-
-            # determine start / end ISO strings expected by Alpaca
-            actual_since = since or since_ms
-
-            if actual_since:
-                # actual_since is ms -> convert to UTC ISO
-                start = pd.to_datetime(int(actual_since), unit="ms", utc=True).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
-            else:
-                # default to 1 day back
-                start = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
-
-            if until_ms:
-                end = pd.to_datetime(int(until_ms), unit="ms", utc=True).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
-            else:
-                end = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            # pass limit to Alpaca (they accept up to ~1000 per page)
-            page_limit = min(1000, limit or 1000)
-
-            bars = self.get_historical_bars(
-                [symbol],
-                timeframe,
-                start,
-                end,
-                page_limit,
-                params.get("adjustment", "raw"),
-                params.get("feed", "iex"),
-                params.get("currency", "USD"),
-            )
-            if (
-                not bars
-                or "bars" not in bars
-                or not isinstance(bars["bars"], dict)
-                or not bars["bars"].get(symbol)
-            ):
-                logger.warning(f"No data available for {pair} {timeframe}")
-                return pd.DataFrame()
-
-            data = []
-            for bar in bars["bars"].get(symbol, []):
-                try:
-                    # Alpaca's bar['t'] is ISO string or timestamp; ensure we parse it
-                    tval = (
-                        bar.get("t") or bar.get("time") or bar.get("timestamp") or bar.get("start")
-                    )
-                    date = pd.to_datetime(tval, utc=True)
-                    data.append(
-                        {
-                            "date": date,
-                            "open": float(bar["o"]),
-                            "high": float(bar["h"]),
-                            "low": float(bar["l"]),
-                            "close": float(bar["c"]),
-                            "volume": float(bar["v"]),
-                        }
-                    )
-                except (KeyError, TypeError, ValueError) as e:
-                    logger.warning(f"Invalid bar data for {symbol}: {e}")
-                    continue
-
-            df = pd.DataFrame(data)
-            if df.empty:
-                logger.warning(f"No valid data retrieved for {pair} {timeframe}")
-                return pd.DataFrame()
-
-            df["date"] = pd.to_datetime(df["date"], utc=True)
-            df.sort_values(by="date", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            return df
-        except Exception as e:
-            logger.error(f"An error occurred fetching OHLCV for {pair}: {e}")
-            return pd.DataFrame()
-
-    def _download_pair_history(self, data, DATETIME_PRINT_FORMAT):
-        if data.empty:
-            logger.error("DataFrame is empty")
-            return "None"
-        elif "date" not in data.columns:
-            logger.error(f"DataFrame does not contain 'date' column: {data.columns}")
-            return "None"
-        else:
-            return f"{data.iloc[0]['date']:{DATETIME_PRINT_FORMAT}}"
-
-    def save_to_feather(self, df, file_path):
-        try:
-            if df.empty:
-                logger.warning("DataFrame is empty, not saving to Feather file.")
-                return
-            feather.write_feather(df, file_path)
-            logger.info(f"DataFrame saved to {file_path}")
-        except Exception as e:
-            logger.error(f"Failed to save DataFrame to Feather file: {str(e)}")
-
-    def klines(self, pair, timeframe=None, *, candle_type="spot", **kwargs) -> pd.DataFrame:
-        try:
-            pair_str = pair
-            if isinstance(pair, tuple) and len(pair) == 3:
-                pair_str, timeframe, _candle_type = pair  # Prefix with underscore
-            else:
-                if timeframe is None:
-                    raise ValueError("timeframe must be provided if not using a tuple.")
-            ohlcv = self.get_historic_ohlcv(pair_str, timeframe)
-            return ohlcv.copy()
-        except Exception as e:
-            logger.error(f"Error fetching klines for {pair}: {str(e)}")
-            return pd.DataFrame()
-
-    def refresh_latest_ohlcv(self, pairs=None, timeframe="1h", **kwargs):
-        """
-        Refresh the latest OHLCV data for the given pairs.
-        If the market is closed, sleep until 5 minutes before it opens.
-        """
-        is_open, time_until_open = self.is_market_open()
-        if not is_open:
-            if time_until_open > 300:  # More than 5 minutes until open
-                sleep_time = time_until_open - 300
-                logger.info(
-                    f"Market is closed, sleeping for {sleep_time:.1f} seconds "
-                    "until 5 minutes before market opens. "
-                    "Reminder, JPX (Japan) opens at 8:00 PM "
-                    "and the SSE (China) and HKEX open at 9:30 PM"
-                )
-                time.sleep(sleep_time)
-            else:
-                logger.info(
-                    "Market is closed, but opening in less than 5 minutes. "
-                    "Proceeding to fetch data."
-                )
-
-        # Now fetch the data
-        latest_ohlcv = {}
-        for raw_pair in pairs or []:
-            if isinstance(raw_pair, tuple) and len(raw_pair) == 3:
-                pair_symbol = raw_pair[0]
-            else:
-                pair_symbol = raw_pair
-            try:
-                ohlcv_data = self.get_historic_ohlcv(
-                    pair=pair_symbol,
-                    timeframe=timeframe,
-                    limit=1,
-                )
-                if not ohlcv_data.empty:
-                    latest_ohlcv[pair_symbol] = ohlcv_data
-                else:
-                    logger.warning(
-                        f"No OHLCV data retrieved for {pair_symbol} on timeframe {timeframe}"
-                    )
-            except Exception as e:
-                logger.error(f"Error fetching latest OHLCV for {pair_symbol}: {str(e)}")
-        return latest_ohlcv
-
-    def get_balances(self):
-        try:
-            account = self.trading_client.get_account()
-            return {
-                "USD": {
-                    "free": float(account.cash),
-                    "used": float(account.cash) - float(account.buying_power),
-                    "total": float(account.equity),
-                }
-            }
-        except Exception as e:
-            logger.error(f"Balance fetch error: {e}")
-            return {}
-
-    def fetch_positions(self, symbols=None, params=None):
-        try:
-            throttle()
-            positions = self.trading_client.get_all_positions()
-            return [self._format_position(pos) for pos in positions]
-        except Exception as e:
-            logger.error(f"Position fetch error: {e}")
-            return []
-
-    def _format_position(self, position):
-        qty = float(position.qty)
-        return {
-            "symbol": f"{position.symbol}/USD",
-            "amount": abs(qty),
-            "side": "long" if qty > 0 else "short",
-            "leverage": 1.0,
-            "contracts": abs(qty),
-            "contractSize": 1,
-            "unrealizedPnl": float(position.unrealized_pl),
-            "info": dict(position),
-        }
-
-    def is_market_open(self) -> tuple[bool, float]:
-        """
-        Check if the NYSE market is currently open and return the time until it opens if closed.
-        NYSE is open Monday through Friday, 9:30 AM to 4:00 PM Eastern Time.
-
-        Returns:
-            tuple: (is_open, time_until_open)
-                - is_open: True if market is open, False otherwise
-                - time_until_open: seconds until the market opens (0 if open)
-        """
-        try:
-            clock = self.trading_client.get_clock()
-            current_time_utc = pd.Timestamp.now(tz="UTC")
-            self._last_market_state = clock.is_open
-            if not clock.is_open:
-                time_until_open = (clock.next_open - current_time_utc).total_seconds()
-                hours, remainder = divmod(time_until_open, 3600)
-                minutes, _ = divmod(remainder, 60)
-                next_open_formatted = clock.next_open.strftime("%Y-%m-%d %H:%M UTC")
-                logger.info(
-                    f"Market is closed. Next open: {next_open_formatted} "
-                    f"({int(hours)}h {int(minutes)}m)"
-                )
-                return False, time_until_open
-            else:
-                return True, 0.0
-        except Exception as e:
-            logger.error(f"Failed to retrieve market clock: {e}")
-            return self._last_market_state if self._last_market_state is not None else False, 0.0
-
-    def get_rate(self, pair: str, side: str | None = None, *args, **kwargs) -> float:
-        symbol = pair.split("/")[0]
-        try:
-            # Use the latest trade endpoint instead of a 1m candle
-            # This is more efficient and avoids the 1m 'no data' gaps
-            request_params = StockLatestTradeRequest(symbol_or_symbols=symbol, feed="iex")
-            latest_trade = self.data_client.get_stock_latest_trade(request_params)
-
-            # RUF019 Fix: Use .get() to safely check existence and truthiness
-            if trade := latest_trade.get(symbol):
-                return float(trade.price)
-
-            # Fallback to klines only if latest_trade fails
-            df = self.klines(pair, timeframe="1m", candle_type="spot")
-            if not df.empty:
-                return float(df["close"].iat[-1])
-
-        except Exception as e:
-            logger.error(f"Failed to fetch rate for {pair}: {e}")
-
-        return 0.0
-
-    def get_funding_fees(self, pair: str, amount: float, **kwargs) -> float:
-        return 0.0
-
-    def check_order_canceled_empty(self, order: dict) -> bool:
-        if not order:
-            return True
-        status = order.get("status", "").lower()
-        return status in ["canceled", "cancelled", "not-found"]
-
-    def fetch_order_or_stoploss_order(
-        self, order_id: str, symbol: str, params: dict | None = None, **kwargs
-    ) -> dict | None:
-        return self.fetch_order(order_id, symbol, params)
-
-    def order_has_fee(self, order: dict) -> bool:
-        return True
-
-    def get_trades_for_order(
-        self, order_id: str, symbol: str, params: dict | None = None, **kwargs
-    ) -> list:
-        return []
-
-    def get_order_id_conditional(self, order: dict) -> str:
-        return order.get("id", "")
-
-    def handle_order_fee(self, trade, order_obj, order):
-        order_id = order_obj.get("id")
-        logger.debug(
-            f"Alpaca handle_order_fee called for trade {trade.id}, processing order ID: {order_id}"
+        pair: str,
+        timeframe: str,
+        since: int | None = None,
+        limit: int = 10000,
+        params: dict | None = None,
+        since_ms: int | None = None,
+        is_new_pair: bool = False,
+        candle_type: str = "spot",
+        until_ms: int | None = None,
+    ) -> pd.DataFrame:
+        del is_new_pair, candle_type
+        return self._fetch_bars_df(
+            pair=pair,
+            timeframe=timeframe,
+            since_ms=since if since is not None else since_ms,
+            limit=limit,
+            params=params or {},
+            until_ms=until_ms,
         )
-        fee_info = order_obj.get("fee")
-        if not fee_info:
-            logger.debug(f"Order {order_id}: No 'fee' info found in order_obj.")
-            return None
-        fee_cost = fee_info.get("cost", 0.0)
-        fee_currency = fee_info.get("currency", self.config.get("stake_currency", "USD"))
-        stake_currency = self.config.get("stake_currency", "USD")
-        is_open_fee = order_id is not None and str(trade.open_order_id) == str(order_id)
-        is_close_fee = order_id is not None and str(trade.close_order_id) == str(order_id)
-        if is_open_fee:
-            logger.info(
-                f"Applying OPEN fee for trade {trade.id}, order {order_id}: "
-                f"Cost={fee_cost}, Currency={fee_currency}"
-            )
-            trade.fee_open = True
-            trade.fee_open_cost = fee_cost
-            trade.fee_open_currency = fee_currency
-            trade.fee_open_stake_currency = stake_currency
-        elif is_close_fee:
-            logger.info(
-                f"Applying CLOSE fee for trade {trade.id}, order {order_id}: "
-                f"Cost={fee_cost}, Currency={fee_currency}"
-            )
-            trade.fee_close = True
-            trade.fee_close_cost = fee_cost
-            trade.fee_close_currency = fee_currency
-            trade.fee_close_stake_currency = stake_currency
-        else:
-            logger.debug(
-                f"Order {order_id} does not match open or close order for trade {trade.id}."
-            )
-        return None
-
-    def extract_cost_curr_rate(self, *args, **kwargs) -> tuple[float, str, float]:
-        logger.debug("Alpacastocks.extract_cost_curr_rate called.")
-        logger.debug(f"  args: {args}")
-        logger.debug(f"  kwargs: {kwargs}")
-        cost = 0.0
-        currency = self.config.get("stake_currency", "USD")
-        rate = 0.0
-        if args and len(args) > 0 and isinstance(args[0], dict) and "cost" in args[0]:
-            fee_info = args[0]
-            cost = float(fee_info.get("cost", 0.0))
-            currency = fee_info.get("currency", currency)
-        elif args and len(args) > 2:
-            arg_cost = args[2]
-            try:
-                cost = float(arg_cost)
-            except (ValueError, TypeError):
-                logger.warning(f"Could not convert args[2] '{arg_cost}' to float for cost.")
-                cost = 0.0
-        logger.debug(
-            f"extract_cost_curr_rate returning cost={cost}, currency={currency}, rate={rate}"
-        )
-        return cost, currency, rate
-
-    def get_markets(self, reload=False, params=None, tradable_only=False, active_only=False):
-        pairlist_file_path = Path(self.PAIRLIST_FILE)
-        reload_needed = self._should_reload_markets(pairlist_file_path, reload)
-
-        if reload_needed:
-            self._load_markets_from_api(pairlist_file_path, tradable_only, active_only)
-        else:
-            self._load_markets_from_file(pairlist_file_path, tradable_only, active_only)
-
-        return self._markets
-
-    def _should_reload_markets(self, file_path: Path, reload_flag: bool) -> bool:
-        """
-        Determine if markets should be reloaded from the API.
-        """
-        if reload_flag or not hasattr(self, "_markets"):
-            if file_path.exists():
-                file_age = time.time() - file_path.stat().st_mtime
-                if file_age > 86400:
-                    logger.info("Pairlist file is older than 24 hours. Reloading from Alpaca.")
-                    return True
-                return False
-            return True
-        return False
-
-    def _load_markets_from_file(self, file_path: Path, tradable_only: bool, active_only: bool):
-        """
-        Load markets from a local JSON file.
-        """
-        try:
-            with file_path.open("r") as f:
-                self._markets = json.load(f)
-            logger.debug("Loaded market pairs from file.")
-        except Exception as e:
-            logger.error(f"Failed to load market pairs from file: {e}")
-            # Fallback to API reload with original filter flags
-            self._load_markets_from_api(file_path, tradable_only, active_only)
-
-    def _load_markets_from_api(self, file_path: Path, tradable_only: bool, active_only: bool):
-        """
-        Fetch and process market data from Alpaca API.
-        """
-        logger.info("Refreshing market pairs from Alpaca API.")
-        try:
-            search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY)
-            throttle()
-            assets = self.trading_client.get_all_assets(search_params)
-            assets_dict = [dict(item) for item in assets]
-            self._markets = self._process_assets(assets_dict, tradable_only, active_only)
-
-            with file_path.open("w") as f:
-                json.dump(self._markets, f, default=str)
-            logger.info("Saved market pairs to file.")
-
-        except APIError as e:
-            error_message = str(e).lower()
-            # Handle both "forbidden" and "unauthorized" authentication errors
-            if "forbidden" in error_message or "unauthorized" in error_message:
-                logger.error(
-                    "Authentication failed - Invalid API credentials. "
-                    "Please check your Alpaca API key and secret."
-                )
-                sys.exit(1)
-            logger.error(f"Error fetching market data from Alpaca: {e}")
-            # Re-raise other API errors so they bubble up
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error while fetching markets: {e}")
-            # Re-raise unexpected errors
-            raise
-
-    def _process_assets(self, assets_dict: list, tradable_only: bool, active_only: bool):
-        """
-        Process raw asset data into a market dictionary.
-        """
-        markets = {}
-        for asset in assets_dict:
-            if not self._is_asset_included(asset, tradable_only, active_only):
-                continue
-
-            pair = f"{asset['symbol']}/USD"
-            markets[pair] = {
-                "id": pair,
-                "symbol": pair,
-                "base": asset["symbol"],
-                "quote": "USD",
-                "spot": True,
-                "tradable": asset["tradable"],
-                "margin": False,
-                "active": asset["status"] == "active",
-                "maker": 0.001,
-                "taker": 0.002,
-                "info": asset,
-                "precision": {"amount": 8, "price": 8},
-                "limits": {
-                    "amount": {"min": 0.001, "max": 1000000},
-                    "price": {"min": 0.01, "max": 1000000},
-                    "cost": {"min": 0.01, "max": 1000000},
-                },
-                "future": False,
-                "option": False,
-                "linear": True,
-                "inverse": False,
-                "contractSize": 1,
-                "expiry": None,
-                "expiry_date": None,
-                "strike": None,
-                "underlying": None,
-                "settle": None,
-                "settleDate": None,
-                "listing": None,
-                "listed": None,
-                "market_type": "spot",
-            }
-        return markets
-
-    def _is_asset_included(self, asset: dict, tradable_only: bool, active_only: bool) -> bool:
-        """
-        Determine if an asset should be included in the market list.
-        """
-        if tradable_only and not asset.get("tradable", False):
-            return False
-        if active_only and asset.get("status") != "active":
-            return False
-        return True
-
-    def fetch_balance(self, params: dict | None = None) -> dict:
-        """
-        Fetch account balances for Freqtrade strategies and FreqUI.
-
-        Returns a dict of currencies with fields 'free', 'used' and 'total'.
-        """
-        try:
-            # Reuse your existing helper
-            balances = self.get_balances()
-            return balances
-        except Exception as e:
-            logger.error(f"Error fetching balance via Alpaca: {e}")
-            return {}
-
-    def fetch_ticker(self, pair: str, params: dict | None = None) -> dict:
-        symbol = pair.split("/", 1)[0]
-
-        try:
-            quote_resp = self.data_client.get_stock_latest_quote(
-                StockLatestQuoteRequest(symbol_or_symbols=symbol)
-            )
-            trade_resp = self.data_client.get_stock_latest_trade(
-                StockLatestTradeRequest(symbol_or_symbols=symbol)
-            )
-
-            # ---- safe dict conversion ----
-            try:
-                qraw = quote_resp.dict() if hasattr(quote_resp, "dict") else quote_resp
-            except Exception as e:
-                logger.debug(f"quote dict() failed: {e}", exc_info=True)
-                qraw = quote_resp
-
-            try:
-                traw = trade_resp.dict() if hasattr(trade_resp, "dict") else trade_resp
-            except Exception as e:
-                logger.debug(f"trade dict() failed: {e}", exc_info=True)
-                traw = trade_resp
-
-            logger.debug(f"RAW QUOTE RESP: {qraw}")
-            logger.debug(f"RAW TRADE RESP: {traw}")
-
-            # ---- unwrap symbol map ----
-            if isinstance(qraw, dict) and len(qraw) == 1:
-                v = next(iter(qraw.values()))
-                if isinstance(v, dict):
-                    qraw = v
-
-            if isinstance(traw, dict) and len(traw) == 1:
-                v = next(iter(traw.values()))
-                if isinstance(v, dict):
-                    traw = v
-
-            # ---- unwrap "data" wrapper ----
-            if isinstance(qraw, dict) and isinstance(qraw.get("data"), dict):
-                qraw = qraw["data"]
-
-            if isinstance(traw, dict) and isinstance(traw.get("data"), dict):
-                traw = traw["data"]
-
-            # ---- timestamp ----
-            ts_ms = self._extract_ts(traw) or self._extract_ts(qraw)
-
-            if not ts_ms:
-                ts_ms = int(datetime.now(UTC).timestamp() * 1000)
-                logger.debug(f"No timestamp for {symbol}, fallback to now()")
-
-            # ---- price ----
-            last_price = self._compute_last_price(qraw, traw, symbol)
-
-            return {
-                "symbol": pair,
-                "timestamp": ts_ms,
-                "datetime": datetime.fromtimestamp(ts_ms / 1000, UTC).isoformat(),
-                "high": None,
-                "low": None,
-                "open": None,
-                "close": last_price,
-                "bid": float(qraw.get("bid_price") or qraw.get("bid") or 0)
-                if isinstance(qraw, dict)
-                else None,
-                "bidVolume": qraw.get("bid_size") if isinstance(qraw, dict) else None,
-                "ask": float(qraw.get("ask_price") or qraw.get("ask") or 0)
-                if isinstance(qraw, dict)
-                else None,
-                "askVolume": qraw.get("ask_size") if isinstance(qraw, dict) else None,
-                "info": {"quote": qraw, "trade": traw},
-            }
-
-        except Exception:
-            logger.exception(f"Error fetching ticker for {symbol}")
-            raise
-
-    # -----------------------
-    # HELPERS (minimal set)
-    # -----------------------
-
-    def _extract_ts(self, obj):
-        if not isinstance(obj, dict):
-            return None
-
-        for k in ("timestamp", "t", "ts", "time", "created_at"):
-            if obj.get(k) is not None:
-                ts = self._parse_ts(obj[k])
-                if ts:
-                    return ts
-
-        for v in obj.values():
-            ts = self._parse_ts(v)
-            if ts:
-                return ts
-
-        return None
-
-    def _parse_ts(self, value):
-        if value is None:
-            return None
-
-        if isinstance(value, datetime):
-            return int(value.timestamp() * 1000)
-
-        if isinstance(value, (int, float)):
-            return int(value) if value > 1e12 else int(value * 1000)
-
-        if isinstance(value, str):
-            try:
-                return int(isoparse(value).timestamp() * 1000)
-            except Exception:
-                return None
-
-        if isinstance(value, dict):
-            for k in ("timestamp", "t", "ts", "time", "created_at"):
-                if value.get(k) is not None:
-                    return self._parse_ts(value[k])
-
-        return None
-
-    def _compute_last_price(self, qdata, tdata, symbol):
-        if isinstance(tdata, dict):
-            p = tdata.get("price") or tdata.get("last") or tdata.get("p")
-            if p is not None:
-                return float(p)
-
-        if isinstance(qdata, dict):
-            try:
-                bid = qdata.get("bid_price") or qdata.get("bid")
-                ask = qdata.get("ask_price") or qdata.get("ask")
-                close = qdata.get("close")
-
-                if bid and ask:
-                    return (float(bid) + float(ask)) / 2
-                if close:
-                    return float(close)
-            except Exception as e:
-                logger.debug(f"price calc failed for {symbol}: {e}", exc_info=True)
-
-        return None
 
     def fetch_ohlcv(
         self,
@@ -1396,202 +1465,429 @@ class Alpacastocks(Stockexchange):
         since: int | None = None,
         limit: int | None = None,
         params: dict | None = None,
-    ) -> list[list]:
-        try:
-            # --- Convert timeframe to seconds ---
-            timeframe_map = {
-                "1m": 60,
-                "5m": 300,
-                "15m": 900,
-                "1h": 3600,
-                "1d": 86400,
-            }
-            tf_sec = timeframe_map.get(timeframe, 60)
-
-            # --- Fetch raw bars ---
-            bars = self.get_historic_ohlcv(
-                pair=symbol,
-                timeframe=timeframe,
-                since=since,
-                limit=limit,
-                params=params or {},
-            )
-
-            if bars is None or bars.empty:
-                logger.debug(
-                    f"No data returned for {symbol} {timeframe} (likely no trades in interval)"
-                )
-                return []
-
-            df = bars.sort_values("date")
-
-            # --- Convert to OHLCV ---
-            ohlcv = [
-                [
-                    int(row["date"].timestamp() * 1000),
-                    float(row["open"]),
-                    float(row["high"]),
-                    float(row["low"]),
-                    float(row["close"]),
-                    float(row["volume"]),
-                ]
-                for _, row in df.iterrows()
+    ) -> list[list[Any]]:
+        df = self._fetch_bars_df(
+            pair=symbol,
+            timeframe=timeframe,
+            since_ms=since,
+            limit=limit or 500,
+            params=params or {},
+        )
+        if df.empty:
+            return []
+        pair_text = self._normalise_pair_string(symbol)
+        with self._klines_lock:
+            self._klines[(pair_text, timeframe, CandleType.SPOT)] = df.copy()
+        return [
+            [
+                self._datetime_to_ms(row.date),
+                float(row.open),
+                float(row.high),
+                float(row.low),
+                float(row.close),
+                float(row.volume),
             ]
+            for row in df.itertuples(index=False)
+        ]
 
-            if not ohlcv:
-                return []
-
-            # --- Remove current (possibly incomplete) candle ---
-            # Renamed now_ts to now_ms to match the usage below
-            now_ms = int(datetime.now(UTC).timestamp() * 1000)
-
-            last_ts = ohlcv[-1][0]
-            if last_ts >= now_ms - (tf_sec * 1000):
-                ohlcv.pop()
-
-            # --- Fill missing candles (CRITICAL FIX) ---
-            filled = []
-            prev = ohlcv[0]
-            filled.append(prev)
-
-            for curr in ohlcv[1:]:
-                prev_ts = prev[0]
-                curr_ts = curr[0]
-
-                expected_ts = prev_ts + tf_sec * 1000
-
-                # Fill gaps
-                while expected_ts < curr_ts:
-                    filled.append(
-                        [
-                            expected_ts,
-                            prev[4],  # open = last close
-                            prev[4],  # high
-                            prev[4],  # low
-                            prev[4],  # close
-                            0.0,  # volume
-                        ]
-                    )
-                    expected_ts += tf_sec * 1000
-
-                filled.append(curr)
-                prev = curr
-
-            return filled
-
-        except Exception as e:
-            logger.error(f"Error fetching OHLCV for {symbol} via Alpaca: {e}")
-            return []
-
-    def fetch_open_orders(
+    def klines(
         self,
-        symbol: str | None = None,
-        since: int | None = None,
-        limit: int | None = None,
-        params: dict | None = None,
-    ) -> list[dict]:
+        pair: Any,
+        timeframe: str | None = None,
+        *,
+        candle_type: CandleType | str = CandleType.SPOT,
+        copy: bool = True,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """Return the Freqtrade candle cache for an exact pair/timeframe/candle type.
+
+        Freqtrade uses a 3-tuple candle identifier throughout the live data
+        path: ``(pair, timeframe, CandleType)``.  Keep the cache keyed exactly
+        that way so ``DataProvider.ohlcv()`` and ``available_pairs`` see the
+        same objects the refresh layer populated.
+        """
+        del kwargs
+        pair_text = self._normalise_pair_string(pair)
+        if isinstance(pair, tuple) and len(pair) >= 2 and timeframe is None:
+            timeframe = str(pair[1])
+        if timeframe is None:
+            raise ConfigurationError("timeframe is required for klines()")
+
+        if isinstance(pair, tuple) and len(pair) >= 3:
+            candle_type = pair[2]
+        if not isinstance(candle_type, CandleType):
+            candle_type = CandleType.from_string(str(candle_type))
+
+        key = (pair_text, timeframe, candle_type)
+        with self._klines_lock:
+            cached = self._klines.get(key)
+            if cached is not None:
+                return cached.copy() if copy else cached
+
+        # Populate the exact cache key on first access.
+        df = self.get_historic_ohlcv(
+            pair_text, timeframe, limit=self._initial_candle_limit(timeframe)
+        )
+        if not df.empty:
+            with self._klines_lock:
+                self._klines[key] = df.copy()
+        return df.copy() if copy else df
+
+    def refresh_latest_ohlcv(
+        self,
+        pair_list: list[Any],
+        *,
+        since_ms: int | None = None,
+        cache: bool = True,
+        drop_incomplete: bool | None = None,
+    ) -> dict[tuple[str, str, CandleType], pd.DataFrame]:
+        """Refresh live OHLCV using Freqtrade's exact candle identifiers."""
+        is_open, time_until_open = self.is_market_open()
+        if not is_open:
+            self._wait_for_market_open(time_until_open)
+
+        result: dict[tuple[str, str, CandleType], pd.DataFrame] = {}
+        use_drop_incomplete = (
+            self._ft_has.get("ohlcv_partial_candle", True)
+            if drop_incomplete is None
+            else bool(drop_incomplete)
+        )
+        for item in pair_list or []:
+            key = self._normalise_candle_key(item)
+            try:
+                df = self._refresh_candle_key(key, since_ms, use_drop_incomplete)
+                if df.empty:
+                    logger.debug("No new OHLCV for %s %s", key[0], key[1])
+                    continue
+                if cache:
+                    with self._klines_lock:
+                        self._klines[key] = df.copy()
+                result[key] = df.copy()
+            except Exception as exc:
+                logger.warning("Unable to refresh %s candles: %s", key, exc)
+        return result
+
+    def _wait_for_market_open(self, time_until_open: float) -> None:
+        if time_until_open > 300:
+            sleep_time = time_until_open - 300
+            hours, rem = divmod(sleep_time, 3600)
+            minutes, seconds = divmod(rem, 60)
+            logger.info(
+                "US stock market is closed, sleeping for %d hours, %d minutes, and %.1f "
+                "seconds until 5 minutes before the next market opens.",
+                hours,
+                minutes,
+                seconds,
+            )
+            time.sleep(sleep_time)
+            return
+        logger.info(
+            "US stock market is closed, but opens in %.1f seconds; continuing with the "
+            "final pre-open refresh.",
+            max(0.0, time_until_open),
+        )
+
+    def _normalise_candle_key(self, item: Any) -> tuple[str, str, CandleType]:
+        if isinstance(item, tuple) and len(item) >= 3:
+            pair_text = self._normalise_pair_string(item[0])
+            timeframe = str(item[1])
+            raw_candle_type = item[2]
+        elif isinstance(item, tuple) and len(item) == 2:
+            pair_text = self._normalise_pair_string(item[0])
+            timeframe = str(item[1])
+            raw_candle_type = CandleType.SPOT
+        else:
+            pair_text = self._normalise_pair_string(item)
+            timeframe = str(self.config.get("timeframe", "1m"))
+            raw_candle_type = CandleType.SPOT
+        candle_type = (
+            raw_candle_type
+            if isinstance(raw_candle_type, CandleType)
+            else CandleType.from_string(str(raw_candle_type))
+        )
+        return pair_text, timeframe, candle_type
+
+    def _refresh_candle_key(
+        self,
+        key: tuple[str, str, CandleType],
+        since_ms: int | None,
+        drop_incomplete: bool,
+    ) -> pd.DataFrame:
+        pair_text, timeframe, candle_type = key
+        with self._klines_lock:
+            existing = self._klines.get(key)
+            existing_last_ms = (
+                self._datetime_to_ms(existing["date"].iloc[-1])
+                if existing is not None and not existing.empty
+                else None
+            )
+        fetch_since = since_ms
+        if fetch_since is None and existing_last_ms is not None:
+            fetch_since = max(0, existing_last_ms - self._timeframe_seconds(timeframe) * 1000)
+        limit = self._initial_candle_limit(timeframe) if existing is None or existing.empty else 10
+        df = self.get_historic_ohlcv(
+            pair_text,
+            timeframe,
+            since=fetch_since,
+            limit=limit,
+            candle_type=candle_type.value,
+        )
+        if df.empty:
+            return existing.copy() if existing is not None and not existing.empty else df
+        if existing is not None and not existing.empty:
+            df = pd.concat([existing, df], ignore_index=True)
+            df = df.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+        if drop_incomplete:
+            df = self._drop_incomplete_candle(df, timeframe)
+        return df
+
+    def _drop_incomplete_candle(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        if df.empty:
+            return df
+        now = pd.Timestamp.now(tz="UTC")
+        tf_ms = self._timeframe_seconds(timeframe) * 1000
+        last_ms = self._datetime_to_ms(df["date"].iloc[-1])
+        current_bucket = (int(now.timestamp() * 1000) // tf_ms) * tf_ms
+        if last_ms >= current_bucket and len(df) > 1:
+            return df.iloc[:-1].copy()
+        return df
+
+    def _fetch_bars_df(
+        self,
+        pair: str,
+        timeframe: str,
+        since_ms: int | None,
+        limit: int,
+        params: dict[str, Any],
+        until_ms: int | None = None,
+    ) -> pd.DataFrame:
+        self.validate_timeframes(timeframe)
+        symbol = self._pair_symbol(pair)
+        requested_limit = max(1, min(int(limit), 10000))
+
+        end_dt = self._ms_to_datetime(until_ms) if until_ms is not None else datetime.now(UTC)
+        if since_ms is None:
+            seconds = self._timeframe_seconds(timeframe) * requested_limit
+            start_dt = end_dt - timedelta(seconds=max(seconds, 86400))
+        else:
+            start_dt = self._ms_to_datetime(int(since_ms))
+
+        # Give Alpaca a bounded request.  The SDK/API may paginate internally,
+        # but we still enforce Freqtrade's requested result limit below.
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            start=start_dt,
+            end=end_dt,
+            limit=min(requested_limit, 10000),
+            timeframe=self.convert_timeframe(timeframe),
+            adjustment=self._parse_adjustment(params.get("adjustment", self.adjustment.value)),
+            feed=self._parse_data_feed(params.get("feed", self.data_feed.value)),
+            sort=Sort.ASC,
+            currency="USD",
+        )
+
         try:
-            query: dict = {"status": QueryOrderStatus.OPEN}
-            if limit:
-                query["limit"] = limit
-            if params:
-                query.update(params)
+            barset = self.data_client.get_stock_bars(request)
+        except APIError as exc:
+            raise self._translate_api_error(exc, f"fetch bars {symbol} {timeframe}") from exc
 
-            request = GetOrdersRequest(**query)
-            alpaca_orders = self.trading_client.get_orders(request)
+        df = getattr(barset, "df", None)
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
-            ft_orders = []
-            for o in alpaca_orders:
-                created_ts = int(o.submitted_at.timestamp() * 1000)
-                qty = float(o.qty or 0)
-                filled = float(o.filled_qty or 0)
-                remaining = qty - filled
-                avg_fill_price = float(o.filled_avg_price or 0)
+        df = self._normalise_bar_dataframe(df, symbol)
+        if df.empty:
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
-                ft_orders.append(
-                    {
-                        "id": str(o.id),
-                        "clientOrderId": getattr(o, "client_order_id", None),
-                        "timestamp": created_ts,
-                        "datetime": self.iso8601(created_ts),
-                        "symbol": f"{o.symbol}/USD",
-                        "type": o.order_type.value.lower(),
-                        "side": o.side.value.lower(),
-                        "price": float(o.limit_price) if o.limit_price else None,
-                        "amount": qty,
-                        "filled": filled,
-                        "remaining": remaining,
-                        "status": o.status.value.lower(),
-                        "cost": filled * avg_fill_price,
-                        "info": dict(o),
-                    }
-                )
+        if since_ms is not None:
+            df = df[df["date"] >= self._ms_to_datetime(int(since_ms))]
+        if until_ms is not None:
+            df = df[df["date"] <= self._ms_to_datetime(int(until_ms))]
+        df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
-            if symbol:
-                base = symbol.split("/", 1)[0]
-                ft_orders = [o for o in ft_orders if o["symbol"].startswith(base)]
+        # CCXT/Freqtrade limit means number of returned candles, not page size.
+        if len(df) > requested_limit:
+            df = df.iloc[:requested_limit].copy()
+        return df[["date", "open", "high", "low", "close", "volume"]]
 
-            return ft_orders
+    def _normalise_bar_dataframe(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        work = df.copy()
+        if isinstance(work.index, pd.MultiIndex):
+            names = list(work.index.names)
+            if "symbol" in names:
+                work = work.xs(symbol, level="symbol", drop_level=True)
+            else:
+                # Common BarSet layout is (symbol, timestamp).
+                first_level = work.index.get_level_values(0)
+                if symbol in first_level:
+                    work = work.xs(symbol, level=0, drop_level=True)
+            work = work.reset_index()
+        else:
+            work = work.reset_index()
 
-        except Exception as e:
-            logger.error(f"Error fetching open orders via Alpaca: {e}")
-            return []
+        if "timestamp" not in work.columns:
+            if "date" in work.columns:
+                work = work.rename(columns={"date": "timestamp"})
+            elif "index" in work.columns:
+                work = work.rename(columns={"index": "timestamp"})
 
-    def iso8601(self, timestamp: int) -> str:
-        return pd.to_datetime(timestamp, unit="ms").isoformat()
+        required = {"timestamp", "open", "high", "low", "close", "volume"}
+        if not required.issubset(work.columns):
+            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
+        work["date"] = pd.to_datetime(work["timestamp"], utc=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+        work = work.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+        return work[["date", "open", "high", "low", "close", "volume"]]
+
+    # ------------------------------------------------------------------
+    # Historical / live trades
+    # ------------------------------------------------------------------
 
     def fetch_trades(
         self,
         pair: str,
         since: int | None = None,
-        since_ms=None,
+        since_ms: int | None = None,
         limit: int | None = None,
         params: dict | None = None,
-    ) -> list[dict]:
-        """
-        Pulls historical trades from Alpaca and returns them in CCXT/Freqtrade format,
-        so FreqUI can render live and backtested order-flow.
-        """
-        symbol = pair.split("/", 1)[0]
-        data_client: StockHistoricalDataClient = (
-            self.data_client
-        )  # your instantiated Alpaca data client
-
-        # Convert since (ms) to ISO8601, if provided
-        start: str | None = None
-
-        ts = since_ms if since_ms is not None else since
-        if ts is not None:
-            start = datetime.fromtimestamp(ts / 1000, UTC).isoformat()
-
-        # Default limit if not set
-        max_trades = limit or 1000
-
-        # Fetch trades (Alpaca returns a .data list of Trade objects)
-        throttle()
-        api_resp = data_client.get_stock_trades(
-            symbol_or_symbols=symbol, start=start, limit=max_trades, **(params or {})
+    ) -> list[dict[str, Any]]:
+        symbol = self._pair_symbol(pair)
+        requested_limit = max(1, min(int(limit or self._ft_has["trades_limit"]), 10000))
+        start_ms = since_ms if since_ms is not None else since
+        request = StockTradesRequest(
+            symbol_or_symbols=symbol,
+            start=self._ms_to_datetime(start_ms) if start_ms is not None else None,
+            limit=requested_limit,
+            feed=self._parse_data_feed((params or {}).get("feed", self.data_feed.value)),
+            sort=Sort.ASC,
         )
+        try:
+            trade_set = self.data_client.get_stock_trades(request)
+        except APIError as exc:
+            raise self._translate_api_error(exc, f"fetch trades {symbol}") from exc
 
-        ccxt_trades = []
-        for t in api_resp.data:
-            # Alpaca Trade.timestamp is ISO str; parse to ms
-            ts = int(isoparse(t.timestamp).timestamp() * 1000)
-            dt = datetime.fromtimestamp(ts / 1000, UTC).isoformat()
-
-            ccxt_trades.append(
+        trades = trade_set.get(symbol, []) if hasattr(trade_set, "get") else []
+        result = []
+        for trade in trades[:requested_limit]:
+            timestamp = self._datetime_to_ms(getattr(trade, "timestamp", None))
+            result.append(
                 {
-                    "id": t.trade_id,
-                    "timestamp": ts,
-                    "datetime": dt,
-                    "symbol": symbol,
-                    "side": t.taker_side.value.lower(),  # "buy" or "sell"
-                    "price": float(t.price),
-                    "amount": float(t.size),
+                    "id": str(getattr(trade, "id", "")),
+                    "timestamp": timestamp,
+                    "datetime": datetime.fromtimestamp(timestamp / 1000, UTC).isoformat(),
+                    "symbol": pair,
+                    # Alpaca stock prints do not provide a CCXT-style taker side.
+                    "side": None,
+                    "price": self._as_float(getattr(trade, "price", None), 0.0),
+                    "amount": self._as_float(getattr(trade, "size", None), 0.0),
+                    "info": self._model_to_dict(trade),
                 }
             )
+        return result
 
-        return ccxt_trades
+    # ------------------------------------------------------------------
+    # WebSockets
+    # ------------------------------------------------------------------
+
+    def setup_websocket(self) -> None:
+        """Start Alpaca TradingStream for account/order updates only."""
+        with self._stream_lock:
+            if self._trading_stream_thread and self._trading_stream_thread.is_alive():
+                return
+            self._trading_stream = TradingStream(self.key, self.secret, paper=self.dry_run)
+            self._trading_stream.subscribe_trade_updates(self._handle_trade_update)
+            thread = threading.Thread(
+                target=self._run_stream,
+                args=(self._trading_stream, "trading"),
+                daemon=True,
+                name="alpaca-trading-stream",
+            )
+            self._trading_stream_thread = thread
+            self._stream_threads.append(thread)
+            self._stream_clients.append(self._trading_stream)
+            thread.start()
+
+    async def _handle_trade_update(self, trade_update: Any) -> None:
+        order = getattr(trade_update, "order", None)
+        order_id = getattr(order, "id", None)
+        if order_id is not None:
+            self._order_updates[str(order_id)] = trade_update
+        logger.debug("Alpaca trade update: %s", trade_update)
+
+    def _run_stream(self, stream: Any, name: str) -> None:
+        try:
+            stream.run()  # Alpaca's run() starts its own event loop; it is not a coroutine.
+        except Exception:
+            logger.exception("Alpaca %s websocket stopped unexpectedly.", name)
+
+    async def watch_ticker(self, pairs: list[str], params: dict | None = None):
+        del params
+        symbols = [self._pair_symbol(pair) for pair in pairs]
+        target_loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+        stream = StockDataStream(self.key, self.secret, feed=self.data_feed)
+        self._register_live_stream(stream)
+
+        async def on_quote(quote: Any) -> None:
+            payload = {
+                "symbol": f"{quote.symbol}/USD",
+                "timestamp": self._datetime_to_ms(quote.timestamp),
+                "bid": self._as_float(getattr(quote, "bid_price", None), 0.0),
+                "ask": self._as_float(getattr(quote, "ask_price", None), 0.0),
+            }
+            asyncio.run_coroutine_threadsafe(queue.put(payload), target_loop)
+
+        stream.subscribe_quotes(on_quote, *symbols)
+        thread = threading.Thread(target=self._run_stream, args=(stream, "quote"), daemon=True)
+        self._stream_threads.append(thread)
+        thread.start()
+
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            self._stop_stream(stream)
+
+    async def watch_trades(
+        self,
+        pair: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ):
+        del since, limit, params
+        symbol = self._pair_symbol(pair)
+        target_loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        stream = StockDataStream(self.key, self.secret, feed=self.data_feed)
+        self._register_live_stream(stream)
+
+        async def on_trade(trade: Any) -> None:
+            timestamp = self._datetime_to_ms(trade.timestamp)
+            payload = {
+                "id": str(getattr(trade, "id", "")),
+                "timestamp": timestamp,
+                "datetime": datetime.fromtimestamp(timestamp / 1000, UTC).isoformat(),
+                "symbol": pair,
+                "side": None,
+                "price": self._as_float(getattr(trade, "price", None), 0.0),
+                "amount": self._as_float(getattr(trade, "size", None), 0.0),
+            }
+            asyncio.run_coroutine_threadsafe(queue.put(payload), target_loop)
+
+        stream.subscribe_trades(on_trade, symbol)
+        thread = threading.Thread(target=self._run_stream, args=(stream, "trade"), daemon=True)
+        self._stream_threads.append(thread)
+        thread.start()
+
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            self._stop_stream(stream)
 
     async def watch_ohlcv(
         self,
@@ -1601,296 +1897,629 @@ class Alpacastocks(Stockexchange):
         limit: int | None = None,
         params: dict | None = None,
     ):
-        symbol = pair.split("/", 1)[0]
-        # convert timeframe to Alpaca bar timeframe
-        minutes = int(timeframe.rstrip("m"))
-        alpaca_tf = f"{minutes}Min"
+        del since, limit, params
+        self.validate_timeframes(timeframe)
+        symbol = self._pair_symbol(pair)
+        target_loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[list[Any]] = asyncio.Queue()
+        stream = StockDataStream(self.key, self.secret, feed=self.data_feed)
+        self._register_live_stream(stream)
 
-        stream = TradingStream(self.key, self.secret, paper=self.dry_run)
-        queue: asyncio.Queue = asyncio.Queue()
+        # Alpaca's stock websocket supplies native minute bars and daily bars.
+        # Higher Freqtrade timeframes are assembled locally.  Buckets are
+        # aligned to fixed wall-clock boundaries rather than the moment the
+        # stream was started, and no candles are invented across market gaps.
+        current_bucket: pd.Timestamp | None = None
+        bucket_bars: list[list[Any]] = []
 
-        async def _on_bar(bar):
-            # bar.start is datetime-like -> use .timestamp()
-            try:
-                start_dt = (
-                    getattr(bar, "start", None) or bar.get("t") if isinstance(bar, dict) else None
+        async def on_minute_bar(bar: Any) -> None:
+            nonlocal current_bucket, bucket_bars
+            data = self._bar_to_ohlcv(bar)
+            if timeframe == "1m":
+                asyncio.run_coroutine_threadsafe(queue.put(data), target_loop)
+                return
+
+            bar_time = pd.Timestamp(data[0], unit="ms", tz="UTC")
+            bucket = self._stream_bucket_start(bar_time, timeframe)
+            if current_bucket is None:
+                current_bucket = bucket
+            elif bucket != current_bucket:
+                if bucket_bars:
+                    aggregated = self._aggregate_stream_buffer(bucket_bars, timeframe)
+                    if aggregated is not None:
+                        asyncio.run_coroutine_threadsafe(queue.put(aggregated), target_loop)
+                current_bucket = bucket
+                bucket_bars = []
+
+            bucket_bars.append(data)
+
+        async def on_daily_bar(bar: Any) -> None:
+            asyncio.run_coroutine_threadsafe(queue.put(self._bar_to_ohlcv(bar)), target_loop)
+
+        if timeframe == "1d":
+            stream.subscribe_daily_bars(on_daily_bar, symbol)
+        else:
+            stream.subscribe_bars(on_minute_bar, symbol)
+
+        thread = threading.Thread(target=self._run_stream, args=(stream, "bar"), daemon=True)
+        self._stream_threads.append(thread)
+        thread.start()
+
+        try:
+            while True:
+                yield await queue.get()
+        finally:
+            self._stop_stream(stream)
+
+    def _stream_bucket_start(self, timestamp: pd.Timestamp, timeframe: str) -> pd.Timestamp:
+        """Return a fixed UTC bucket start for a streamed US-equity bar."""
+        if timeframe in ("1m", "5m", "15m"):
+            minutes = int(timeframe[:-1])
+            local = timestamp.tz_convert("America/New_York")
+            bucket = local.floor(f"{minutes}min")
+            return bucket.tz_convert("UTC")
+        if timeframe == "1h":
+            # US regular-session hourly bars conventionally start at :30
+            # (09:30, 10:30, ...).  This also keeps the adapter aligned with
+            # the common equity-session anchor when aggregating Alpaca minute data.
+            local = timestamp.tz_convert("America/New_York")
+            bucket = (local - pd.Timedelta(minutes=30)).floor("1h") + pd.Timedelta(minutes=30)
+            return bucket.tz_convert("UTC")
+        raise ConfigurationError(f"Cannot stream-aggregate timeframe {timeframe}")
+
+    def _aggregate_stream_buffer(self, bars: list[list[Any]], timeframe: str) -> list[Any] | None:
+        """Aggregate the bars currently belonging to one fixed time bucket."""
+        if not bars:
+            return None
+        if timeframe == "1m":
+            return bars[-1]
+        expected_minutes = self._timeframe_minutes(timeframe)
+        if expected_minutes <= 0:
+            raise ConfigurationError(f"Invalid aggregation timeframe: {timeframe}")
+
+        # Never bridge a gap in actual market data.  A partial bucket is valid
+        # for live streaming, but a missing-minute gap means the bucket should
+        # be discarded rather than padded with synthetic zero-volume candles.
+        timestamps = [pd.Timestamp(b[0], unit="ms", tz="UTC") for b in bars]
+        for previous, current in pairwise(timestamps):
+            if current - previous != pd.Timedelta(minutes=1):
+                logger.debug("Skipping incomplete streamed %s bucket due to data gap", timeframe)
+                return None
+
+        return [
+            bars[0][0],
+            float(bars[0][1]),
+            max(float(b[2]) for b in bars),
+            min(float(b[3]) for b in bars),
+            float(bars[-1][4]),
+            sum(float(b[5]) for b in bars),
+        ]
+
+    def _bar_to_ohlcv(self, bar: Any) -> list[Any]:
+        if isinstance(bar, dict):
+            timestamp = bar.get("timestamp") or bar.get("t")
+            return [
+                self._datetime_to_ms(timestamp),
+                self._as_float(bar.get("open", bar.get("o", 0.0))),
+                self._as_float(bar.get("high", bar.get("h", 0.0))),
+                self._as_float(bar.get("low", bar.get("l", 0.0))),
+                self._as_float(bar.get("close", bar.get("c", 0.0))),
+                self._as_float(bar.get("volume", bar.get("v", 0.0))),
+            ]
+        return [
+            self._datetime_to_ms(bar.timestamp),
+            float(bar.open),
+            float(bar.high),
+            float(bar.low),
+            float(bar.close),
+            float(bar.volume),
+        ]
+
+    def ws_connection_reset(self) -> None:
+        with self._stream_lock:
+            clients = list(self._stream_clients)
+        for client in clients:
+            self._stop_stream(client)
+
+    # ------------------------------------------------------------------
+    # Market clock
+    # ------------------------------------------------------------------
+
+    def is_market_open(self) -> tuple[bool, float]:
+        try:
+            clock = self._api_call(self.trading_client.get_clock, "get_clock")
+        except ExchangeError:
+            if self._market_open_cache is not None:
+                return self._market_open_cache[0], max(
+                    0.0, self._market_open_cache[1] - time.time()
                 )
-                if isinstance(start_dt, (int, float)):
-                    ts = int(start_dt * 1000)
-                elif isinstance(start_dt, datetime):
-                    ts = int(start_dt.timestamp() * 1000)
-                else:
-                    # fallback: try bar.start.timestamp()
-                    # Fix: Use direct property access instead of getattr with constant
-                    ts = int(bar.start.timestamp() * 1000)
-            except Exception:
-                # last-resort: now
-                ts = int(datetime.now(UTC).timestamp() * 1000)
-
-            await queue.put(
-                [
-                    ts,
-                    float(getattr(bar, "open", bar.get("o", 0))),
-                    float(getattr(bar, "high", bar.get("h", 0))),
-                    float(getattr(bar, "low", bar.get("l", 0))),
-                    float(getattr(bar, "close", bar.get("c", 0))),
-                    float(getattr(bar, "volume", bar.get("v", 0))),
-                ]
-            )
-
-        stream.subscribe_bars(_on_bar, symbol, bar_timeframe=alpaca_tf)
-
-        # Use the public run method instead of private _run_forever when possible
-        try:
-            # run() may be blocking; create_task for the official coroutine entry if available
-            self._stream_task = asyncio.create_task(
-                stream.run()
-            )  # or stream._run_forever() if run() isn't provided
-        except Exception:
-            try:
-                self._stream_task = asyncio.create_task(stream._run_forever())
-            except Exception:
-                logger.exception("Failed to start Alpaca bar stream.")
-
-        while True:
-            ohlcv = await queue.get()
-            yield ohlcv
-
-    async def watch_ticker(self, pairs: list[str], params: dict | None = None):
-        """
-        Streams live bid/ask updates from Alpaca into Freqtrade/FreqUI.
-        Yields dicts: {
-            'symbol': 'MSFT',
-            'timestamp': 1234567890123,      # ms
-            'bid': 250.12,
-            'ask': 250.15
-        }
-        """
-        # 1) Instantiate the stream client
-        stream = TradingStream(self.key, self.secret, paper=self.dry_run)
-
-        # 2) Prepare an asyncio queue for quotes
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-
-        # 3) Quote callback
-        async def _on_quote(quote):
-            # Alpaca's quote.timestamp is ISO8601
-            ts_ms = int(isoparse(quote.timestamp).timestamp() * 1000)
-            await queue.put(
-                {
-                    "symbol": quote.symbol,
-                    "timestamp": ts_ms,
-                    "bid": float(quote.bid_price),
-                    "ask": float(quote.ask_price),
-                }
-            )
-
-        # 4) Subscribe to quotes for each pair
-        for pair in pairs:
-            symbol = pair.split("/", 1)[0]
-            stream.subscribe_quotes(_on_quote, symbol)
-
-        # 5) Launch the websocket loop
-        self._stream_task = asyncio.create_task(stream._run_forever())
-
-        # 6) Yield quotes continuously
-        while True:
-            quote_update = await queue.get()
-            yield quote_update
-
-    def get_rates(self, pair: str, refresh: bool, is_short: bool) -> tuple[float, float]:
-        """
-        Returns entry and exit rates for any symbol, compatible with Freqtrade UI.
-        Caches rates when `refresh=False`.
-        """
-        entry_rate = None
-        exit_rate = None
-
-        # 1) Try cache first
-        if not refresh:
-            with self._cache_lock:
-                entry_rate = self._entry_rate_cache.get(pair)
-                exit_rate = self._exit_rate_cache.get(pair)
-            if entry_rate is not None:
-                logger.debug(f"Using cached entry rate for {pair}.")
-            if exit_rate is not None:
-                logger.debug(f"Using cached exit rate for {pair}.")
-
-        # 2) On cache miss or when refresh requested, fetch fresh bid/ask
-        if entry_rate is None or exit_rate is None:
-            ticker = self.fetch_ticker(pair)
-            bid = ticker["bid"]
-            ask = ticker["ask"]
-
-            # Long entry buys at ask, short entry sells at bid
-            entry_rate = entry_rate if entry_rate is not None else (ask if not is_short else bid)
-            # Long exit sells at bid, short exit buys at ask
-            exit_rate = exit_rate if exit_rate is not None else (bid if not is_short else ask)
-
-            # 3) Cache them
-            with self._cache_lock:
-                self._entry_rate_cache[pair] = entry_rate
-                self._exit_rate_cache[pair] = exit_rate
-
-        return entry_rate, exit_rate
-
-    def get_conversion_rate(self, base: str, quote: str) -> float:
-        """
-        Returns the mid market conversion rate between two symbols,
-        with full exception safety so FreqUI never sees a missing rate.
-        """
-        # 0) trivial case
-        if base == quote:
-            return 1.0
-
-        # 1) try direct pair
-        pair = f"{base}/{quote}"
-        try:
-            ticker = self.fetch_ticker(pair)
-            return (ticker["bid"] + ticker["ask"]) / 2
-        except Exception:
-            logger.debug(f"Direct conversion fetch failed for {pair}, trying inverse.")
-
-        # 2) try inverse pair
-        inv_pair = f"{quote}/{base}"
-        try:
-            inv = self.fetch_ticker(inv_pair)
-            mid = (inv["bid"] + inv["ask"]) / 2
-            return 1.0 / mid
-        except Exception:
-            logger.warning(
-                f"Inverse conversion fetch also failed for {inv_pair}. Falling back to 1.0"
-            )
-
-        # 3) ultimate fallback
-        return 1.0
-
-    async def watch_trades(
-        self,
-        pair: str,
-        since: int | None = None,
-        limit: int | None = None,
-        params: dict | None = None,
-    ):
-        """
-        Streams live trade ticks from Alpaca into Freqtrade/FreqUI.
-        Yields dicts: {
-            'id':       '123456789',
-            'timestamp': 1234567890123,  # ms
-            'datetime': '2025-05-16T12:34:56.789Z',
-            'symbol':   'MSFT',
-            'side':     'buy' or 'sell',
-            'price':    250.12,
-            'amount':   100
-        }
-        """
-        symbol = pair.split("/", 1)[0]
-        stream = TradingStream(self.key, self.secret, paper=self.dry_run)
-        q: asyncio.Queue = asyncio.Queue()
-
-        async def _on_trade(trade):
-            ts = int(isoparse(trade.timestamp).timestamp() * 1000)
-            # Alpaca Trade.timestamp is ISO str; parse to ms
-            dt = datetime.fromtimestamp(ts / 1000, UTC).isoformat()
-            await q.put(
-                {
-                    "id": trade.trade_id,
-                    "timestamp": ts,
-                    "datetime": dt,
-                    "symbol": symbol,
-                    "side": trade.taker_side.value.lower(),
-                    "price": float(trade.price),
-                    "amount": float(trade.size),
-                }
-            )
-
-        # subscribe to live trades for this symbol
-        stream.subscribe_trades(_on_trade, symbol)
-
-        # kick off the websocket
-        self._stream_task = asyncio.create_task(stream._run_forever())
-
-        # yield trades as they arrive
-        while True:
-            yield await q.get()
-
-    def validate_config(self, config: dict) -> None:
-        """
-        Validate the exchange configuration.
-        This method is required by Freqtrade and called during bot initialization.
-        """
-        logger.info("Validating Alpaca configuration...")
-
-        # Check for required API credentials
-        if not self.key or not self.secret:
-            raise OperationalException(
-                "Alpaca API key and secret are required in the configuration."
-            )
-
-        # Test authentication by making a simple API call
-        try:
-            # This will fail immediately if credentials are invalid
-            self.trading_client.get_account()
-            logger.debug("Alpaca authentication successful")
-        except APIError as e:
-            error_message = str(e).lower()
-            if "forbidden" in error_message or "unauthorized" in error_message:
-                logger.error(
-                    "Authentication failed - Invalid API credentials. "
-                    "Please check your Alpaca API key and secret."
-                )
-                sys.exit(1)
-            # Re-raise other API errors
             raise
 
-        # Validate dry_run mode compatibility
-        if not self.dry_run:
-            logger.warning(
-                "Live trading mode is enabled. "
-                "Ensure you have sufficient funds and understand the risks."
+        now = time.time()
+        if clock.is_open:
+            self._market_open_cache = (True, now, now)
+            return True, 0.0
+        next_open = clock.next_open
+        wait = max(0.0, (next_open - datetime.now(UTC)).total_seconds())
+        self._market_open_cache = (False, now + wait, now)
+        return False, wait
+
+    # ------------------------------------------------------------------
+    # Lifecycle / validation
+    # ------------------------------------------------------------------
+
+    def validate_config(self, config: dict) -> None:
+        self.validate_trading_mode_and_margin_mode(
+            config.get("trading_mode", "spot"),
+            config.get("margin_mode"),
+            allow_none_margin_mode=True,
+        )
+        self.validate_timeframes([config.get("timeframe", "1h")])
+
+        # Authentication is checked only when not in a backtest and when
+        # credentials are expected to be live-usable.  Market data is fetched
+        # through the same credentials on dry-run, so data access is still real.
+        if config.get("runmode") in ("dry_run", "live", "worker", None):
+            self._api_call(self.trading_client.get_account, "validate Alpaca account")
+
+    def close(self) -> None:
+        self.ws_connection_reset()
+
+    # ------------------------------------------------------------------
+    # Dry-run implementation
+    # ------------------------------------------------------------------
+
+    def _create_dry_order(
+        self,
+        pair: str,
+        ordertype: str,
+        side: str,
+        amount: float,
+        rate: float | None,
+        tif: TimeInForce,
+        extended_hours: bool,
+    ) -> dict[str, Any]:
+        del extended_hours
+        symbol = self._pair_symbol(pair)
+        asset = self._get_asset(symbol)
+        if not asset.tradable or self._enum_value(asset.status) != AssetStatus.ACTIVE.value:
+            raise InvalidOrderException(f"Alpaca asset {symbol} is not tradable/active.")
+        amount = self._normalize_order_quantity(asset, amount, ordertype)
+        if amount <= 0:
+            raise InvalidOrderException(f"Order quantity becomes zero for {symbol}.")
+        if asset.fractionable and ordertype.lower() in {"market", "limit"}:
+            reference_price = (
+                rate
+                if rate is not None
+                else self.get_rate(pair, side="entry" if side == "buy" else "exit", refresh=True)
             )
+            if amount * float(reference_price) < 1.0 - 1e-9:
+                raise InvalidOrderException(
+                    f"Fractional Alpaca stock order for {symbol} is below the $1 minimum notional: "
+                    f"qty={amount}, price={reference_price}."
+                )
+        if ordertype.lower() == "limit" and (rate is None or rate <= 0):
+            raise PricingError(f"A dry-run limit order for {pair} requires a positive rate.")
+        if ordertype.lower() not in {"market", "limit"}:
+            raise InvalidOrderException(f"Unsupported order type for dry-run: {ordertype}")
+        order_id = f"dry_run_{side}_{uuid4()}"
+        now_ms = int(time.time() * 1000)
+        requested_rate = float(
+            rate
+            or self.get_rate(
+                pair, side="entry" if side == "buy" else "exit", is_short=False, refresh=True
+            )
+        )
+        if ordertype.lower() == "limit":
+            requested_rate = self._normalize_price(asset, requested_rate)
+        status = "closed" if ordertype.lower() == "market" else "open"
+        filled = amount if status == "closed" else 0.0
+        average = requested_rate if filled else None
+        order = {
+            "id": order_id,
+            "symbol": pair,
+            "type": ordertype.lower(),
+            "side": side,
+            "price": requested_rate,
+            "average": average,
+            "amount": amount,
+            "filled": filled,
+            "remaining": amount - filled,
+            "status": status,
+            "timestamp": now_ms,
+            "lastTradeTimestamp": now_ms if filled else None,
+            "datetime": datetime.fromtimestamp(now_ms / 1000, UTC).isoformat(),
+            "cost": filled * (average or requested_rate),
+            "fee": None,
+            "timeInForce": tif.value,
+            "info": {"dry_run": True, "tif": tif.value},
+        }
+        with self._dry_order_lock:
+            self._dry_orders[order_id] = order
+        return dict(order)
 
-        # Validate timeframes if specified in config
-        timeframes = config.get("timeframes", [])
-        if timeframes:
-            self.validate_timeframes(timeframes)
+    def _fetch_dry_order(self, order_id: str, pair: str) -> dict[str, Any]:
+        with self._dry_order_lock:
+            order = self._dry_orders.get(order_id)
 
-        logger.info("Alpaca configuration validation completed successfully.")
+        # Freqtrade persists its Order rows even in dry-run mode.  The native
+        # Exchange implementation normally keeps dry-run orders in memory, so
+        # a bot restart can leave an old DB order that this adapter can no longer
+        # see.  Recover that DB representation when possible instead of treating
+        # the missing in-memory object as a fatal exchange error.
+        if not order and order_id.startswith("dry_run_"):
+            try:
+                from freqtrade.persistence import Order as PersistedOrder
+
+                db_order = PersistedOrder.order_by_id(order_id, self._normalise_pair_string(pair))
+                if db_order is not None:
+                    order = db_order.to_ccxt_object()
+                    # Normalize persisted DB values to the fields used by the
+                    # dry-run fill simulator.
+                    order["type"] = (order.get("type") or "limit").lower()
+                    order["side"] = (order.get("side") or db_order.ft_order_side or "buy").lower()
+                    order["amount"] = float(order.get("amount") or db_order.ft_amount or 0.0)
+                    order["filled"] = float(order.get("filled") or 0.0)
+                    order["remaining"] = self._as_float(
+                        order.get("remaining"),
+                        order["amount"] - order["filled"],
+                    )
+                    order["price"] = (
+                        float(order["price"])
+                        if order.get("price") is not None
+                        else float(db_order.ft_price)
+                    )
+                    order["average"] = (
+                        float(order["average"]) if order.get("average") is not None else None
+                    )
+                    order.setdefault("symbol", self._normalise_pair_string(pair))
+                    order.setdefault("cost", 0.0)
+                    order.setdefault("fee", None)
+                    with self._dry_order_lock:
+                        self._dry_orders[order_id] = order
+                    logger.info("Recovered dry-run order %s from Freqtrade persistence.", order_id)
+            except Exception:
+                logger.debug(
+                    "Could not recover persisted dry-run order %s.",
+                    order_id,
+                    exc_info=True,
+                )
+
+        if not order:
+            raise InvalidOrderException(f"Dry-run order {order_id} not found.")
+
+        if order["status"] == "open" and order["type"] == "limit":
+            ticker = self.fetch_ticker(pair)
+            bid = float(ticker.get("bid") or 0.0)
+            ask = float(ticker.get("ask") or 0.0)
+            fillable = (order["side"] == "buy" and ask > 0 and ask <= order["price"]) or (
+                order["side"] == "sell" and bid > 0 and bid >= order["price"]
+            )
+            if fillable:
+                fill_price = ask if order["side"] == "buy" else bid
+                with self._dry_order_lock:
+                    order["status"] = "closed"
+                    order["filled"] = order["amount"]
+                    order["remaining"] = 0.0
+                    order["average"] = fill_price
+                    order["cost"] = order["amount"] * fill_price
+                    order["lastTradeTimestamp"] = int(time.time() * 1000)
+        return dict(order)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _enum_value(value: Any) -> Any:
+        return getattr(value, "value", value)
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None or value == "":
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _datetime_to_ms(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return int(dt.timestamp() * 1000)
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.timestamp() * 1000)
+
+    @staticmethod
+    def _ms_to_datetime(value: int) -> datetime:
+        return datetime.fromtimestamp(value / 1000, UTC)
+
+    @staticmethod
+    def _model_to_dict(value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, dict):
+            return value
+        if hasattr(value, "model_dump"):
+            try:
+                return value.model_dump(mode="json")
+            except TypeError:
+                return value.model_dump()
+        if hasattr(value, "dict"):
+            try:
+                return value.dict()
+            except Exception:
+                logger.debug("Unable to serialize Alpaca model with dict()", exc_info=True)
+        try:
+            return dict(value)
+        except Exception:
+            return str(value)
+
+    @staticmethod
+    def _round_down_increment(value: float, increment: float) -> float:
+        """Round *value* down to the supplied increment without destroying fractions.
+
+        Very small increments such as 1e-9 are commonly rendered in scientific
+        notation (``str(1e-9) == "1e-09"``).  The previous implementation treated
+        that as a zero-decimal increment and rounded the result to an integer,
+        which turned valid fractional stock quantities such as 5.266900165 into
+        5.0.  Keep sufficient precision for Alpaca's 9-decimal fractional share
+        quantities while still removing floating-point noise.
+        """
+        if increment <= 0:
+            return float(value)
+
+        units = math.floor((float(value) / float(increment)) + 1e-12)
+        result = units * float(increment)
+
+        # Alpaca fractionable equity quantities are supported to 9 decimal
+        # places. Twelve decimals also gives enough room for price increments
+        # while avoiding binary floating-point artifacts.
+        return round(result, 12)
+
+    @staticmethod
+    def _normalise_pair_string(pair: Any) -> str:
+        """Normalize Freqtrade pair inputs to a plain pair string.
+
+        Freqtrade may pass candle identifiers as:
+            ("TSLA/USD", "1m", CandleType.SPOT)
+        while most exchange methods receive just "TSLA/USD".  The Alpaca
+        adapter only needs the first element for symbol parsing.
+        """
+        if isinstance(pair, tuple):
+            if not pair:
+                raise ConfigurationError("Empty pair tuple received")
+            pair = pair[0]
+        if not isinstance(pair, str):
+            raise ConfigurationError(
+                f"Stock pair must be a string or Freqtrade pair tuple, got {pair!r}"
+            )
+        return pair
+
+    @classmethod
+    def _split_pair(cls, pair: Any) -> tuple[str, str]:
+        text = cls._normalise_pair_string(pair).replace(":USD", "")
+        if "/" not in text:
+            raise ConfigurationError(f"Stock pair must be BASE/USD, got {pair}")
+        base, quote = text.split("/", 1)
+        if quote.upper() != "USD":
+            raise ConfigurationError(f"Alpaca stock adapter only supports USD-quoted pairs: {pair}")
+        return base.upper(), quote.upper()
+
+    def _pair_symbol(self, pair: str) -> str:
+        return self._split_pair(pair)[0]
+
+    def _parse_tif(self, value: str | TimeInForce | None) -> TimeInForce:
+        if isinstance(value, TimeInForce):
+            return value
+        key = str(value or "DAY").lower()
+        try:
+            return self._TIF_MAP[key]
+        except KeyError as exc:
+            raise ConfigurationError(
+                f"Unsupported Alpaca time-in-force {value}. Supported: {', '.join(self._TIF_MAP)}"
+            ) from exc
+
+    @staticmethod
+    def _parse_data_feed(value: str | DataFeed) -> DataFeed:
+        if isinstance(value, DataFeed):
+            return value
+        text = str(value).lower()
+        for member in DataFeed:
+            if member.value.lower() == text or member.name.lower() == text:
+                return member
+        raise ConfigurationError(f"Unsupported Alpaca stock data feed: {value}")
+
+    @staticmethod
+    def _parse_adjustment(value: str | Adjustment) -> Adjustment:
+        if isinstance(value, Adjustment):
+            return value
+        text = str(value).lower()
+        for member in Adjustment:
+            if member.value.lower() == text or member.name.lower() == text:
+                return member
+        raise ConfigurationError(f"Unsupported Alpaca stock adjustment: {value}")
+
+    def _initial_candle_limit(self, timeframe: str) -> int:
+        """Return enough candles for startup plus a small safety margin."""
+        startup = int(self.config.get("startup_candle_count", 0) or 0)
+        return max(500, startup + 50, 1000 if timeframe == "1m" else 500)
+
+    @staticmethod
+    def _timeframe_minutes(timeframe: str) -> int:
+        if timeframe.endswith("m"):
+            return int(timeframe[:-1])
+        if timeframe.endswith("h"):
+            return int(timeframe[:-1]) * 60
+        if timeframe.endswith("d"):
+            return int(timeframe[:-1]) * 1440
+        raise ConfigurationError(f"Unsupported timeframe {timeframe}")
+
+    def _timeframe_seconds(self, timeframe: str) -> int:
+        return self._timeframe_minutes(timeframe) * 60
+
+    @staticmethod
+    def _is_whole_quantity(value: float) -> bool:
+        return math.isclose(float(value), round(float(value)), rel_tol=0.0, abs_tol=1e-10)
+
+    def _normalize_order_quantity(self, asset: Asset, amount: float, ordertype: str) -> float:
+        value = float(amount)
+        if value <= 0:
+            return 0.0
+
+        ordertype = ordertype.lower()
+        fractionable = bool(getattr(asset, "fractionable", False))
+
+        # For fractionable equities, preserve fractional quantities for market
+        # orders and DAY limit orders. Alpaca supports up to 9 decimal places.
+        if fractionable and ordertype in {"market", "limit"}:
+            raw_increment = self._as_float(getattr(asset, "min_trade_increment", None), 0.0)
+            increment = raw_increment if 0.0 < raw_increment < 1.0 else 1e-9
+            # For fractionable equities, Alpaca's equity minimum is a notional
+            # rule rather than a whole-share minimum. Quantity itself can be
+            # represented to 9 decimal places.
+            minimum = increment
+            value = math.floor(value * 1_000_000_000 + 1e-9) / 1_000_000_000
+        else:
+            # Non-fractionable equity quantities must be whole shares.
+            increment = max(1.0, float(getattr(asset, "min_trade_increment", None) or 1.0))
+            minimum = max(1.0, float(getattr(asset, "min_order_size", None) or 1.0))
+
+        qty = self._round_down_increment(value, increment)
+        if not fractionable or ordertype not in {"market", "limit"}:
+            qty = math.floor(qty + 1e-12)
+
+        if qty < minimum - 1e-12:
+            raise InvalidOrderException(
+                f"Order quantity {qty} for {asset.symbol} is below Alpaca minimum {minimum}."
+            )
+        return qty
+
+    def _normalize_price(self, asset: Asset, price: float) -> float:
+        increment = float(asset.price_increment or 0.01)
+        return self._round_down_increment(price, increment)
 
     def _get_available_qty(self, symbol: str) -> float:
-        try:
-            positions = self.trading_client.get_all_positions()
-            for pos in positions:
-                if pos.symbol == symbol:
-                    return float(pos.qty)
-        except Exception as e:
-            logger.error(f"Failed to fetch available qty for {symbol}: {e}")
+        positions = self._api_call(self.trading_client.get_all_positions, "get_all_positions")
+        for position in positions:
+            if position.symbol.upper() == symbol.upper():
+                return max(
+                    0.0, self._as_float(position.qty_available, self._as_float(position.qty, 0.0))
+                )
         return 0.0
 
-    def validate_trading_mode_and_margin_mode(
-        self, trading_mode, margin_mode, allow_none_margin_mode: bool = False, **kwargs
-    ) -> None:
-        """
-        Validate that the requested trading and margin modes are supported by the exchange.
-        Alpaca stocks implementation currently focuses on spot trading.
-        """
-        # The logic remains the same:
-        if trading_mode and str(trading_mode).lower() != "spot":
-            raise OperationalException(
-                f"Alpaca Stocks exchange does not support {trading_mode} trading mode."
-            )
+    def _normalize_order(
+        self,
+        order: Any,
+        pair: str,
+        requested_rate: float | None = None,
+    ) -> dict[str, Any]:
+        status = str(self._enum_value(getattr(order, "status", "new"))).lower()
+        normalized_status = self._ft_has["order_statuses"].get(status, "open")
+        filled = self._as_float(getattr(order, "filled_qty", None), 0.0)
+        amount = self._as_float(getattr(order, "qty", None), filled)
+        remaining = max(0.0, amount - filled)
+        avg = self._as_float(getattr(order, "filled_avg_price", None), 0.0)
+        limit_price = self._as_float(getattr(order, "limit_price", None), 0.0)
+        requested_price = requested_rate or limit_price or avg or None
+        if filled >= amount > 0 and status not in {"rejected", "canceled", "expired"}:
+            normalized_status = "closed"
+            remaining = 0.0
 
-        # In Alpaca, margin is account-level rather than symbol-level in the crypto sense.
-        # Check against 'none' or 'cross'. The 'allow_none_margin_mode' is handled by the caller.
-        if margin_mode and str(margin_mode).lower() not in ("none", "cross"):
-            raise OperationalException(
-                f"Alpaca Stocks exchange does not support {margin_mode} margin mode."
-            )
+        submitted_at = getattr(order, "submitted_at", None) or getattr(order, "created_at", None)
+        filled_at = getattr(order, "filled_at", None)
+        timestamp = self._datetime_to_ms(submitted_at) if submitted_at else None
+        last_trade_timestamp = self._datetime_to_ms(filled_at) if filled_at else None
+        side = str(self._enum_value(getattr(order, "side", "buy"))).lower()
+        order_type = str(
+            self._enum_value(getattr(order, "order_type", getattr(order, "type", "limit")))
+        ).lower()
+        symbol = f"{getattr(order, 'symbol', self._pair_symbol(pair))}/USD"
+        cost = filled * avg if avg > 0 else 0.0
 
-    def ohlcv_candle_limit(self, timeframe: str, candle_type: str = "trade") -> int:
-        """
-        Calculates the maximum number of candles that can be requested at once.
-        This limit is defined by the Alpaca API for historical data requests.
-        """
-        # 1000 is the common limit for Alpaca bar data requests.
-        return 1000
+        return {
+            "id": str(getattr(order, "id", "")),
+            "clientOrderId": getattr(order, "client_order_id", None),
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "price": requested_price,
+            "average": avg or None,
+            "amount": amount,
+            "filled": filled,
+            "remaining": remaining,
+            "status": normalized_status,
+            "timestamp": timestamp,
+            "lastTradeTimestamp": last_trade_timestamp,
+            "datetime": datetime.fromtimestamp(timestamp / 1000, UTC).isoformat()
+            if timestamp
+            else None,
+            "cost": cost,
+            "fee": None,
+            "timeInForce": self._enum_value(getattr(order, "time_in_force", None)),
+            "info": self._model_to_dict(order),
+        }
+
+    def _translate_api_error(self, error: APIError, context: str) -> Exception:
+        message = str(error)
+        lower = message.lower()
+        if any(token in lower for token in ("insufficient", "buying power", "not enough")):
+            return InsufficientFundsError(f"{context}: {message}")
+        if any(token in lower for token in ("not found", "order not found")):
+            return InvalidOrderException(f"{context}: {message}")
+        if any(
+            token in lower
+            for token in ("timeout", "temporarily", "rate limit", "too many requests", "connection")
+        ):
+            return TemporaryError(f"{context}: {message}")
+        return OperationalException(f"{context}: {message}")
+
+    def _api_call(self, func: Any, context: str, order_exception: bool = False) -> Any:
+        try:
+            return func()
+        except APIError as exc:
+            translated = self._translate_api_error(exc, context)
+            if order_exception and not isinstance(
+                translated, (InsufficientFundsError, InvalidOrderException)
+            ):
+                translated = OperationalException(str(translated))
+            raise translated from exc
+        except (TimeoutError, OSError) as exc:
+            raise TemporaryError(f"{context}: {exc}") from exc
+
+    def _throttle(self) -> None:
+        """Throttle direct HTTP activity requests made by this adapter."""
+        # Alpaca SDK clients have their own request handling; this throttle only
+        # applies to our direct account-activity HTTP calls.
+        now = time.monotonic()
+        last = getattr(self, "_last_http_request", 0.0)
+        elapsed = now - last
+        if elapsed < 3.0:
+            time.sleep(3.0 - elapsed)
+        self._last_http_request = time.monotonic()
+
+    def _register_live_stream(self, stream: Any) -> None:
+        with self._stream_lock:
+            self._stream_clients.append(stream)
+
+    def _stop_stream(self, stream: Any) -> None:
+        try:
+            stream.stop()
+        except Exception:
+            logger.debug("Error stopping Alpaca websocket", exc_info=True)
+        with self._stream_lock:
+            if stream in self._stream_clients:
+                self._stream_clients.remove(stream)
+
+
+# Keep the historical class naming convention used by the fork.
+__all__ = ["Alpacastocks"]
