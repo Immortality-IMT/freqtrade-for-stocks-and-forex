@@ -21,8 +21,10 @@ class TestIMT(IStrategy):
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # Initialize tags to object dtype to allow string labels
-        dataframe["enter_tag"] = dataframe.get("enter_tag", "").astype(object)
-        dataframe["exit_tag"] = dataframe.get("exit_tag", "").astype(object)
+        for col in ("enter_tag", "exit_tag"):
+            if col not in dataframe.columns:
+                dataframe[col] = ""
+            dataframe[col] = dataframe[col].astype(object)
         self.logger.debug(
             f"DataFrame in populate_indicators:\n"
             f"{dataframe[['date', 'open', 'high', 'low', 'close']].tail(5)}"
