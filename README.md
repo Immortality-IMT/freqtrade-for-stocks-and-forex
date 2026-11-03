@@ -423,3 +423,136 @@ To run this bot we recommend you a cloud instance with a minimum of:
 - [TA-Lib](https://ta-lib.github.io/ta-lib-python/)
 - [virtualenv](https://virtualenv.pypa.io/en/stable/installation.html) (Recommended)
 - [Docker](https://www.docker.com/products/docker) (Recommended)
+
+
+## Additional features
+
+### Position stacking: `allow_multiple_positions`
+
+Normally Freqtrade holds **one** trade per pair. With
+
+```json
+"allow_multiple_positions": true
+```
+
+the bot may open additional, separate trades in a pair that already has an open trade. This works in live
+and dry-run trading (it is not the same as backtesting's `--enable-position-stacking`).
+
+After each new trade opens, the pair is **barred from new entries** until a cooldown has passed. A pair is
+also barred while any of its orders is still open (unfilled limit entry, pending stoploss, ...). Only entries
+are affected; exits, stoplosses and order handling keep working for every open trade.
+
+```json
+"position_cooldown_minutes": 15
+```
+
+`position_cooldown_minutes` (default `15`) is the length of that bar. It can also be set in the strategy as
+`position_cooldown_minutes = 15`; the config value wins if both are set.
+
+The cooldown counts from the opening time of the pair's **most recent open trade**. Once that trade is closed
+it no longer counts.
+
+### Exchange stacking: `allow_multiple_exchanges`
+
+```json
+"exchange": { "name": "binance", ... },
+"additional_exchanges": [
+  { "name": "kraken", "key": "...", "secret": "..." },
+  { "name": "bybit",  "key": "...", "secret": "..." }
+],
+"allow_multiple_positions": true,
+"allow_multiple_exchanges": true,
+"position_cooldown_minutes": 15
+```
+
+With this on, every new trade is placed on the exchange that **currently holds the fewest open trades of that
+pair** (ties go to the order in the config). Positions are spread round-robin: A, B, C, A, B, C, ...
+An exchange that closes its trade becomes the preferred choice again. If the chosen exchange cannot fund the
+stake, the next one is tried. Stoploss, exits and order management for a trade always run on the exchange that
+trade was opened on.
+
+`exchange` (the first block) is the primary exchange: it supplies candles, pairlists and signals.
+`additional_exchanges` are only used to place and manage trades. `allow_multiple_exchanges` requires
+`allow_multiple_positions`.
+
+### Multiple wallets on one exchange (for example PancakeSwap)
+
+Wallets behave exactly like extra exchanges: a pair is spread round-robin over them, wallet 1, wallet 2,
+wallet 3, then back to wallet 1, and each trade is managed and sold with the wallet it was opened with. Each
+wallet is one entry with its own `key` and `secret` (public address and private key). Give each a `"label"`:
+
+```json
+"exchange": { "name": "immortality", "label": "wallet1", "key": "<ADDRESS 1>", "secret": "<PRIVATE KEY 1>", "api_key": "<NODEREAL KEY>", ... },
+"additional_exchanges": [
+  { "name": "immortality", "label": "wallet2", "key": "<ADDRESS 2>", "secret": "<PRIVATE KEY 2>", "api_key": "<NODEREAL KEY>" },
+  { "name": "immortality", "label": "wallet3", "key": "<ADDRESS 3>", "secret": "<PRIVATE KEY 3>", "api_key": "<NODEREAL KEY>" }
+],
+"allow_multiple_positions": true,
+"allow_multiple_exchanges": true
+```
+
+Every wallet entry needs the same fields as a single-wallet config (`name`, `key`, `secret` and the NodeReal
+`api_key`). Each wallet makes its own price and balance calls to the node, so the node traffic grows with the number
+of wallets; `price_cache_ttl` and `balance_cache_ttl` in the config reduce it. Each live wallet also needs BNB for gas. Labels are
+only needed when the same exchange name appears more than once. The first (`exchange`) wallet may omit its
+label; its label is then the exchange name, so existing trades keep working. Never share or commit real keys.
+If a trade's label is later removed from the config, the bot logs a warning and falls back to the primary wallet.
+
+### How the two settings work together
+
+A new trade needs three things: an entry signal from the strategy, a pair that is not in cooldown, and an
+exchange with funds. The cooldown decides **how fast** trades follow each other; exchange stacking decides
+**where** each one goes.
+
+| `position_cooldown_minutes` | What you get | Example |
+|---|---|---|
+| Low (e.g. `1`-`15`) | **Spreading one build-up across exchanges.** While the signal stays on, trades open one after another within minutes, each on the next exchange. | 4 exchanges, `stake_amount` 250, `max_open_trades` 4: about 1000 is deployed as 4 trades of 250, one per exchange. |
+| High (e.g. `1440` = 1 day, `43200` = 30 days) | **Spreading repeated entries over time and exchanges** (a simple DCA-style schedule). One entry per interval, each on the next exchange; the strategy is tested again each interval. | 3 exchanges, cooldown `43200`: month 1 on A, month 2 on B, month 3 on C, month 4 on A again (A now holds two trades). |
+| `0` | No bar at all. A new trade can open on every bot loop (every few seconds) while the signal is on, until `max_open_trades` is reached. Rarely what you want. | |
+
+The strategy signal is still the gate. A long cooldown only says when the pair may be entered **again**; the
+next entry happens on the first candle after the cooldown where the strategy signals.
+
+### Essential settings and sizing
+
+- `stake_amount` is the size of **one trade**, which sits on one exchange. Nothing is divided automatically.
+- `max_open_trades` is a **global** cap on open trades across all exchanges and all pairs. Total exposure is
+  at most `stake_amount x max_open_trades`.
+- Exchange stacking does not limit how many trades a pair can hold. Only `max_open_trades` (or a limit in your
+  strategy, for example in `confirm_trade_entry`) stops the stacking. To spread one pair over N exchanges, set
+  `max_open_trades = N` for one pair, or `N x number_of_pairs` for several.
+- Each exchange (wallet) needs enough free balance for `stake_amount`. Live, balances are checked per exchange. In
+  dry-run there is one shared simulated balance: `dry_run_wallet` minus the open trades of all exchanges together.
+- For ordinary exchanges (for example kraken or bybit), set `"enable_ws": false` in every entry of
+  `additional_exchanges`. They are only used to place and manage orders, so they do not need websocket streams,
+  and some exchanges log websocket errors (timeouts, unsupported order book depth) that are harmless but noisy.
+  Freqtrade then uses the normal REST API for them. It is not needed for the `immortality` wallets.
+- Use the **same pair name and stake currency** on every exchange. The pair must exist on all of them.
+- Every venue needs a unique name. Different exchanges are told apart by their exchange name. Several wallets or
+  accounts on the **same** exchange need a unique `"label"` each (see Multiple wallets below); without one the bot
+  refuses to start. The label is saved on every trade, so keep it unchanged while trades are open.
+- Exits are decided by your strategy, and there are two ways to do it:
+  - **Sell everything at once.** Use the normal pair-wide exit signal (`exit_long`). All open trades of the
+    pair are sold immediately, each on its own exchange. Freqtrade ignores an exit signal on a candle that
+    also has an entry signal, so make sure the strategy does not signal an entry on that candle.
+  - **Sell only the trade that meets a condition.** Never set `exit_long`; decide in `custom_exit`, which is
+    called per trade and receives the trade (including `trade.exchange`, `open_date`, `open_rate`). Return a
+    reason only for the trade you want to close, for example the oldest or the most profitable one.
+  Keep `use_exit_signal = True` in both cases: Freqtrade only uses `exit_long` and calls `custom_exit` when it
+  is on. Stoploss, ROI and trailing stop already apply per trade.
+
+### Console messages
+
+When more than one exchange is configured the log shows lines starting with `[multi-exchange]`: the exchange
+choice before each entry, and the open trades per exchange after every entry, exit order and fill.
+
+```
+[multi-exchange] IMT/BNB open per exchange: {'binance': 1, 'kraken': 0, 'bybit': 0} -> trying kraken first
+[multi-exchange] ENTRY IMT/BNB placed on kraken. Open trades -> binance: #1 IMT/BNB | kraken: #2 IMT/BNB | bybit: -
+```
+
+### Known limits
+
+Pair locks and the cooldown are global: a trade or a stoploss lock on one exchange applies to the pair on all
+exchanges. Candles and pairlists come from the primary exchange only, and `/balance` shows the primary
+exchange's wallet only.
