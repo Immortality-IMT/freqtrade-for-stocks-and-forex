@@ -48,6 +48,11 @@ class Test_multiple_exchanges(IStrategy):
         return len(self._open_trades(pair)) >= self._exchange_count()
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # The exchange's OHLCV cache can hand back float tag columns left over from earlier runs,
+        # and Freqtrade then fails writing "" into them. Make sure they can hold strings.
+        for col in ("enter_tag", "exit_tag"):
+            if col in dataframe.columns:
+                dataframe[col] = dataframe[col].astype(object)
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
