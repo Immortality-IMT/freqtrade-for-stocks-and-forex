@@ -1,0 +1,77 @@
+//Download TWS
+//https://www.interactivebrokers.com/en/trading/tws-updatable-latest.php
+//cd ~/Downloads
+//chmod u+x tws-latest-linux-x64.sh
+//./tws-latest-linux-x64.sh
+// Setting, set the port to paper trade 4002 or live 7497
+// Check Enable ActiveX and socket clients
+// Uncheck read only API
+{
+    "$schema": "https://schema.freqtrade.io/schema.json",
+    "max_open_trades": 10,
+    "stake_currency": "USD",   //changed line
+    "stake_amount": 1000,
+    "fiat_display_currency": "USD",
+    "dry_run": true,
+    "db_url": "sqlite:///tradesv3.forex.dryrun.sqlite",
+    "dry_run_wallet": 1000000,
+    "cancel_open_orders_on_exit": false,
+    "trading_mode": "spot",
+    "margin_mode": "",
+    "entry_pricing": {
+        "price_side": "other",
+    },
+    "exit_pricing":{
+        "price_side": "other",
+    },
+    "unfilledtimeout": {
+        "entry": 10,
+        "exit": 10,
+        "exit_timeout_count": 0,
+        "unit": "minutes"
+    },
+    "exchange": {
+        "name": "interactivebrokers",
+        "key": "",
+        "secret": "",
+        "pair_whitelist": [
+            "EUR/USD",
+            "GBP/USD",
+            "AUD/USD"
+        ],
+        "pair_blacklist": []
+    },
+    "pairlists": [
+        {
+            "method": "StaticPairList",
+            "pairs": [
+                "EUR/USD",
+                "GBP/USD",
+                "AUD/USD"
+            ]
+        }
+    ],
+    "telegram": {
+        "enabled": false,
+        "token": "",
+        "chat_id": ""
+    },
+    "api_server": {
+        "enabled": true,
+        "listen_ip_address": "127.0.0.1",
+        "listen_port": 8080,
+        "verbosity": "error",
+        "enable_openapi": false,
+        "jwt_secret_key": "4e5Y1gklkxLrN00M-FBVAI7uvPesd7PCwydd7kHk7JvbQRRwewBW_xGbYlaQl9vk",
+        "ws_token": "1nT-JCLiCA6vZelVJZYO8ZdCsou9iK0PQfO7q400Q37jErMV07TqD_NY9XEFnzBs",
+        "CORS_origins": [],
+        "username": "freqtrader",
+        "password": "xxx"
+    },
+    "bot_name": "freqtrade",
+    "initial_state": "running",
+    "force_entry_enable": false,
+    "internals": {
+        "process_throttle_secs": 5
+    }
+}
