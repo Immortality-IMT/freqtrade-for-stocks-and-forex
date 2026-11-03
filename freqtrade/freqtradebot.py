@@ -386,6 +386,11 @@ class FreqtradeBot(LoggingMixin):
         self.startup_update_open_orders()
         self.update_all_liquidation_prices()
         self.update_funding_fees()
+        if self.config.get("allow_multiple_positions", False):
+            logger.info(
+                f"Position stacking on: a pair is barred from new entries for "
+                f"{self._position_cooldown()} after one of its trades opened."
+            )
         self._log_exchange_overview("Startup")
 
     def validate_informative_candle_types(self) -> None:
@@ -908,16 +913,43 @@ class FreqtradeBot(LoggingMixin):
     # enter positions / open trades logic and methods
     #
 
+    def _position_cooldown(self) -> timedelta:
+        """
+        Time a pair stays barred from new entries after one of its trades was opened
+        (only used with allow_multiple_positions). Minutes, taken from, in order:
+        config["position_cooldown_minutes"], strategy.position_cooldown_minutes, default 15.
+        """
+        minutes = self.config.get("position_cooldown_minutes")
+        if minutes is None:
+            minutes = getattr(self.strategy, "position_cooldown_minutes", None)
+        if minutes is None:
+            minutes = 15
+        try:
+            cooldown = timedelta(minutes=float(minutes))
+        except (TypeError, ValueError):
+            raise OperationalException(
+                f"position_cooldown_minutes must be a number of minutes, got {minutes!r}."
+            ) from None
+        if cooldown < timedelta(0):
+            raise OperationalException("position_cooldown_minutes must not be negative.")
+        return cooldown
+
     def _prune_whitelist(self, whitelist: list[str], now_utc: datetime) -> list[str]:
         """
-        Remove pairs with open trades or orders within the last 15 minutes.
+        Remove pairs with an open trade opened within the cooldown period (see
+        _position_cooldown) and pairs that still have an open order.
         """
         pruned = whitelist.copy()
+        cooldown = self._position_cooldown()
         for trade in Trade.get_open_trades():
             time_since_trade = now_utc - trade.open_date_utc
-            if trade.pair in pruned and time_since_trade < timedelta(minutes=15):
+            if trade.pair in pruned and time_since_trade < cooldown:
                 pruned.remove(trade.pair)
-                logger.debug("Removed %s from pair whitelist", trade.pair)
+                logger.debug(
+                    "Removed %s from pair whitelist, cooldown ends %s",
+                    trade.pair,
+                    (trade.open_date_utc + cooldown).strftime(constants.DATETIME_PRINT_FORMAT),
+                )
             for order in trade.orders:
                 if order.ft_is_open and order.ft_pair in pruned:
                     pruned.remove(order.ft_pair)
