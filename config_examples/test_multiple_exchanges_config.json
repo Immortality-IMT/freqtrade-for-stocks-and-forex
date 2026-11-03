@@ -48,6 +48,7 @@
             "name": "kraken",
             "key": "<KRAKEN_KEY>",
             "secret": "<KRAKEN_SECRET>",
+            "enable_ws": false,
             "ccxt_config": {},
             "ccxt_async_config": {}
         },
@@ -55,6 +56,7 @@
             "name": "bybit",
             "key": "<BYBIT_KEY>",
             "secret": "<BYBIT_SECRET>",
+            "enable_ws": false,
             "ccxt_config": {},
             "ccxt_async_config": {}
         }
