@@ -134,6 +134,11 @@ class FreqtradeBot(LoggingMixin):
         ex = self.exchanges.get(name) if name else None
         wallets = self.all_wallets.get(name) if name else None
         if ex is None or wallets is None:  # unknown / legacy venue -> stay on active (primary)
+            if name:
+                self.log_once(
+                    f'Trade venue "{name}" is not in the config, using the primary exchange.',
+                    logger.warning,
+                )
             yield
             return
         prev = (getattr(self._ctx, "exchange", None), getattr(self._ctx, "wallets", None))
@@ -142,6 +147,13 @@ class FreqtradeBot(LoggingMixin):
             yield
         finally:
             self._ctx.exchange, self._ctx.wallets = prev
+
+    def _active_exchange_label(self) -> str:
+        """Label (config "label", default the exchange id) of the venue currently active."""
+        for label, ex in self.exchanges.items():
+            if ex is self.exchange:
+                return label
+        return self.exchange.id
 
     def _log_exchange_overview(self, event: str) -> None:
         """Console summary: which open trade sits on which exchange (multi-exchange only)."""
@@ -179,10 +191,14 @@ class FreqtradeBot(LoggingMixin):
             ex = ExchangeResolver.load_exchange(
                 self.config, exchange_config=extra_conf, load_leverage_tiers=True
             )
-            if ex.id in self.exchanges:
-                raise OperationalException(f"Exchange {ex.id} is configured twice.")
-            self.exchanges[ex.id] = ex
-            self.all_wallets[ex.id] = Wallets(self.config, ex)
+            label = str(extra_conf.get("label") or ex.id)
+            if label in self.exchanges:
+                raise OperationalException(
+                    f'"{label}" is configured twice. To use several wallets or accounts of the '
+                    'same exchange, give each entry its own unique "label".'
+                )
+            self.exchanges[label] = ex
+            self.all_wallets[label] = Wallets(self.config, ex)
         logger.info(f"Multi-exchange enabled: {', '.join(self.exchanges)}")
 
     def __init__(self, config: Config) -> None:
@@ -219,8 +235,9 @@ class FreqtradeBot(LoggingMixin):
 
             self.wallets = Wallets(self.config, self.exchange)
 
-            self.exchanges: dict[str, Exchange] = {self.exchange.id: self.exchange}
-            self.all_wallets: dict[str, Wallets] = {self.exchange.id: self.wallets}
+            primary_label = str(self.config["exchange"].get("label") or self.exchange.id)
+            self.exchanges: dict[str, Exchange] = {primary_label: self.exchange}
+            self.all_wallets: dict[str, Wallets] = {primary_label: self.wallets}
             self._load_additional_exchanges()
 
             PairLocks.timeframe = self.config["timeframe"]
@@ -1419,7 +1436,7 @@ class FreqtradeBot(LoggingMixin):
                 open_rate=enter_limit_filled_price,
                 open_rate_requested=enter_limit_requested,
                 open_date=datetime.now(UTC),
-                exchange=self.exchange.id,
+                exchange=self._active_exchange_label(),
                 strategy=self.strategy.get_strategy_name(),
                 enter_tag=enter_tag,
                 timeframe=timeframe_to_minutes(self.config["timeframe"]),
