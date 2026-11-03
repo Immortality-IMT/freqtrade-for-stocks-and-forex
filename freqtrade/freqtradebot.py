@@ -143,6 +143,16 @@ class FreqtradeBot(LoggingMixin):
         finally:
             self._ctx.exchange, self._ctx.wallets = prev
 
+    def _log_exchange_overview(self, event: str) -> None:
+        """Console summary: which open trade sits on which exchange (multi-exchange only)."""
+        if len(self.exchanges) < 2:
+            return
+        by_exchange: dict[str, list[str]] = {name: [] for name in self.exchanges}
+        for t in Trade.get_open_trades():
+            by_exchange.setdefault(t.exchange, []).append(f"#{t.id} {t.pair}")
+        summary = " | ".join(f"{n}: {', '.join(v) or '-'}" for n, v in by_exchange.items())
+        logger.info(f"[multi-exchange] {event}. Open trades -> {summary}")
+
     def _wallets_for(self, trade: Trade) -> Wallets:
         return self.all_wallets.get(trade.exchange, self._primary_wallets)
 
@@ -376,6 +386,7 @@ class FreqtradeBot(LoggingMixin):
         self.startup_update_open_orders()
         self.update_all_liquidation_prices()
         self.update_funding_fees()
+        self._log_exchange_overview("Startup")
 
     def validate_informative_candle_types(self) -> None:
         """
@@ -1028,6 +1039,8 @@ class FreqtradeBot(LoggingMixin):
                 with self._on(name):
                     result = self._enter_on_active_exchange(pair, signal, enter_tag)
                 if result is not None:
+                    if result:
+                        self._log_exchange_overview(f"ENTRY {pair} placed on {name}")
                     return result
                 logger.info(f"{pair}: {name} cannot fund the stake, trying next exchange.")
             logger.info(f"No exchange can fund a new position for {pair}.")
@@ -1043,7 +1056,12 @@ class FreqtradeBot(LoggingMixin):
         """
         held = Counter(t.exchange for t in Trade.get_open_trades() if t.pair == pair)
         names = list(self.exchanges)
-        return sorted(names, key=lambda n: (held[n], names.index(n)))
+        order = sorted(names, key=lambda n: (held[n], names.index(n)))
+        logger.info(
+            f"[multi-exchange] {pair} open per exchange: "
+            f"{ {n: held[n] for n in names} } -> trying {order[0]} first"
+        )
+        return order
 
     def _enter_on_active_exchange(
         self, pair: str, signal: SignalDirection, enter_tag: str | None
@@ -2548,6 +2566,11 @@ class FreqtradeBot(LoggingMixin):
         trade.exit_reason = exit_reason
 
         self._notify_exit(trade, order_type, sub_trade=bool(sub_trade_amt), order=order_obj)
+        if len(self.exchanges) > 1:
+            logger.info(
+                f"[multi-exchange] EXIT order placed for trade #{trade.id} {trade.pair} "
+                f"on {trade.exchange} (reason: {exit_reason})"
+            )
         # In case of market exit orders the order can be closed immediately
         if order.get("status", "unknown") in ("closed", "expired"):
             self.update_trade_state(trade, order_obj.order_id, order)
@@ -2784,6 +2807,12 @@ class FreqtradeBot(LoggingMixin):
                 self.cancel_stoploss_on_exchange(trade)
             # Updating wallets when order is closed
             self.wallets.update()
+            if len(self.exchanges) > 1:
+                side = "ENTRY" if order.ft_order_side == trade.entry_side else "EXIT"
+                state = "" if trade.is_open else " (trade closed)"
+                self._log_exchange_overview(
+                    f"{side} filled for trade #{trade.id} {trade.pair} on {trade.exchange}{state}"
+                )
         return trade
 
     @_per_trade
